@@ -1,0 +1,224 @@
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const Core = require("../agent-core.js");
+
+function baseDecision(overrides = {}) {
+  return {
+    version: "1.0",
+    status: "continue",
+    message: "진행합니다.",
+    summary: "검색창 입력",
+    progress: "검색창을 확인함",
+    doneReason: "",
+    completionEvidence: [],
+    needsUserApproval: false,
+    plan: ["검색어 입력", "결과 확인"],
+    toolCalls: [],
+    actions: [{
+      id: "a1",
+      type: "fill",
+      ref: "e1",
+      selector: null,
+      text: null,
+      value: "agent",
+      checked: null,
+      key: null,
+      code: null,
+      direction: null,
+      amount: null,
+      url: null,
+      ms: null,
+      reason: "검색어 입력"
+    }],
+    verification: {
+      required: true,
+      expectedChange: "검색창 값 변경",
+      successCriteria: ["검색창 값이 agent임"]
+    },
+    ...overrides
+  };
+}
+
+const context = {
+  url: "https://example.com/search",
+  title: "Search",
+  visibleText: "Search documents",
+  viewport: { width: 1000, height: 700, scrollX: 0, scrollY: 0 },
+  interactiveElements: [{
+    ref: "e1",
+    tag: "input",
+    role: "textbox",
+    type: "search",
+    label: "Search",
+    selector: "input[name='q']"
+  }]
+};
+
+test("parses fenced model JSON", () => {
+  const value = Core.parseJsonFromText(`\`\`\`json\n${JSON.stringify(baseDecision())}\n\`\`\``);
+  assert.equal(value.status, "continue");
+});
+
+test("normalizes a decision and validates an observed element ref", () => {
+  const decision = Core.normalizeDecision(baseDecision(), { step: 2, maxEffects: 3 });
+  const validation = Core.validateDecision(decision, { context, availableTools: [], maxEffects: 3 });
+  assert.equal(decision.step, 2);
+  assert.equal(validation.valid, true);
+  assert.equal(decision.actions[0].ref, "e1");
+});
+
+test("rejects invented refs and completion without evidence", () => {
+  const invented = Core.normalizeDecision(baseDecision({
+    actions: [{ ...baseDecision().actions[0], ref: "e99" }]
+  }), { maxEffects: 3 });
+  assert.equal(Core.validateDecision(invented, { context }).valid, false);
+
+  const completed = Core.normalizeDecision(baseDecision({
+    status: "completed",
+    actions: [],
+    completionEvidence: []
+  }), { maxEffects: 3 });
+  const validation = Core.validateDecision(completed, { context });
+  assert.match(validation.errors.join(" "), /completionEvidence/);
+});
+
+test("rejects a syntactically valid but blank user-facing decision", () => {
+  const decision = Core.normalizeDecision({
+    version: "1.0",
+    status: "answer",
+    message: "",
+    summary: "",
+    doneReason: "",
+    toolCalls: [],
+    actions: []
+  });
+  const validation = Core.validateDecision(decision, { context, availableTools: [] });
+  assert.equal(validation.valid, false);
+  assert.match(validation.errors.join("\n"), /사용자에게 표시할/);
+});
+
+test("accepts only runtime-issued completion evidence IDs", () => {
+  const completed = Core.normalizeDecision(baseDecision({
+    status: "completed",
+    actions: [],
+    completionEvidence: ["ev-2-page_observation-abc"]
+  }), { maxEffects: 3 });
+  assert.equal(Core.validateDecision(completed, {
+    context,
+    availableEvidenceIds: ["ev-2-page_observation-abc"]
+  }).valid, true);
+  const invented = Core.validateDecision(completed, {
+    context,
+    availableEvidenceIds: ["ev-2-page_observation-other"]
+  });
+  assert.equal(invented.valid, false);
+  assert.match(invented.errors.join(" "), /ledger/);
+});
+
+test("validates independent verifier evidence and policy approval reasons", () => {
+  const verifier = Core.normalizeVerifier({
+    version: "1.0",
+    status: "verified",
+    message: "근거 확인",
+    evidenceIds: ["ev-1-page_observation-abc"],
+    missingEvidence: [],
+    confidence: 0.92
+  });
+  assert.equal(Core.validateVerifier(verifier, {
+    availableEvidenceIds: ["ev-1-page_observation-abc"]
+  }).valid, true);
+  assert.equal(Core.validateVerifier(verifier, { availableEvidenceIds: [] }).valid, false);
+
+  const policy = Core.normalizePolicy({
+    version: "1.0",
+    verdict: "approval",
+    message: "외부 전송",
+    risks: ["external side effect"],
+    sensitiveData: [],
+    approvalReasons: []
+  });
+  assert.equal(Core.validatePolicy(policy).valid, false);
+});
+
+test("uses each MCP tool input schema dynamically", () => {
+  const decision = Core.normalizeDecision(baseDecision({
+    actions: [],
+    toolCalls: [{
+      toolName: "search",
+      argumentsJson: JSON.stringify({ limit: "many" }),
+      reason: "자료 검색"
+    }]
+  }), { maxEffects: 3 });
+  const validation = Core.validateDecision(decision, {
+    context,
+    availableTools: [{
+      name: "search",
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        properties: { query: { type: "string" }, limit: { type: "integer" } },
+        required: ["query"]
+      }
+    }]
+  });
+  assert.equal(validation.valid, false);
+  assert.match(validation.errors.join(" "), /query/);
+  assert.match(validation.errors.join(" "), /integer/);
+});
+
+test("prevents tool calls and page actions from sharing one stale plan", () => {
+  const decision = Core.normalizeDecision(baseDecision({
+    toolCalls: [{ toolName: "search", argumentsJson: "{}", reason: "search" }]
+  }), { maxEffects: 4 });
+  const validation = Core.validateDecision(decision, {
+    context,
+    availableTools: [{ name: "search", inputSchema: { type: "object" } }]
+  });
+  assert.equal(validation.valid, false);
+  assert.match(validation.errors.join(" "), /한 턴/);
+});
+
+test("validates event-driven wait conditions and separates browser-level effects", () => {
+  const waitDecision = Core.normalizeDecision(baseDecision({
+    actions: [{
+      id: "wait-ready",
+      type: "wait_for",
+      conditionJson: JSON.stringify({ type: "text", operator: "contains", value: "Ready" }),
+      ms: 5000,
+      reason: "wait for the page result"
+    }]
+  }), { maxEffects: 3 });
+  assert.equal(Core.validateDecision(waitDecision, { context }).valid, true);
+
+  const mixed = Core.normalizeDecision(baseDecision({
+    actions: [
+      baseDecision().actions[0],
+      { id: "tab", type: "tab_adopt", tabId: 12, reason: "adopt popup" }
+    ]
+  }), { maxEffects: 3 });
+  const validation = Core.validateDecision(mixed, { context });
+  assert.equal(validation.valid, false);
+  assert.match(validation.errors.join(" "), /브라우저 수준 액션/);
+});
+
+test("detects repeated decisions on an unchanged observation", () => {
+  const session = {};
+  const decision = Core.normalizeDecision(baseDecision(), { maxEffects: 3 });
+  assert.equal(Core.updateProgressGuard(session, context, decision, { limit: 2 }).stalled, false);
+  assert.equal(Core.updateProgressGuard(session, context, decision, { limit: 2 }).stalled, false);
+  const third = Core.updateProgressGuard(session, context, decision, { limit: 2 });
+  assert.equal(third.stalled, true);
+  assert.equal(third.count, 2);
+});
+
+test("context fingerprints are stable across object key order", () => {
+  const left = Core.fingerprintContext(context);
+  const right = Core.fingerprintContext({
+    interactiveElements: context.interactiveElements,
+    viewport: context.viewport,
+    visibleText: context.visibleText,
+    title: context.title,
+    url: context.url
+  });
+  assert.equal(left, right);
+});

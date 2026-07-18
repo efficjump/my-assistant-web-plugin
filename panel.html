@@ -1,0 +1,535 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Agent</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <div class="agent-title">
+          <div class="agent-mark" aria-hidden="true">A</div>
+          <div class="agent-heading">
+            <h1>Agent</h1>
+            <div class="agent-subtitle" id="statusLine" aria-live="polite"></div>
+          </div>
+        </div>
+        <div class="topbar-actions">
+          <button class="icon-button" id="openContextButton" type="button" title="컨텍스트" aria-label="컨텍스트">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M4 5h16" />
+              <path d="M4 12h10" />
+              <path d="M4 19h16" />
+              <path d="M18 10v4" />
+              <path d="M16 12h4" />
+            </svg>
+          </button>
+          <button class="icon-button" id="openExportButton" type="button" title="내보내기" aria-label="내보내기">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 3v12" />
+              <path d="m7 10 5 5 5-5" />
+              <path d="M5 21h14" />
+            </svg>
+          </button>
+          <button class="icon-button" id="pickElementButton" type="button" title="요소 선택" aria-label="요소 선택">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M4 4h6" />
+              <path d="M4 4v6" />
+              <path d="M20 20h-6" />
+              <path d="M20 20v-6" />
+              <path d="m12 12 7-3-3 7-2-2-2 4-2-1 2-4-2-1Z" />
+            </svg>
+          </button>
+          <button class="icon-button" id="undoActionButton" type="button" title="되돌리기" aria-label="되돌리기" disabled>
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M9 14 4 9l5-5" />
+              <path d="M4 9h10a6 6 0 1 1 0 12h-2" />
+            </svg>
+          </button>
+          <button class="icon-button" id="refreshContextButton" type="button" title="새로고침" aria-label="새로고침">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M20 12a8 8 0 1 1-2.34-5.66" />
+              <path d="M20 4v6h-6" />
+            </svg>
+          </button>
+          <button class="icon-button" id="clearChatButton" type="button" title="대화 비우기" aria-label="대화 비우기">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M3 6h18" />
+              <path d="M8 6V4h8v2" />
+              <path d="M6 6l1 15h10l1-15" />
+              <path d="M10 11v6" />
+              <path d="M14 11v6" />
+            </svg>
+          </button>
+          <button class="icon-button" id="openSettingsButton" type="button" title="설정" aria-label="설정">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z" />
+              <path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06A1.7 1.7 0 0 0 15 19.37a1.7 1.7 0 0 0-1 .58l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 11.5 15a1.7 1.7 0 0 0-.58-1l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 15 11.5a1.7 1.7 0 0 0 1-.58l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.7 1.7 0 0 0 19.4 15Z" />
+            </svg>
+          </button>
+        </div>
+      </header>
+
+      <section class="context-strip" aria-live="polite">
+        <div class="context-main">
+          <div class="page-title" id="pageTitle">대기 중</div>
+          <div class="page-url" id="pageUrl"></div>
+        </div>
+        <div class="capability-row">
+          <span class="status-badge" id="agentModeBadge">승인형</span>
+          <span class="status-badge muted" id="mcpStatusBadge">MCP 꺼짐</span>
+          <span class="status-badge muted" id="pickedElementBadge" hidden>선택 없음</span>
+        </div>
+      </section>
+
+      <section class="goal-panel">
+        <input id="goalInput" type="text" autocomplete="off" placeholder="작업 목표 고정">
+        <button class="secondary-button compact" id="pinGoalButton" type="button">고정</button>
+        <button class="secondary-button compact" id="clearGoalButton" type="button">해제</button>
+      </section>
+
+      <section class="restricted-panel" id="restrictedPanel" hidden>
+        <div>
+          <strong id="restrictedTitle">접근할 수 없는 페이지</strong>
+          <p id="restrictedMessage"></p>
+        </div>
+        <button class="secondary-button compact" id="restrictedRefreshButton" type="button">다시 확인</button>
+      </section>
+
+      <section class="chat-log" id="messageList" aria-live="polite"></section>
+
+      <section class="approval-panel" id="approvalPanel" hidden>
+        <div class="plan-summary" id="planSummary"></div>
+        <img class="annotation-preview" id="annotationPreview" alt="실행 대상 미리보기" hidden>
+        <ol class="action-list" id="actionList"></ol>
+        <div class="button-row">
+          <button class="danger-button" id="approveActionButton" type="button">승인 후 실행</button>
+          <button class="secondary-button" id="rejectActionButton" type="button">취소</button>
+        </div>
+      </section>
+
+      <section class="composer">
+        <div class="template-row">
+          <select id="templateSelect" aria-label="작업 템플릿">
+            <option value="">템플릿 선택</option>
+          </select>
+          <button class="secondary-button compact" id="insertTemplateButton" type="button">삽입</button>
+          <button class="secondary-button compact" id="saveTemplateButton" type="button">저장</button>
+        </div>
+        <textarea id="chatInput" rows="3" placeholder="무엇을 할까요?" autocomplete="off"></textarea>
+        <div class="composer-actions">
+          <button class="secondary-button stop-button" id="stopAgentButton" type="button" disabled>중지</button>
+          <button class="send-button" id="sendButton" type="button" title="보내기" aria-label="보내기">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M22 2 11 13" />
+              <path d="m22 2-7 20-4-9-9-4 20-7Z" />
+            </svg>
+          </button>
+        </div>
+      </section>
+    </main>
+
+    <section class="settings-overlay" id="settingsModal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle" hidden>
+      <div class="settings-sheet">
+        <header class="settings-header">
+          <div>
+            <h2 id="settingsTitle">설정</h2>
+            <p id="settingsStatus" aria-live="polite"></p>
+          </div>
+          <button class="icon-button" id="closeSettingsButton" type="button" title="닫기" aria-label="닫기">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M18 6 6 18" />
+              <path d="m6 6 12 12" />
+            </svg>
+          </button>
+        </header>
+
+        <nav class="settings-tabs" aria-label="설정" role="tablist">
+          <button class="settings-tab active" id="apiTab" type="button" role="tab" aria-controls="apiPanel" aria-selected="true" data-settings-tab="api">AI</button>
+          <button class="settings-tab" id="agentTab" type="button" role="tab" aria-controls="agentPanel" aria-selected="false" data-settings-tab="agent">Agent</button>
+          <button class="settings-tab" id="siteTab" type="button" role="tab" aria-controls="sitePanel" aria-selected="false" data-settings-tab="site">Site</button>
+          <button class="settings-tab" id="mcpTab" type="button" role="tab" aria-controls="mcpPanel" aria-selected="false" data-settings-tab="mcp">MCP</button>
+          <button class="settings-tab" id="advancedTab" type="button" role="tab" aria-controls="advancedPanel" aria-selected="false" data-settings-tab="advanced">고급</button>
+        </nav>
+
+        <div class="settings-body">
+          <section class="settings-panel active" id="apiPanel" role="tabpanel" aria-labelledby="apiTab" data-settings-panel="api">
+            <div class="settings-grid">
+              <label class="field">
+                <span>API 형식</span>
+                <select id="apiProfileInput">
+                  <option value="openai-responses">OpenAI Responses</option>
+                  <option value="openai-chat">OpenAI 호환 Chat Completions</option>
+                  <option value="anthropic-messages">Anthropic 호환 Messages</option>
+                  <option value="custom-json">Custom JSON</option>
+                </select>
+              </label>
+
+              <label class="field">
+                <span>Endpoint</span>
+                <input id="apiEndpointInput" type="url" autocomplete="off" placeholder="https://...">
+              </label>
+
+              <label class="field">
+                <span>Model</span>
+                <input id="modelInput" type="text" autocomplete="off" placeholder="API에서 요구하는 모델명">
+              </label>
+
+              <label class="field">
+                <span>Auth header name</span>
+                <input id="authHeaderNameInput" type="text" autocomplete="off" placeholder="Authorization">
+              </label>
+
+              <label class="field">
+                <span>Auth header value</span>
+                <input id="authHeaderValueInput" type="password" autocomplete="off" placeholder="Bearer ...">
+              </label>
+
+              <label class="field">
+                <span>Response path</span>
+                <input id="responsePathInput" type="text" autocomplete="off" placeholder="choices.0.message.content">
+              </label>
+
+              <label class="field">
+                <span>Temperature</span>
+                <input id="temperatureInput" type="number" min="0" max="2" step="0.1">
+              </label>
+
+              <label class="field">
+                <span>Max output tokens</span>
+                <input id="maxOutputTokensInput" type="number" min="128" max="8192" step="64">
+              </label>
+
+              <label class="toggle-field">
+                <input id="structuredOutputInput" type="checkbox">
+                <span>구조화 출력 사용</span>
+              </label>
+
+              <label class="toggle-field">
+                <input id="persistSecretsInput" type="checkbox">
+                <span>인증 값을 이 브라우저에 영구 저장 (공용 기기에서는 사용 금지)</span>
+              </label>
+
+              <label class="toggle-field">
+                <input id="openAiWebSearchEnabledInput" type="checkbox">
+                <span>OpenAI Web Search 도구</span>
+              </label>
+
+              <label class="toggle-field">
+                <input id="openAiCodeInterpreterEnabledInput" type="checkbox">
+                <span>OpenAI Code Interpreter 도구</span>
+              </label>
+
+              <label class="field full">
+                <span>OpenAI File Search vector store IDs</span>
+                <textarea id="openAiVectorStoreIdsInput" rows="3" spellcheck="false" placeholder="쉼표 또는 줄바꿈으로 구분, 비우면 File Search 비활성화"></textarea>
+              </label>
+
+              <div class="button-row full inline-actions">
+                <button class="secondary-button" id="testApiButton" type="button">API 연결 테스트</button>
+              </div>
+            </div>
+          </section>
+
+          <section class="settings-panel" id="agentPanel" role="tabpanel" aria-labelledby="agentTab" data-settings-panel="agent">
+            <div class="settings-grid">
+              <label class="field">
+                <span>동작 모드</span>
+                <select id="agentModeInput">
+                  <option value="approve">승인형</option>
+                  <option value="auto">자동형</option>
+                </select>
+              </label>
+
+              <label class="field">
+                <span>최대 턴</span>
+                <input id="maxAgentStepsInput" type="number" min="1" max="20" step="1">
+              </label>
+
+              <label class="field">
+                <span>턴당 액션</span>
+                <input id="maxActionsPerTurnInput" type="number" min="1" max="8" step="1">
+              </label>
+
+              <label class="field">
+                <span>정체 허용 턴</span>
+                <input id="maxNoProgressStepsInput" type="number" min="1" max="6" step="1">
+              </label>
+
+              <label class="field">
+                <span>API 제한 시간 (초)</span>
+                <input id="requestTimeoutSecondsInput" type="number" min="10" max="180" step="5">
+              </label>
+
+              <label class="field">
+                <span>API 재시도</span>
+                <input id="maxApiRetriesInput" type="number" min="0" max="5" step="1">
+              </label>
+
+              <label class="field">
+                <span>화면 텍스트 한도</span>
+                <input id="maxTextCharsInput" type="number" min="4000" max="50000" step="1000">
+              </label>
+
+              <label class="field">
+                <span>요소 한도</span>
+                <input id="maxElementsInput" type="number" min="20" max="180" step="10">
+              </label>
+
+              <label class="toggle-field">
+                <input id="includeScreenshotInput" type="checkbox">
+                <span>스크린샷 포함</span>
+              </label>
+
+              <label class="toggle-field">
+                <input id="stopOnSensitiveInputInput" type="checkbox">
+                <span>민감 입력 감지 시 중단</span>
+              </label>
+
+              <label class="toggle-field">
+                <input id="redactSensitiveDataInput" type="checkbox">
+                <span>민감정보 보호 모드</span>
+              </label>
+
+              <label class="toggle-field">
+                <input id="policyGuardEnabledInput" type="checkbox">
+                <span>도구 실행 전 독립 정책 판정</span>
+              </label>
+            </div>
+          </section>
+
+          <section class="settings-panel" id="sitePanel" role="tabpanel" aria-labelledby="siteTab" data-settings-panel="site">
+            <div class="settings-grid">
+              <label class="toggle-field">
+                <input id="siteProfileEnabledInput" type="checkbox">
+                <span>현재 사이트 프로필 사용</span>
+              </label>
+
+              <label class="field">
+                <span>사이트 동작 모드</span>
+                <select id="siteAgentModeInput">
+                  <option value="approve">승인형</option>
+                  <option value="auto">자동형</option>
+                </select>
+              </label>
+
+              <label class="toggle-field">
+                <input id="siteIncludeScreenshotInput" type="checkbox">
+                <span>사이트에서 스크린샷 포함</span>
+              </label>
+
+              <label class="toggle-field">
+                <input id="siteMcpEnabledInput" type="checkbox">
+                <span>사이트에서 MCP 사용</span>
+              </label>
+
+              <div class="button-row full inline-actions">
+                <button class="secondary-button" id="saveSiteProfileButton" type="button">사이트 프로필 저장</button>
+                <button class="secondary-button" id="removeSiteProfileButton" type="button">삭제</button>
+              </div>
+            </div>
+          </section>
+
+          <section class="settings-panel" id="mcpPanel" role="tabpanel" aria-labelledby="mcpTab" data-settings-panel="mcp">
+            <div class="settings-grid">
+              <label class="toggle-field">
+                <input id="mcpEnabledInput" type="checkbox">
+                <span>MCP 사용</span>
+              </label>
+
+              <label class="toggle-field">
+                <input id="mcpRequireApprovalInput" type="checkbox">
+                <span>MCP 도구 실행 전 승인</span>
+              </label>
+
+              <label class="field full">
+                <span>MCP endpoint</span>
+                <input id="mcpEndpointInput" type="url" autocomplete="off" placeholder="https://example.com/mcp">
+              </label>
+
+              <label class="field">
+                <span>MCP 인증 방식</span>
+                <select id="mcpAuthModeInput">
+                  <option value="header">Static header</option>
+                  <option value="oauth">OAuth 2.1 PKCE</option>
+                </select>
+              </label>
+
+              <label class="field mcp-header-only">
+                <span>MCP auth header name</span>
+                <input id="mcpAuthHeaderNameInput" type="text" autocomplete="off" placeholder="Authorization">
+              </label>
+
+              <label class="field mcp-header-only">
+                <span>MCP auth header value</span>
+                <input id="mcpAuthHeaderValueInput" type="password" autocomplete="off" placeholder="Bearer ...">
+              </label>
+
+              <label class="field mcp-oauth-only">
+                <span>OAuth client ID</span>
+                <input id="mcpOAuthClientIdInput" type="text" autocomplete="off" placeholder="비우면 dynamic registration 시도">
+              </label>
+
+              <label class="field mcp-oauth-only">
+                <span>OAuth scopes</span>
+                <input id="mcpOAuthScopesInput" type="text" autocomplete="off" placeholder="예: mcp.read mcp.write">
+              </label>
+
+              <div class="tool-browser full mcp-oauth-only">
+                <div class="tool-browser-header">
+                  <strong id="mcpOAuthStatus">OAuth 연결 안 됨</strong>
+                  <div class="button-row inline-actions">
+                    <button class="secondary-button" id="connectMcpOAuthButton" type="button">OAuth 연결</button>
+                    <button class="secondary-button" id="disconnectMcpOAuthButton" type="button" disabled>연결 해제</button>
+                  </div>
+                </div>
+              </div>
+
+              <label class="field">
+                <span>MCP protocol version</span>
+                <input id="mcpProtocolVersionInput" type="text" autocomplete="off" placeholder="auto">
+              </label>
+
+              <label class="field full">
+                <span>허용 MCP 도구</span>
+                <input id="mcpAllowedToolsInput" type="text" autocomplete="off" placeholder="비우면 전체 허용, 예: search, read_doc">
+              </label>
+
+              <label class="field full">
+                <span>MCP extra headers JSON</span>
+                <textarea id="mcpExtraHeadersJsonInput" rows="4" spellcheck="false" placeholder='{"x-tenant-id":"..."}'></textarea>
+              </label>
+
+              <div class="button-row full inline-actions">
+                <button class="secondary-button" id="refreshMcpToolsButton" type="button">MCP 도구 확인</button>
+                <button class="secondary-button" id="testMcpToolButton" type="button" disabled>선택 도구 테스트</button>
+                <button class="secondary-button" id="refreshMcpAssetsButton" type="button">Resources/Prompts 확인</button>
+              </div>
+
+              <div class="tool-browser full">
+                <div class="tool-browser-header">
+                  <strong id="mcpToolCount">도구 0개</strong>
+                  <select id="mcpToolSelect" aria-label="MCP 도구 선택"></select>
+                </div>
+                <pre id="mcpToolDetail"></pre>
+                <label class="field full">
+                  <span>테스트 arguments JSON</span>
+                  <textarea id="mcpToolArgumentsInput" rows="4" spellcheck="false" placeholder='{"query":"..."}'></textarea>
+                </label>
+                <pre id="mcpToolResult"></pre>
+              </div>
+
+              <div class="tool-browser full">
+                <div class="tool-browser-header">
+                  <strong id="mcpResourceCount">리소스 0개</strong>
+                  <select id="mcpResourceSelect" aria-label="MCP 리소스 선택"></select>
+                </div>
+                <pre id="mcpResourceDetail"></pre>
+                <div class="button-row inline-actions">
+                  <button class="secondary-button" id="readMcpResourceButton" type="button" disabled>리소스 읽기</button>
+                </div>
+                <pre id="mcpResourceResult"></pre>
+              </div>
+
+              <div class="tool-browser full">
+                <div class="tool-browser-header">
+                  <strong id="mcpPromptCount">프롬프트 0개</strong>
+                  <select id="mcpPromptSelect" aria-label="MCP 프롬프트 선택"></select>
+                </div>
+                <pre id="mcpPromptDetail"></pre>
+                <label class="field full">
+                  <span>프롬프트 arguments JSON</span>
+                  <textarea id="mcpPromptArgumentsInput" rows="4" spellcheck="false" placeholder='{"topic":"..."}'></textarea>
+                </label>
+                <div class="button-row inline-actions">
+                  <button class="secondary-button" id="getMcpPromptButton" type="button" disabled>프롬프트 가져오기</button>
+                </div>
+                <pre id="mcpPromptResult"></pre>
+              </div>
+            </div>
+          </section>
+
+          <section class="settings-panel" id="advancedPanel" role="tabpanel" aria-labelledby="advancedTab" data-settings-panel="advanced">
+            <div class="settings-grid">
+              <label class="field full">
+                <span>Extra headers JSON</span>
+                <textarea id="extraHeadersJsonInput" rows="4" spellcheck="false" placeholder='{"x-api-version":"..."}'></textarea>
+              </label>
+
+              <label class="field full custom-only">
+                <span>Custom body JSON template</span>
+                <textarea id="customBodyTemplateInput" rows="8" spellcheck="false" placeholder='{"model":"{{model}}","messages":"{{messages}}"}'></textarea>
+              </label>
+
+              <label class="field full">
+                <span>System instruction</span>
+                <textarea id="systemInstructionInput" rows="6" spellcheck="false"></textarea>
+              </label>
+            </div>
+          </section>
+        </div>
+
+        <footer class="settings-footer">
+          <button class="secondary-button" id="resetSettingsButton" type="button">초기화</button>
+          <button class="primary-button" id="saveSettingsButton" type="button">저장</button>
+        </footer>
+      </div>
+    </section>
+
+    <section class="settings-overlay" id="contextModal" role="dialog" aria-modal="true" aria-labelledby="contextTitle" hidden>
+      <div class="settings-sheet compact-sheet">
+        <header class="settings-header">
+          <div>
+            <h2 id="contextTitle">Context</h2>
+            <p id="contextStatus" aria-live="polite"></p>
+          </div>
+          <button class="icon-button" id="closeContextButton" type="button" title="닫기" aria-label="닫기">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M18 6 6 18" />
+              <path d="m6 6 12 12" />
+            </svg>
+          </button>
+        </header>
+        <div class="context-body">
+          <div class="context-stats" id="contextStats"></div>
+          <div class="button-row inline-actions">
+            <button class="secondary-button" id="refreshContextDetailsButton" type="button">새로 읽기</button>
+            <button class="secondary-button" id="copyContextButton" type="button">복사</button>
+          </div>
+          <pre class="context-preview" id="contextPreview"></pre>
+        </div>
+      </div>
+    </section>
+
+    <section class="settings-overlay" id="exportModal" role="dialog" aria-modal="true" aria-labelledby="exportTitle" hidden>
+      <div class="settings-sheet compact-sheet">
+        <header class="settings-header">
+          <div>
+            <h2 id="exportTitle">Export</h2>
+            <p id="exportStatus" aria-live="polite"></p>
+          </div>
+          <button class="icon-button" id="closeExportButton" type="button" title="닫기" aria-label="닫기">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M18 6 6 18" />
+              <path d="m6 6 12 12" />
+            </svg>
+          </button>
+        </header>
+        <div class="export-body">
+          <div class="export-grid">
+            <button class="secondary-button" id="copyMarkdownButton" type="button">Markdown 복사</button>
+            <button class="secondary-button" id="downloadMarkdownButton" type="button">Markdown 저장</button>
+            <button class="secondary-button" id="downloadJsonButton" type="button">JSON 저장</button>
+            <button class="secondary-button" id="downloadCsvButton" type="button">CSV 저장</button>
+          </div>
+          <pre class="context-preview" id="exportPreview"></pre>
+        </div>
+      </div>
+    </section>
+
+    <script src="agent-core.js"></script>
+    <script src="panel.js"></script>
+  </body>
+</html>
