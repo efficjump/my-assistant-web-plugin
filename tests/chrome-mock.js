@@ -1,19 +1,48 @@
 (() => {
   const stored = {
     settings: {
-      apiEndpoint: "http://127.0.0.1:4173/mock-ai",
+      apiEndpoint: `${location.origin}/mock-ai`,
       model: "mock-agent",
       includeScreenshot: false,
-      agentMode: "auto"
+      agentMode: "auto",
+      bridgeEnabled: true,
+      bridgeEndpoint: `ws://${location.hostname}:${location.port}/extension`,
+      bridgeRequireApproval: true
+    }
+  };
+  const runtimeListeners = [];
+  const bridgeStatus = {
+    enabled: true,
+    endpoint: stored.settings.bridgeEndpoint,
+    phase: "connected",
+    connected: true,
+    paired: true,
+    requireApproval: true,
+    brokerId: "mock-broker",
+    lastError: "",
+    connectedAt: Date.now(),
+    protocolVersion: "1.0",
+    runtime: {
+      armed: true,
+      sharedTab: {
+        tabId: 7,
+        title: "Agent test dashboard",
+        url: "https://example.test/dashboard"
+      },
+      sessionActive: false,
+      activeSessionCount: 0,
+      pendingApprovalCount: 0
     }
   };
   const pageContext = {
+    documentId: "mock-dashboard-document",
     url: "https://example.test/dashboard",
     title: "Agent test dashboard",
     language: "ko",
     timestamp: new Date().toISOString(),
     pageState: { readyState: "complete", domRevision: 1, scrollHeight: 900, scrollWidth: 1200 },
     viewport: { width: 1200, height: 800, scrollX: 0, scrollY: 0, devicePixelRatio: 1 },
+    observationScope: { kind: "visual-viewport", description: "Mock visual viewport" },
     selection: "",
     visibleText: "테스트 대시보드 상태는 정상입니다.",
     documentTextExcerpt: "테스트 대시보드 상태는 정상입니다.",
@@ -51,6 +80,11 @@
   globalThis.chrome = {
     runtime: {
       lastError: null,
+      onMessage: {
+        addListener(listener) {
+          runtimeListeners.push(listener);
+        }
+      },
       sendMessage(message, callback) {
         let data = {};
         if (message.type === "GET_ACTIVE_TAB") {
@@ -58,11 +92,28 @@
         } else if (message.type === "COLLECT_PAGE_CONTEXT") {
           data = pageContext;
         } else if (message.type === "CALL_AI") {
-          const text = JSON.stringify(decision);
+          const verifierRequested = Array.isArray(message.request?.responseSchema?.required)
+            && message.request.responseSchema.required.includes("evidenceIds");
+          const evidenceIds = Array.from(new Set(
+            String(message.request?.user || "").match(/ev-[a-z0-9_-]+/gi) || []
+          ));
+          const result = verifierRequested
+            ? {
+                version: "1.0",
+                status: evidenceIds.length ? "verified" : "needs_more_evidence",
+                message: evidenceIds.length
+                  ? "현재 화면 관찰 근거와 답변이 일치합니다."
+                  : "현재 화면 관찰 근거가 필요합니다.",
+                evidenceIds: evidenceIds.slice(0, 1),
+                missingEvidence: evidenceIds.length ? [] : ["현재 화면 관찰"],
+                confidence: evidenceIds.length ? 0.98 : 0.2
+              }
+            : decision;
+          const text = JSON.stringify(result);
           data = {
             status: 200,
             text,
-            json: decision,
+            json: result,
             audit: {
               version: "1.0",
               requestId: message.request?.requestId || "mock-request",
@@ -85,8 +136,45 @@
           };
         } else if (message.type === "LIST_MCP_TOOLS") {
           data = { tools: [] };
+        } else if (message.type === "GET_BRIDGE_STATUS") {
+          data = bridgeStatus;
+        } else if (message.type === "LIST_EXTERNAL_APPROVALS") {
+          data = { operations: [], status: bridgeStatus };
+        } else if (message.type === "CONFIGURE_BRIDGE") {
+          Object.assign(bridgeStatus, {
+            enabled: Boolean(message.settings.bridgeEnabled),
+            endpoint: message.settings.bridgeEndpoint || "",
+            requireApproval: message.settings.bridgeRequireApproval !== false
+          });
+          data = bridgeStatus;
+        } else if (message.type === "CONNECT_BRIDGE" || message.type === "PAIR_BRIDGE") {
+          Object.assign(bridgeStatus, { enabled: true, connected: true, paired: true, phase: "connected" });
+          data = bridgeStatus;
+        } else if (message.type === "DISCONNECT_BRIDGE" || message.type === "REVOKE_BRIDGE") {
+          Object.assign(bridgeStatus, {
+            connected: false,
+            paired: message.type !== "REVOKE_BRIDGE",
+            phase: "disconnected"
+          });
+          data = bridgeStatus;
+        } else if (message.type === "ATTACH_BRIDGE_TAB") {
+          bridgeStatus.runtime.armed = true;
+          data = bridgeStatus;
+        } else if (message.type === "DETACH_BRIDGE_TAB") {
+          bridgeStatus.runtime.armed = false;
+          bridgeStatus.runtime.sharedTab = null;
+          data = bridgeStatus;
         }
         queueMicrotask(() => callback({ ok: true, data }));
+      }
+    },
+    tabs: {
+      onActivated: { addListener() {} },
+      onUpdated: { addListener() {} }
+    },
+    permissions: {
+      async request() {
+        return true;
       }
     },
     storage: {

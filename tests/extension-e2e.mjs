@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { createHash, generateKeyPairSync } from "node:crypto";
+import { createHash, generateKeyPairSync, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
-import { access, mkdtemp, readFile, readdir, rm, writeFile, cp } from "node:fs/promises";
+import { access, chmod, mkdtemp, readFile, readdir, rm, writeFile, cp } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { createCompanionServer } from "../bridge/server.mjs";
 
 class CdpClient {
   static async connect(url) {
@@ -60,6 +63,16 @@ const extensionRoot = path.join(temporaryRoot, "extension");
 const profileRoot = path.join(temporaryRoot, "profile");
 let browserProcess;
 let server;
+let companion;
+let mcpClient;
+
+const silentLogger = Object.freeze({
+  debug() {},
+  error() {},
+  info() {},
+  log() {},
+  warn() {},
+});
 
 try {
   const extensionId = await prepareTestExtension();
@@ -164,13 +177,245 @@ try {
     });
     assert.equal(firstContext.ok, true);
     assert.match(firstContext.data.documentId, /^[0-9a-z-]{8,}$/i);
-    const input = firstContext.data.interactiveElements.find((element) => element.label === "Name");
+    assert.equal(firstContext.data.observationScope.kind, "visual-viewport");
+    assert.doesNotMatch(firstContext.data.visibleText, /Hidden DOM fact|Clipped action|Covered action|Offscreen viewport fact/);
+    assert.doesNotMatch(firstContext.data.documentTextExcerpt, /Hidden DOM fact|Offscreen viewport fact/);
+    assert.match(firstContext.data.visibleText, /Display contents direct visible fact/);
+    assert.equal(firstContext.data.interactiveElementStats.included, firstContext.data.interactiveElements.length);
+    assert.ok(firstContext.data.interactiveElementStats.total >= firstContext.data.interactiveElementStats.included);
+    assert.equal(
+      firstContext.data.interactiveElementStats.truncated,
+      firstContext.data.interactiveElementStats.total > firstContext.data.interactiveElementStats.included
+    );
+    assert.equal(
+      firstContext.data.iframes.find((iframe) => iframe.title === "Same-origin frame")?.contentAccess,
+      "same-origin"
+    );
+    assert.equal(
+      firstContext.data.iframes.find((iframe) => iframe.title === "Metadata-only frame")?.contentAccess,
+      "metadata-only"
+    );
+    assert.equal(
+      firstContext.data.interactiveElements.some((element) => /Covered action|Clipped action|Offscreen action/.test(element.label || "")),
+      false
+    );
+
+    const panelContracts = await exercisePanelContracts({
+      cdp,
+      panelSessionId,
+      tabId: firstTabId,
+      context: firstContext.data
+    });
+    assert.deepEqual(
+      panelContracts.layouts.map(({ width, height }) => ({ width, height })),
+      [
+        { width: 420, height: 600 },
+        { width: 360, height: 640 },
+        { width: 300, height: 640 },
+        { width: 240, height: 600 }
+      ]
+    );
+    for (const layout of panelContracts.layouts) {
+      const viewportLabel = `${layout.width}x${layout.height}`;
+      assert.equal(layout.documentOverflow, false, `${viewportLabel} document should not overflow`);
+      assert.ok(layout.topbarHeight <= 50, `${viewportLabel} topbar was ${layout.topbarHeight}px tall`);
+      assert.ok(layout.composerHeight <= 110, `${viewportLabel} composer was ${layout.composerHeight}px tall`);
+      assert.ok(layout.chatHeight >= 120, `${viewportLabel} conversation viewport was only ${layout.chatHeight}px tall`);
+      assert.ok(layout.externalApprovalHeight >= 120, `${viewportLabel} approval viewport was only ${layout.externalApprovalHeight}px tall`);
+      assert.equal(layout.composerVisible, true, `${viewportLabel} composer should remain available for external approval`);
+      assert.equal(layout.composerInputSingleRow, true, `${viewportLabel} composer input and send control should share a row`);
+      assert.equal(layout.goalPopoverClosed, true);
+      assert.equal(layout.templatePopoverClosed, true);
+      assert.equal(layout.externalPickerHidden, true, "a single external approval does not need a request picker");
+      assert.equal(layout.settingsTabsSingleRow, true, `${viewportLabel} settings tabs should stay on one row`);
+      assert.equal(layout.settingsTabsScrollable, true, `${viewportLabel} settings tabs should allow horizontal scrolling`);
+      assert.equal(layout.narrowStress.topbarActionCount, 3, `${viewportLabel} should expose three primary topbar actions`);
+      for (const [controlName, measurement] of Object.entries(layout.narrowStress.controls)) {
+        assert.equal(
+          measurement.inViewport,
+          true,
+          `${viewportLabel} ${controlName} escaped the viewport: ${JSON.stringify(measurement.rect)}`
+        );
+      }
+      for (const [containerName, measurement] of Object.entries(layout.narrowStress.containers)) {
+        assert.equal(
+          measurement.noHorizontalOverflow,
+          true,
+          `${viewportLabel} ${containerName} overflowed horizontally: ${JSON.stringify(measurement)}`
+        );
+      }
+    }
+    assert.equal(panelContracts.approvalModes.local.composerHidden, true);
+    assert.equal(panelContracts.approvalModes.local.approvalStackVisible, true);
+    assert.equal(panelContracts.approvalModes.local.approvalPanelFocused, true);
+    assert.equal(panelContracts.approvalModes.local.approvalControlsVisible, true);
+    assert.equal(panelContracts.approvalModes.local.annotationHidden, true);
+    assert.equal(panelContracts.approvalModes.local.annotationSourcePresent, false);
+    assert.equal(panelContracts.approvalModes.local.documentOverflow, false);
+    assert.deepEqual(panelContracts.approvalModes.afterReject, {
+      chatInputFocused: true,
+      draftPreserved: true,
+      composerVisible: true
+    });
+    assert.deepEqual(panelContracts.approvalModes.externalOnly, {
+      composerVisible: true,
+      pickerHidden: true,
+      requestCount: 1
+    });
+    assert.deepEqual(panelContracts.approvalModes.multipleExternal, {
+      pickerVisible: true,
+      requestCount: 2,
+      selectedActionCount: 1
+    });
+    assert.equal(panelContracts.template.preservedDraft, true);
+    assert.equal(panelContracts.template.insertedPrompt, true);
+    assert.equal(panelContracts.template.popoverClosedAfterInsert, true);
+    assert.deepEqual(panelContracts.site, {
+      target: "https://example.test 사이트별 설정",
+      agentMode: "approve",
+      includeScreenshot: false,
+      mcpEnabled: false,
+      agentModeField: "inherit",
+      screenshotField: "off",
+      mcpField: "inherit"
+    });
+    assert.deepEqual(panelContracts.goal, {
+      restored: "화면 상태를 확인하고 근거를 남기기",
+      readOnly: true,
+      otherTabGoal: "",
+      retainedAfterClear: "화면 상태를 확인하고 근거를 남기기",
+      popoverClosedAfterPin: true
+    });
+
+    const verificationContracts = await exerciseAgentVerificationContracts({
+      cdp,
+      panelSessionId,
+      tabId: firstTabId,
+      context: firstContext.data
+    });
+    assert.equal(verificationContracts.repairedStatus, "completed");
+    assert.equal(verificationContracts.completionVerified, true);
+    assert.ok(
+      verificationContracts.purposes.findIndex((purpose) => purpose === "answer-grounding-repair")
+        < verificationContracts.purposes.findIndex((purpose) => purpose.startsWith("verifier-"))
+    );
+    assert.equal(verificationContracts.allVisualVerificationCallsReceivedScreenshot, true);
+    assert.equal(verificationContracts.previousViewportEvidenceStatus, "rejected");
+    assert.equal(verificationContracts.currentViewportEvidenceStatus, "verified");
+
+    const transitionContracts = await exerciseTabTransitionContracts({ cdp, panelSessionId });
+    assert.equal(transitionContracts.preservedRunningSession, true);
+    assert.equal(transitionContracts.deferredWhileBound, true);
+    assert.equal(transitionContracts.resumedOnLatestTab, true);
+
+    const pointerTarget = firstContext.data.interactiveElements.find((element) => element.label === "Pointer action");
+    assert.ok(
+      pointerTarget?.ref,
+      `pointer-cursor custom controls should be recognized without page-specific selectors: ${JSON.stringify(firstContext.data.interactiveElements.map((element) => ({ label: element.label, tag: element.tag, rect: element.rect })))}`
+    );
+    const pointerResult = await extensionMessage(cdp, panelSessionId, {
+      type: "EXECUTE_PAGE_ACTIONS",
+      targetTabId: firstTabId,
+      actions: [{ id: "pointer-sequence", type: "click", ref: pointerTarget.ref, reason: "custom pointer event E2E" }]
+    });
+    assert.equal(pointerResult.ok, true);
+    assert.equal(pointerResult.data.results[0].ok, true);
+    assert.equal(pointerResult.data.results[0].result.inputSequence, "pointer-mouse-click");
+    const pointerContext = await extensionMessage(cdp, panelSessionId, {
+      type: "COLLECT_PAGE_CONTEXT",
+      targetTabId: firstTabId,
+      options: { maxTextChars: 8000, maxElements: 40, redactSensitiveData: true }
+    });
+    assert.match(pointerContext.data.visibleText, /Pointer sequence complete/);
+
+    const svgTarget = pointerContext.data.interactiveElements.find((element) => element.label === "SVG action");
+    assert.equal(svgTarget?.tag, "svg", "a standalone accessible SVG should be exposed as an interactive control");
+    const svgResult = await extensionMessage(cdp, panelSessionId, {
+      type: "EXECUTE_PAGE_ACTIONS",
+      targetTabId: firstTabId,
+      actions: [{ id: "click-svg", type: "click", ref: svgTarget.ref, reason: "standalone SVG control E2E" }]
+    });
+    assert.equal(svgResult.ok, true);
+    assert.equal(svgResult.data.results[0].ok, true);
+    const svgContext = await extensionMessage(cdp, panelSessionId, {
+      type: "COLLECT_PAGE_CONTEXT",
+      targetTabId: firstTabId,
+      options: { maxTextChars: 8000, maxElements: 40, redactSensitiveData: true }
+    });
+    assert.match(svgContext.data.visibleText, /SVG action complete/);
+
+    const delegatedTarget = svgContext.data.interactiveElements.find(
+      (element) => element.label === "Delegated child target"
+    );
+    assert.ok(delegatedTarget?.ref);
+    const delegatedResult = await extensionMessage(cdp, panelSessionId, {
+      type: "EXECUTE_PAGE_ACTIONS",
+      targetTabId: firstTabId,
+      actions: [{ id: "click-delegated-child", type: "click", ref: delegatedTarget.ref, reason: "delegated child target E2E" }]
+    });
+    assert.equal(delegatedResult.ok, true);
+    assert.equal(delegatedResult.data.results[0].ok, true);
+    const delegatedContext = await extensionMessage(cdp, panelSessionId, {
+      type: "COLLECT_PAGE_CONTEXT",
+      targetTabId: firstTabId,
+      options: { maxTextChars: 8000, maxElements: 40, redactSensitiveData: true }
+    });
+    assert.match(delegatedContext.data.visibleText, /Delegated target delegated-child/);
+    assert.match(delegatedContext.data.visibleText, /Delegated native activation revealed/);
+
+    const limitedContext = await extensionMessage(cdp, panelSessionId, {
+      type: "COLLECT_PAGE_CONTEXT",
+      targetTabId: firstTabId,
+      options: { maxTextChars: 8000, maxElements: 20, redactSensitiveData: true }
+    });
+    assert.equal(limitedContext.data.interactiveElementStats.included, 20);
+    assert.ok(limitedContext.data.interactiveElementStats.total > 20);
+    assert.equal(limitedContext.data.interactiveElementStats.truncated, true);
+    assert.equal(
+      limitedContext.data.interactiveElements[0]?.label,
+      "Visual-first late candidate",
+      "all exposed candidates must be collected before visual ordering and limiting"
+    );
+
+    const lowerScrollResult = await extensionMessage(cdp, panelSessionId, {
+      type: "EXECUTE_PAGE_ACTIONS",
+      targetTabId: firstTabId,
+      actions: [{ id: "scroll-lower", type: "scroll", direction: "down", amount: 3000, reason: "reveal lower viewport" }]
+    });
+    assert.equal(lowerScrollResult.data.results[0].ok, true);
+    const lowerContext = await poll(
+      async () => extensionMessage(cdp, panelSessionId, {
+        type: "COLLECT_PAGE_CONTEXT",
+        targetTabId: firstTabId,
+        options: { maxTextChars: 8000, maxElements: 40, redactSensitiveData: true }
+      }),
+      (response) => response?.data?.visibleText?.includes("Offscreen viewport fact"),
+      5000
+    );
+    assert.ok(lowerContext.data.interactiveElements.some((element) => element.label === "Offscreen action"));
+
+    await extensionMessage(cdp, panelSessionId, {
+      type: "EXECUTE_PAGE_ACTIONS",
+      targetTabId: firstTabId,
+      actions: [{ id: "scroll-top", type: "scroll", direction: "up", amount: 3000, reason: "restore upper viewport" }]
+    });
+    const restoredContext = await poll(
+      async () => extensionMessage(cdp, panelSessionId, {
+        type: "COLLECT_PAGE_CONTEXT",
+        targetTabId: firstTabId,
+        options: { maxTextChars: 8000, maxElements: 40, redactSensitiveData: true }
+      }),
+      (response) => response?.data?.interactiveElements?.some((element) => element.label === "Name"),
+      5000
+    );
+
+    const input = restoredContext.data.interactiveElements.find((element) => element.label === "Name");
     assert.ok(input?.ref, "the real content script should expose a runtime element ref");
-    const privateInput = firstContext.data.interactiveElements.find((element) => element.label === "Email");
+    const privateInput = restoredContext.data.interactiveElements.find((element) => element.label === "Email");
     assert.equal(privateInput?.value, "[redacted]");
-    const shadowInput = firstContext.data.interactiveElements.find((element) => element.label === "Shadow Name");
-    const frameInput = firstContext.data.interactiveElements.find((element) => element.label === "Frame Name");
-    const uploadInput = firstContext.data.interactiveElements.find((element) => element.label === "Upload document");
+    const shadowInput = restoredContext.data.interactiveElements.find((element) => element.label === "Shadow Name");
+    const frameInput = restoredContext.data.interactiveElements.find((element) => element.label === "Frame Name");
+    const uploadInput = restoredContext.data.interactiveElements.find((element) => element.label === "Upload document");
     assert.match(shadowInput?.scope || "", /shadow/);
     assert.match(frameInput?.scope || "", /frame/);
     assert.ok(uploadInput?.ref);
@@ -289,11 +534,248 @@ try {
     assert.equal(afterWorkerRestart.ok, true);
     assert.equal(afterWorkerRestart.data.documentId, reloadedContext.data.documentId);
 
-    process.stdout.write("Real Chrome extension E2E passed: AI audits, empty-response guard, deep DOM, wait, files, tabs, identity, and worker restart.\n");
+    companion = await createCompanionServer({
+      port: 0,
+      statePath: path.join(temporaryRoot, "companion", "companion-state.json"),
+      logger: silentLogger,
+      authenticationTimeoutMs: 10_000,
+      toolCallTimeoutMs: 15_000,
+    });
+
+    await evaluate(cdp, panelSessionId, `(async () => {
+      const stored = await chrome.storage.local.get("settings");
+      await chrome.storage.local.set({
+        settings: {
+          ...(stored.settings || {}),
+          bridgeEnabled: true,
+          bridgeEndpoint: ${JSON.stringify(companion.endpoints.extension)},
+          bridgeRequireApproval: true,
+          policyGuardEnabled: false,
+          stopOnSensitiveInput: true
+        }
+      });
+      return true;
+    })()`);
+
+    const configuredBridge = await extensionMessage(cdp, panelSessionId, {
+      type: "CONFIGURE_BRIDGE",
+      settings: {
+        bridgeEnabled: true,
+        bridgeEndpoint: companion.endpoints.extension,
+        bridgeRequireApproval: true
+      }
+    });
+    assert.equal(configuredBridge.ok, true);
+    await poll(async () => extensionMessage(cdp, panelSessionId, { type: "GET_BRIDGE_STATUS" }), (
+      response
+    ) => response?.ok && response.data.phase === "pairing_required", 10_000);
+
+    const pairedBridge = await extensionMessage(cdp, panelSessionId, {
+      type: "PAIR_BRIDGE",
+      pairingCode: companion.pairingCode
+    });
+    assert.equal(pairedBridge.ok, true);
+    const connectedBridge = await poll(
+      async () => extensionMessage(cdp, panelSessionId, { type: "GET_BRIDGE_STATUS" }),
+      (response) => response?.ok && response.data.connected && companion.extensionConnected,
+      10_000
+    );
+    assert.equal(connectedBridge.data.paired, true);
+    assert.equal(companion.pairingCode, null, "the one-time pairing code must be consumed");
+
+    const attachedBridge = await extensionMessage(cdp, panelSessionId, {
+      type: "ATTACH_BRIDGE_TAB",
+      targetTabId: firstTabId
+    });
+    assert.equal(attachedBridge.ok, true);
+    assert.equal(attachedBridge.data.runtime.armed, true);
+    assert.equal(attachedBridge.data.runtime.sharedTab.tabId, firstTabId);
+
+    if (process.argv.includes("--capture-docs")) {
+      await evaluate(cdp, panelSessionId, `(async () => {
+        await loadSettings();
+        await refreshBridgeStatus();
+        openSettings();
+        activateSettingsTab("bridge");
+        elements.inputs.bridgeEnabled.checked = true;
+        hideRestrictedPage();
+        document.querySelector(".settings-body")?.scrollTo({ top: 0 });
+        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        return true;
+      })()`);
+      await capturePanelScreenshot(cdp, panelSessionId, "bridge-settings.png");
+      await evaluate(cdp, panelSessionId, "closeSettings(); true");
+    }
+
+    mcpClient = new Client(
+      { name: "real-chrome-bridge-e2e", version: "1.0.0" },
+      { capabilities: {} }
+    );
+    const mcpTransport = new StreamableHTTPClientTransport(new URL(companion.endpoints.mcp), {
+      requestInit: {
+        headers: { Authorization: `Bearer ${companion.mcpToken}` }
+      }
+    });
+    await mcpClient.connect(mcpTransport);
+
+    const bridgeStatus = toolData(await mcpClient.callTool({
+      name: "browser_status",
+      arguments: {}
+    }));
+    assert.equal(bridgeStatus.armed, true);
+
+    const bridgeGoal = "Inspect the shared page and enter the approved test value in the Name field.";
+    const session = toolData(await mcpClient.callTool({
+      name: "browser_session_start",
+      arguments: { goal: bridgeGoal }
+    }));
+    assert.match(session.session_id, /^session-/);
+
+    const firstObservation = toolData(await mcpClient.callTool({
+      name: "browser_observe",
+      arguments: { session_id: session.session_id }
+    }));
+    assert.match(firstObservation.observation_id, /^observation-/);
+    const bridgeNameInput = firstObservation.context.interactiveElements.find(
+      (element) => element.label === "Name"
+    );
+    assert.ok(bridgeNameInput?.ref, "the MCP observation must expose a runtime-bound Name ref");
+
+    const readOnlyOperation = toolData(await mcpClient.callTool({
+      name: "browser_execute",
+      arguments: {
+        session_id: session.session_id,
+        observation_id: firstObservation.observation_id,
+        idempotency_key: "real-chrome-extract-1",
+        actions: [{
+          id: "extract-visible-page",
+          type: "extract",
+          reason: "Verify a read-only operation through the complete Bridge path."
+        }]
+      }
+    }));
+    assert.equal(readOnlyOperation.status, "completed");
+    assert.match(readOnlyOperation.result.results[0].result.text, /First page/);
+
+    const secondObservation = toolData(await mcpClient.callTool({
+      name: "browser_observe",
+      arguments: { session_id: session.session_id }
+    }));
+    const currentNameInput = secondObservation.context.interactiveElements.find(
+      (element) => element.label === "Name"
+    );
+    assert.ok(currentNameInput?.ref);
+
+    const approvalOperation = toolData(await mcpClient.callTool({
+      name: "browser_execute",
+      arguments: {
+        session_id: session.session_id,
+        observation_id: secondObservation.observation_id,
+        idempotency_key: "real-chrome-fill-1",
+        actions: [{
+          id: "fill-name-after-approval",
+          type: "fill",
+          ref: currentNameInput.ref,
+          value: "bridge-approved",
+          reason: "Set the non-sensitive test field after explicit extension approval."
+        }]
+      }
+    }));
+    assert.equal(approvalOperation.status, "waiting_approval");
+    assert.equal(approvalOperation.approval.required, true);
+
+    const pendingApprovals = await extensionMessage(cdp, panelSessionId, {
+      type: "LIST_EXTERNAL_APPROVALS"
+    });
+    assert.equal(pendingApprovals.ok, true);
+    assert.equal(
+      pendingApprovals.data.operations.some(
+        (operation) => operation.operation_id === approvalOperation.operation_id
+      ),
+      true
+    );
+
+    if (process.argv.includes("--capture-docs")) {
+      await evaluate(cdp, panelSessionId, `(async () => {
+        await refreshBridgeStatus();
+        state.externalApprovals = state.externalApprovals.map((operation) => ({
+          ...operation,
+          actions: operation.actions.map((action) => ({
+            ...action,
+            reason: "공유된 테스트 페이지의 비민감성 입력란을 변경합니다."
+          })),
+          policy: {
+            ...(operation.policy || {}),
+            message: "확장 프로그램의 정책 검증 결과, 공유된 페이지의 상태 변경에 명시적인 승인이 필요합니다."
+          }
+        }));
+        renderExternalApprovalPanel();
+        closeSettings();
+        hideRestrictedPage();
+        elements.statusLine.textContent = "Bridge · 테스트 탭 공유 중";
+        elements.externalApprovalPanel.scrollIntoView({ block: "start" });
+        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        return true;
+      })()`);
+      await capturePanelScreenshot(cdp, panelSessionId, "bridge-approval.png");
+    }
+
+    const approvedOperation = await extensionMessage(cdp, panelSessionId, {
+      type: "APPROVE_EXTERNAL_OPERATION",
+      operationId: approvalOperation.operation_id
+    });
+    assert.equal(approvedOperation.ok, true);
+    assert.equal(approvedOperation.data.operation.status, "completed");
+
+    const completedOperation = toolData(await mcpClient.callTool({
+      name: "browser_operation_get",
+      arguments: {
+        session_id: session.session_id,
+        operation_id: approvalOperation.operation_id
+      }
+    }));
+    assert.equal(completedOperation.status, "completed");
+    assert.ok(completedOperation.evidence?.id);
+    assert.equal(await readInputValue(cdp, firstTargetId), "bridge-approved");
+
+    const closedSession = toolData(await mcpClient.callTool({
+      name: "browser_session_close",
+      arguments: { session_id: session.session_id }
+    }));
+    assert.equal(closedSession.closed, true);
+
+    if (process.argv.includes("--local-harness")) {
+      await runLocalHarnessBridgeScenario({
+        cdp,
+        companion,
+        firstTargetId,
+        panelSessionId,
+      });
+    }
+
+    const detachedBridge = await extensionMessage(cdp, panelSessionId, {
+      type: "DETACH_BRIDGE_TAB"
+    });
+    assert.equal(detachedBridge.ok, true);
+    assert.equal(detachedBridge.data.runtime.armed, false);
+
+    const revokedBridge = await extensionMessage(cdp, panelSessionId, {
+      type: "REVOKE_BRIDGE"
+    });
+    assert.equal(revokedBridge.ok, true);
+    assert.equal(revokedBridge.data.paired, false);
+    await poll(async () => companion.extensionConnected, (connected) => connected === false, 5_000);
+
+    await mcpClient.close();
+    mcpClient = null;
+
+    process.stdout.write("Real Chrome extension E2E passed: bounded panel approvals, tab/session isolation, grounded answers, deep DOM interactions, files, tabs, worker restart, and the authenticated MCP Bridge approval flow.\n");
   } finally {
     cdp.close();
   }
 } finally {
+  await mcpClient?.close().catch(() => {});
+  await companion?.close().catch(() => {});
   if (browserProcess && browserProcess.exitCode === null) {
     browserProcess.kill("SIGTERM");
     await Promise.race([
@@ -400,8 +882,49 @@ async function startFixtureServer() {
       return;
     }
     const second = request.url?.startsWith("/page-b");
-    response.end(`<!doctype html><html><head><title>${second ? "Second" : "First"} tab</title></head><body>
+    const candidateProbes = Array.from({ length: 24 }, (_, index) => (
+      `<button type="button" aria-label="Candidate probe ${index + 1}">${index + 1}</button>`
+    )).join("");
+    response.end(`<!doctype html><html><head><title>${second ? "Second" : "First"} tab</title><style>
+      #interaction-lab { position: relative; width: 520px; height: 96px; margin-top: 12px; }
+      #covered-action { position: absolute; inset: 0 auto auto 0; width: 130px; height: 34px; }
+      #action-cover { position: absolute; inset: 0 auto auto 0; width: 130px; height: 34px; z-index: 2; background: white; pointer-events: none; }
+      #pointer-action { position: absolute; left: 0; top: 50px; cursor: pointer; padding: 6px; border: 1px solid #333; }
+      #clipped-shell { position: absolute; left: 180px; top: 0; width: 130px; height: 34px; overflow: hidden; }
+      #clipped-action { position: absolute; left: 0; top: 60px; width: 120px; height: 30px; }
+      iframe { width: 230px; height: 70px; }
+      #candidate-probes { position: fixed; left: 570px; top: 8px; z-index: 1; display: grid; grid-template-columns: repeat(6, 32px); gap: 2px; }
+      #candidate-probes button { box-sizing: border-box; width: 32px; height: 14px; min-width: 0; padding: 0; overflow: hidden; font-size: 7px; }
+      #visual-first-candidate { position: fixed; left: 540px; top: 1px; z-index: 2; width: 24px; height: 14px; padding: 0; font-size: 0; }
+      #robustness-lab { position: fixed; left: 540px; top: 82px; z-index: 1; width: 240px; font: 12px sans-serif; }
+      #display-contents-copy { display: contents; }
+      #svg-action { display: block; width: 130px; height: 32px; margin-top: 6px; cursor: pointer; }
+      #delegated-action { cursor: pointer; margin-top: 6px; }
+      #offscreen-section { margin-top: 1300px; min-height: 280px; }
+    </style></head><body>
       <h1>${second ? "Second" : "First"} page</h1>
+      <div style="display:none">Hidden DOM fact</div>
+      <div id="candidate-probes" aria-label="Candidate limit fixtures">${candidateProbes}</div>
+      <div id="interaction-lab">
+        <button id="covered-action" type="button">Covered action</button>
+        <div id="action-cover">Visible cover</div>
+        <div id="pointer-action"><span>Pointer action</span></div>
+        <div id="clipped-shell"><button id="clipped-action" type="button">Clipped action</button></div>
+      </div>
+      <div id="pointer-status" role="status">Pointer idle</div>
+      <div id="robustness-lab">
+        <div id="display-contents-copy">Display contents direct visible fact</div>
+        <svg id="svg-action" role="button" tabindex="0" aria-label="SVG action" viewBox="0 0 130 32">
+          <rect width="130" height="32" rx="4" fill="#dbeafe"></rect>
+          <text x="65" y="20" text-anchor="middle">SVG action</text>
+        </svg>
+        <div id="svg-status" role="status">SVG idle</div>
+        <details id="delegated-details">
+          <summary id="delegated-action"><span id="delegated-child">Delegated child target</span></summary>
+          <div>Delegated native activation revealed</div>
+        </details>
+        <div id="delegated-status" role="status">Delegated idle</div>
+      </div>
       <label for="name">Name</label>
       <input id="name" value="${second ? "second-tab" : "first-tab"}">
       <label for="email">Email</label>
@@ -410,15 +933,34 @@ async function startFixtureServer() {
       <div role="status">Ready</div>
       <div id="shadow-host"></div>
       <iframe title="Same-origin frame" src="/frame"></iframe>
+      <iframe title="Metadata-only frame" src="data:text/html,%3Cbody%3EOpaque%20frame%3C%2Fbody%3E"></iframe>
       <label for="upload">Upload document</label>
       <input id="upload" type="file" accept="text/plain">
       <button id="async" type="button">Start async</button>
       <div id="async-status" role="status">Idle</div>
+      <section id="offscreen-section">
+        <p>Offscreen viewport fact</p>
+        <button id="offscreen-action" type="button">Offscreen action</button>
+      </section>
+      <button id="visual-first-candidate" type="button" aria-label="Visual-first late candidate"></button>
       <script>
         const root = document.querySelector('#shadow-host').attachShadow({mode:'open'});
         root.innerHTML = '<label for="shadow-name">Shadow Name</label><input id="shadow-name">';
         document.querySelector('#async').addEventListener('click', () => {
           setTimeout(() => { document.querySelector('#async-status').textContent = 'Async complete'; }, 180);
+        });
+        const pointerAction = document.querySelector('#pointer-action');
+        pointerAction.addEventListener('pointerdown', () => { pointerAction.dataset.pointerArmed = 'true'; });
+        pointerAction.addEventListener('click', () => {
+          document.querySelector('#pointer-status').textContent = pointerAction.dataset.pointerArmed === 'true'
+            ? 'Pointer sequence complete'
+            : 'Pointer sequence missing';
+        });
+        document.querySelector('#svg-action').addEventListener('click', () => {
+          document.querySelector('#svg-status').textContent = 'SVG action complete';
+        });
+        document.querySelector('#delegated-action').addEventListener('click', (event) => {
+          document.querySelector('#delegated-status').textContent = 'Delegated target ' + event.target.id;
         });
       </script>
     </body></html>`);
@@ -480,13 +1022,946 @@ async function queryTabId(cdp, sessionId, urlPrefix) {
   })()`);
 }
 
+async function exercisePanelContracts({ cdp, panelSessionId, tabId, context }) {
+  await poll(
+    async () => evaluate(cdp, panelSessionId, "Boolean(state?.activeTab && elements?.conversationWorkspace)"),
+    Boolean,
+    15_000
+  );
+  const testTabIds = [970001, 970002];
+  const testUrl = "https://example.test/panel-contract";
+  let initialized = false;
+  try {
+    await evaluate(cdp, panelSessionId, `(() => {
+      globalThis.__panelContractSnapshot = {
+        settings: structuredClone(state.settings),
+        runtimeSettings: structuredClone(state.runtimeSettings),
+        activeTab: state.activeTab ? { ...state.activeTab } : null,
+        lastContext: state.lastContext ? structuredClone(state.lastContext) : null,
+        conversation: structuredClone(state.conversation),
+        pinnedGoal: state.pinnedGoal,
+        goalEditing: state.goalEditing,
+        pickedElement: state.pickedElement ? structuredClone(state.pickedElement) : null,
+        undoStack: structuredClone(state.undoStack),
+        evaluationLogs: structuredClone(state.evaluationLogs),
+        currentPlan: state.currentPlan,
+        externalApprovals: structuredClone(state.externalApprovals),
+        selectedExternalOperationId: state.selectedExternalOperationId,
+        utilityMenuOpen: elements.utilityMenu.open,
+        goalPopoverOpen: elements.goalPopover.open,
+        templatePopoverOpen: elements.templatePopover.open
+      };
+      resetTabScopedState();
+      applyActiveTabSummary({
+        id: ${JSON.stringify(tabId)},
+        title: ${JSON.stringify(context.title || "Agent test dashboard")},
+        url: ${JSON.stringify(context.url)}
+      });
+      state.lastContext = ${JSON.stringify(context)};
+      state.runtimeSettings = { ...state.settings, includeScreenshot: false, agentMode: "approve" };
+      for (let index = 1; index <= 18; index += 1) {
+        appendChatMessage(
+          index % 2 ? "user" : "assistant",
+          "이전 대화 " + index + ": 승인 화면에서도 확인해야 하는 내용입니다.",
+          { record: false }
+        );
+      }
+      const actionTarget = state.lastContext.interactiveElements.find((item) => item.rect)
+        || state.lastContext.interactiveElements[0];
+      globalThis.__panelContractDecision = {
+        version: "1.0",
+        status: "continue",
+        message: "현재 화면의 대상 하나를 클릭하려고 합니다.",
+        summary: "클릭 승인 요청",
+        progress: "현재 화면에서 실행 대상을 확인했습니다.",
+        doneReason: "",
+        completionEvidence: [],
+        needsUserApproval: true,
+        plan: ["현재 화면 확인", "대상 확인", "클릭", "변화 재확인"],
+        toolCalls: [],
+        actions: [{ id: "panel-layout-click", type: "click", ref: actionTarget.ref, reason: "승인 레이아웃 검증" }],
+        verification: { required: true, expectedChange: "화면 변화", successCriteria: ["변경된 화면을 다시 관찰"] },
+        safety: { warnings: ["화면이 바뀔 수 있습니다."], requiresApproval: ["클릭 실행"], blocked: [] }
+      };
+      globalThis.__panelContractExternalApprovals = [
+        {
+          operation_id: "external-one",
+          actions: [{ type: "click", ref: actionTarget.ref, reason: "첫 번째 요청" }],
+          safety: { approvalReasons: ["상태 변경"] },
+          policy: { message: "첫 번째 외부 요청", risks: [] },
+          approval: {}
+        },
+        {
+          operation_id: "external-two",
+          actions: [
+            { type: "focus", ref: actionTarget.ref, reason: "두 번째 요청" },
+            { type: "click", ref: actionTarget.ref, reason: "두 번째 요청" }
+          ],
+          safety: { approvalReasons: ["상태 변경"] },
+          policy: { message: "두 번째 외부 요청", risks: [] },
+          approval: {}
+        }
+      ];
+      hideApprovalPanel();
+      state.externalApprovals = [structuredClone(globalThis.__panelContractExternalApprovals[0])];
+      state.selectedExternalOperationId = "external-one";
+      closeTransientMenus();
+      renderExternalApprovalPanel();
+    })()`);
+    initialized = true;
+
+    const layouts = [];
+    for (const viewport of [
+      { width: 420, height: 600 },
+      { width: 360, height: 640 },
+      { width: 300, height: 640 },
+      { width: 240, height: 600 }
+    ]) {
+      await cdp.send("Emulation.setDeviceMetricsOverride", {
+        ...viewport,
+        deviceScaleFactor: 1,
+        mobile: false
+      }, panelSessionId);
+      layouts.push(await evaluate(cdp, panelSessionId, `(async () => {
+        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        const topbarRect = document.querySelector(".topbar").getBoundingClientRect();
+        const composerRect = elements.composer.getBoundingClientRect();
+        const chatRect = elements.messageList.getBoundingClientRect();
+        const approvalRect = elements.externalApprovalPanel.getBoundingClientRect();
+        const inputRect = elements.chatInput.getBoundingClientRect();
+        const sendRect = elements.sendButton.getBoundingClientRect();
+        const composerStyle = getComputedStyle(elements.composer);
+        const layout = {
+          width: innerWidth,
+          height: innerHeight,
+          documentOverflow: document.documentElement.scrollHeight > document.documentElement.clientHeight + 1
+            || document.documentElement.scrollWidth > document.documentElement.clientWidth + 1,
+          topbarHeight: Math.round(topbarRect.height),
+          composerHeight: Math.round(composerRect.height),
+          chatHeight: Math.round(chatRect.height),
+          externalApprovalHeight: Math.round(approvalRect.height),
+          composerVisible: !elements.composer.hidden
+            && composerStyle.display !== "none"
+            && composerRect.top >= 0
+            && composerRect.bottom <= innerHeight + 1,
+          composerInputSingleRow: Math.min(inputRect.bottom, sendRect.bottom) - Math.max(inputRect.top, sendRect.top) > 0,
+          goalPopoverClosed: !elements.goalPopover.open,
+          templatePopoverClosed: !elements.templatePopover.open,
+          externalPickerHidden: elements.externalApprovalPicker.hidden
+        };
+
+        const stressSnapshot = {
+          statusText: elements.statusLine.textContent,
+          goalStateText: elements.goalState.textContent,
+          goalStateHidden: elements.goalState.hidden,
+          utilityMenuOpen: elements.utilityMenu.open,
+          goalPopoverOpen: elements.goalPopover.open,
+          templatePopoverOpen: elements.templatePopover.open
+        };
+        try {
+          const nextFrame = () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+          const roundedRect = (element) => {
+            const rect = element.getBoundingClientRect();
+            return {
+              top: Math.round(rect.top),
+              right: Math.round(rect.right),
+              bottom: Math.round(rect.bottom),
+              left: Math.round(rect.left),
+              width: Math.round(rect.width),
+              height: Math.round(rect.height)
+            };
+          };
+          const measureControl = (element) => {
+            const rect = element.getBoundingClientRect();
+            const style = getComputedStyle(element);
+            return {
+              inViewport: !element.hidden
+                && style.display !== "none"
+                && style.visibility !== "hidden"
+                && Number(style.opacity || 1) > 0
+                && rect.width > 0
+                && rect.height > 0
+                && rect.left >= -1
+                && rect.top >= -1
+                && rect.right <= innerWidth + 1
+                && rect.bottom <= innerHeight + 1,
+              rect: roundedRect(element)
+            };
+          };
+          const measureContainer = (element) => ({
+            noHorizontalOverflow: element.scrollWidth <= element.clientWidth + 1,
+            scrollWidth: element.scrollWidth,
+            clientWidth: element.clientWidth
+          });
+
+          elements.statusLine.textContent = "목표가 이후 요청에 계속 적용됩니다. 화면 내용을 확인하고 완료 근거까지 남깁니다.";
+          elements.goalState.textContent = "적용 중";
+          elements.goalState.hidden = false;
+          elements.utilityMenu.open = false;
+          elements.goalPopover.open = false;
+          elements.templatePopover.open = false;
+          await nextFrame();
+
+          const topbarActions = {
+            pickElementButton: measureControl(elements.pickElementButton),
+            openSettingsButton: measureControl(elements.openSettingsButton),
+            utilityMenuButton: measureControl(elements.utilityMenuButton)
+          };
+          const controls = {
+            ...topbarActions,
+            chatInput: measureControl(elements.chatInput),
+            sendButton: measureControl(elements.sendButton),
+            goalTrigger: measureControl(elements.goalPopover.querySelector(":scope > summary")),
+            goalState: measureControl(elements.goalState),
+            templateTrigger: measureControl(elements.templatePopover.querySelector(":scope > summary"))
+          };
+          const containers = {
+            document: measureContainer(document.documentElement),
+            topbar: measureContainer(document.querySelector(".topbar")),
+            composerTools: measureContainer(document.querySelector(".composer-tools")),
+            composerInputRow: measureContainer(document.querySelector(".composer-input-row"))
+          };
+
+          elements.goalPopover.open = true;
+          await nextFrame();
+          const goalPanel = elements.goalPopover.querySelector(".composer-popover-panel");
+          controls.goalPanel = measureControl(goalPanel);
+          controls.goalInput = measureControl(elements.goalInput);
+          controls.pinGoalButton = measureControl(elements.pinGoalButton);
+          controls.clearGoalButton = measureControl(elements.clearGoalButton);
+          containers.goalPanel = measureContainer(goalPanel);
+          containers.goalControls = measureContainer(goalPanel.querySelector(".goal-controls"));
+
+          elements.goalPopover.open = false;
+          elements.templatePopover.open = true;
+          await nextFrame();
+          const templatePanel = elements.templatePopover.querySelector(".composer-popover-panel");
+          controls.templatePanel = measureControl(templatePanel);
+          controls.templateSelect = measureControl(elements.templateSelect);
+          controls.insertTemplateButton = measureControl(elements.insertTemplateButton);
+          controls.saveTemplateButton = measureControl(elements.saveTemplateButton);
+          containers.templatePanel = measureContainer(templatePanel);
+          containers.templateActions = measureContainer(templatePanel.querySelector(".template-actions"));
+
+          layout.narrowStress = {
+            topbarActionCount: Object.values(topbarActions).filter((measurement) => measurement.inViewport).length,
+            controls,
+            containers
+          };
+        } finally {
+          elements.statusLine.textContent = stressSnapshot.statusText;
+          elements.goalState.textContent = stressSnapshot.goalStateText;
+          elements.goalState.hidden = stressSnapshot.goalStateHidden;
+          elements.utilityMenu.open = stressSnapshot.utilityMenuOpen;
+          elements.goalPopover.open = stressSnapshot.goalPopoverOpen;
+          elements.templatePopover.open = stressSnapshot.templatePopoverOpen;
+          await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        }
+
+        const settingsWasHidden = elements.settingsModal.hidden;
+        const settingsClassWasPresent = document.body.classList.contains("settings-open");
+        elements.settingsModal.hidden = false;
+        document.body.classList.add("settings-open");
+        await new Promise((resolve) => requestAnimationFrame(resolve));
+        const tabRects = elements.settingsTabs.map((tab) => tab.getBoundingClientRect());
+        const rowTops = tabRects.map((rect) => Math.round(rect.top));
+        const tabsStyle = getComputedStyle(document.querySelector(".settings-tabs"));
+        layout.settingsTabsSingleRow = rowTops.length > 0 && Math.max(...rowTops) - Math.min(...rowTops) <= 1;
+        layout.settingsTabsScrollable = tabsStyle.overflowX === "auto" || tabsStyle.overflowX === "scroll";
+        elements.settingsModal.hidden = settingsWasHidden;
+        document.body.classList.toggle("settings-open", settingsClassWasPresent);
+        return layout;
+      })()`));
+    }
+
+    const approvalModes = await evaluate(cdp, panelSessionId, `(async () => {
+      state.externalApprovals = [];
+      state.selectedExternalOperationId = "";
+      renderExternalApprovalPanel();
+      const approvalDraft = "승인 검토 중에도 보존할 작성 중 요청";
+      elements.chatInput.value = approvalDraft;
+      state.currentPlan = globalThis.__panelContractDecision;
+      renderApprovalPanel(globalThis.__panelContractDecision);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      const approvalRect = elements.approvalPanel.getBoundingClientRect();
+      const controlsRect = elements.approvalPanel.querySelector(".approval-controls").getBoundingClientRect();
+      const local = {
+        composerHidden: elements.composer.hidden,
+        approvalStackVisible: !elements.approvalStack.hidden,
+        approvalPanelFocused: document.activeElement === elements.approvalPanel,
+        approvalControlsVisible: controlsRect.top >= approvalRect.top - 1
+          && controlsRect.bottom <= approvalRect.bottom + 1,
+        annotationHidden: elements.annotationDetails.hidden && elements.annotationPreview.hidden,
+        annotationSourcePresent: elements.annotationPreview.hasAttribute("src"),
+        documentOverflow: document.documentElement.scrollHeight > document.documentElement.clientHeight + 1
+          || document.documentElement.scrollWidth > document.documentElement.clientWidth + 1
+      };
+
+      rejectCurrentPlan();
+      const afterReject = {
+        chatInputFocused: document.activeElement === elements.chatInput,
+        draftPreserved: elements.chatInput.value === approvalDraft,
+        composerVisible: !elements.composer.hidden && getComputedStyle(elements.composer).display !== "none"
+      };
+      state.externalApprovals = [structuredClone(globalThis.__panelContractExternalApprovals[0])];
+      state.selectedExternalOperationId = "external-one";
+      renderExternalApprovalPanel();
+      const composerRect = elements.composer.getBoundingClientRect();
+      const externalOnly = {
+        composerVisible: !elements.composer.hidden
+          && getComputedStyle(elements.composer).display !== "none"
+          && composerRect.bottom <= innerHeight + 1,
+        pickerHidden: elements.externalApprovalPicker.hidden,
+        requestCount: elements.externalApprovalSelect.options.length
+      };
+
+      state.externalApprovals = structuredClone(globalThis.__panelContractExternalApprovals);
+      renderExternalApprovalPanel();
+      const multipleExternal = {
+        pickerVisible: !elements.externalApprovalPicker.hidden,
+        requestCount: elements.externalApprovalSelect.options.length,
+        selectedActionCount: elements.externalApprovalList.children.length
+      };
+      return { local, afterReject, externalOnly, multipleExternal };
+    })()`);
+
+    const functional = await evaluate(cdp, panelSessionId, `(async () => {
+        elements.chatInput.value = "기존에 작성하던 요청";
+        elements.chatInput.setSelectionRange(elements.chatInput.value.length, elements.chatInput.value.length);
+        elements.templateSelect.value = "summarize-page";
+        const selectedTemplatePrompt = getTaskTemplates().find((item) => item.id === elements.templateSelect.value)?.prompt || "";
+        elements.templatePopover.open = true;
+        insertSelectedTemplate();
+        const template = {
+          preservedDraft: elements.chatInput.value.includes("기존에 작성하던 요청"),
+          insertedPrompt: Boolean(selectedTemplatePrompt) && elements.chatInput.value.includes(selectedTemplatePrompt),
+          popoverClosedAfterInsert: !elements.templatePopover.open
+        };
+
+        state.settings = {
+          ...state.settings,
+          agentMode: "approve",
+          includeScreenshot: true,
+          mcpEnabled: false,
+          siteProfiles: {
+            ...state.settings.siteProfiles,
+            "https://example.test": { enabled: true, includeScreenshot: false }
+          }
+        };
+        state.activeTab = { id: ${JSON.stringify(tabId)}, title: "Agent test dashboard", url: "https://example.test/dashboard" };
+        state.lastContext = null;
+        applySiteProfileForActiveTab();
+        const site = {
+          target: elements.siteProfileTarget.textContent,
+          agentMode: state.runtimeSettings.agentMode,
+          includeScreenshot: state.runtimeSettings.includeScreenshot,
+          mcpEnabled: state.runtimeSettings.mcpEnabled,
+          agentModeField: elements.siteInputs.agentMode.value,
+          screenshotField: elements.siteInputs.includeScreenshot.value,
+          mcpField: elements.siteInputs.mcpEnabled.value
+        };
+
+        resetTabScopedState();
+        state.activeTab = { id: ${JSON.stringify(testTabIds[0])}, title: "Goal tab A", url: ${JSON.stringify(testUrl)} };
+        elements.goalInput.value = "화면 상태를 확인하고 근거를 남기기";
+        elements.goalPopover.open = true;
+        pinGoalFromInput();
+        const popoverClosedAfterPin = !elements.goalPopover.open;
+        await persistCurrentSession();
+        await sessionWriteQueue;
+        resetTabScopedState();
+        state.activeTab = { id: ${JSON.stringify(testTabIds[0])}, title: "Goal tab A", url: ${JSON.stringify(testUrl)} };
+        await restoreConversationForActiveTab();
+        const restored = state.pinnedGoal;
+        const readOnly = elements.goalInput.readOnly;
+        state.conversation = [{ role: "user", text: "대화만 비우기 검증" }];
+        clearConversation();
+        await sessionWriteQueue;
+        const retainedAfterClear = state.pinnedGoal;
+        resetTabScopedState();
+        state.activeTab = { id: ${JSON.stringify(testTabIds[1])}, title: "Goal tab B", url: ${JSON.stringify(testUrl)} };
+        await restoreConversationForActiveTab();
+        const otherTabGoal = state.pinnedGoal;
+        const goal = { restored, readOnly, otherTabGoal, retainedAfterClear, popoverClosedAfterPin };
+        return { template, site, goal };
+    })()`);
+
+    return { layouts, approvalModes, ...functional };
+  } finally {
+    try {
+      if (initialized) {
+        await evaluate(cdp, panelSessionId, `(async () => {
+        const original = globalThis.__panelContractSnapshot;
+        const storedSessions = await chrome.storage.local.get(SESSION_STORAGE_KEY);
+        const sessions = { ...(storedSessions[SESSION_STORAGE_KEY] || {}) };
+        for (const tabId of ${JSON.stringify(testTabIds)}) {
+          delete sessions[buildSessionKey(tabId, ${JSON.stringify(testUrl)})];
+        }
+        await chrome.storage.local.set({ [SESSION_STORAGE_KEY]: sessions });
+        state.settings = original.settings;
+        state.runtimeSettings = original.runtimeSettings;
+        state.activeTab = original.activeTab;
+        state.lastContext = original.lastContext;
+        state.conversation = original.conversation;
+        state.pinnedGoal = original.pinnedGoal;
+        state.goalEditing = original.goalEditing;
+        state.pickedElement = original.pickedElement;
+        state.undoStack = original.undoStack;
+        state.evaluationLogs = original.evaluationLogs;
+        state.currentPlan = original.currentPlan;
+        state.externalApprovals = original.externalApprovals;
+        state.selectedExternalOperationId = original.selectedExternalOperationId;
+        elements.messageList.replaceChildren();
+        for (const message of state.conversation) {
+          appendChatMessage(message.role, message.text, { tone: message.tone || "", record: false });
+        }
+        elements.goalInput.value = state.pinnedGoal;
+        elements.chatInput.value = "";
+        renderTemplateSelect();
+        hideApprovalPanel();
+        renderExternalApprovalPanel();
+        updateGoalUi();
+        updatePickedElementBadge();
+        updateAgentButtons();
+        elements.utilityMenu.open = original.utilityMenuOpen;
+        elements.goalPopover.open = original.goalPopoverOpen;
+        elements.templatePopover.open = original.templatePopoverOpen;
+        delete globalThis.__panelContractSnapshot;
+        delete globalThis.__panelContractDecision;
+        delete globalThis.__panelContractExternalApprovals;
+        })()`);
+      }
+    } finally {
+      await cdp.send("Emulation.clearDeviceMetricsOverride", {}, panelSessionId).catch(() => {});
+    }
+  }
+}
+
+async function exerciseAgentVerificationContracts({ cdp, panelSessionId, tabId, context }) {
+  return evaluate(cdp, panelSessionId, `(async () => {
+    const original = {
+      requestAiDecision,
+      collectDecisionObservation,
+      loadMcpToolContext,
+      settings: structuredClone(state.settings),
+      runtimeSettings: structuredClone(state.runtimeSettings),
+      activeTab: state.activeTab ? { ...state.activeTab } : null,
+      lastContext: state.lastContext ? structuredClone(state.lastContext) : null,
+      agentSession: state.agentSession,
+      agentRunUi: state.agentRunUi,
+      currentPlan: state.currentPlan,
+      conversation: structuredClone(state.conversation),
+      evaluationLogs: structuredClone(state.evaluationLogs)
+    };
+    const coherentScreenshot = "data:image/png;base64,Y29oZXJlbnQtdmlzdWFsLW9ic2VydmF0aW9u";
+    try {
+      resetTabScopedState();
+      state.activeTab = { id: ${JSON.stringify(tabId)}, title: ${JSON.stringify(context.title)}, url: ${JSON.stringify(context.url)} };
+      state.runtimeSettings = {
+        ...state.settings,
+        includeScreenshot: true,
+        mcpEnabled: false,
+        maxNoProgressSteps: 2,
+        maxActionsPerTurn: 3
+      };
+      createAgentSession("현재 화면을 근거로 확인해줘");
+      const session = state.agentSession;
+      const purposes = [];
+      const screenshotChecks = [];
+      collectDecisionObservation = async () => ({
+        context: ${JSON.stringify(context)},
+        screenshotDataUrl: coherentScreenshot
+      });
+      loadMcpToolContext = async () => ({ enabled: false, tools: [], error: "" });
+      requestAiDecision = async (activeSession, request) => {
+        purposes.push(request.purpose);
+        if (
+          request.purpose === "decision"
+          || request.purpose === "answer-grounding-repair"
+          || request.purpose.startsWith("answer-grounding-")
+          || request.purpose.startsWith("verifier-")
+        ) {
+          screenshotChecks.push(request.screenshotDataUrl === coherentScreenshot);
+        }
+        let payload;
+        if (request.purpose === "decision") {
+          payload = {
+            version: "1.0",
+            status: "answer",
+            message: "현재 화면에 상태 정보가 보입니다.",
+            summary: "화면 답변",
+            progress: "현재 화면을 읽었습니다.",
+            doneReason: "",
+            completionEvidence: [],
+            needsUserApproval: false,
+            plan: ["현재 화면 확인"],
+            toolCalls: [],
+            actions: [],
+            verification: { required: false, expectedChange: "", successCriteria: [] }
+          };
+        } else if (request.purpose.startsWith("answer-grounding-") && request.purpose !== "answer-grounding-repair") {
+          payload = {
+            version: "1.0",
+            status: "needs_more_evidence",
+            message: "답변을 현재 화면 근거에 맞춰 다시 작성해야 합니다.",
+            evidenceIds: [],
+            missingEvidence: ["현재 화면과 직접 연결된 표현"],
+            confidence: 0.3
+          };
+        } else if (request.purpose === "answer-grounding-repair") {
+          payload = {
+            version: "1.0",
+            status: "completed",
+            message: "현재 화면 확인을 완료했습니다.",
+            summary: "화면 확인 완료",
+            progress: "현재 뷰포트 근거를 확보했습니다.",
+            doneReason: "현재 화면 관찰 근거로 확인됨",
+            completionEvidence: [activeSession.currentPageEvidenceId],
+            needsUserApproval: false,
+            plan: ["현재 화면 확인"],
+            toolCalls: [],
+            actions: [],
+            verification: {
+              required: true,
+              expectedChange: "현재 화면 관찰",
+              successCriteria: ["현재 뷰포트 근거 확인"]
+            }
+          };
+        } else if (request.purpose.startsWith("verifier-")) {
+          payload = {
+            version: "1.0",
+            status: "verified",
+            message: "현재 화면 관찰 근거로 완료를 확인했습니다.",
+            evidenceIds: [activeSession.currentPageEvidenceId],
+            missingEvidence: [],
+            confidence: 0.99
+          };
+        } else {
+          throw new Error(\`Unexpected verification purpose: \${request.purpose}\`);
+        }
+        return { text: JSON.stringify(payload), audit: null };
+      };
+
+      const repairedDecision = await requestChatDecision(session);
+
+      const evidenceSession = {
+        ...session,
+        runId: "viewport-evidence-contract",
+        history: [],
+        evidence: [],
+        currentPageEvidenceId: ""
+      };
+      const previousContext = structuredClone(${JSON.stringify(context)});
+      previousContext.viewport = { ...previousContext.viewport, scrollY: 0 };
+      previousContext.pageState = { ...previousContext.pageState, domRevision: 1 };
+      const currentContext = structuredClone(previousContext);
+      currentContext.viewport.scrollY = 640;
+      currentContext.pageState.domRevision = 2;
+      const previousEvidence = registerObservationEvidence(evidenceSession, previousContext, 1);
+      const currentEvidence = registerObservationEvidence(evidenceSession, currentContext, 2);
+      evidenceSession.currentPageEvidenceId = currentEvidence.id;
+      requestAiDecision = async (_activeSession, request) => ({
+        text: JSON.stringify({
+          version: "1.0",
+          status: "verified",
+          message: "근거 확인",
+          evidenceIds: [previousEvidence.id],
+          missingEvidence: [],
+          confidence: 0.9
+        }),
+        audit: null
+      });
+      const previousViewportEvidence = await requestAnswerGroundingVerification(
+        evidenceSession,
+        { message: "이전 화면 주장", summary: "", progress: "" },
+        currentContext,
+        2,
+        coherentScreenshot
+      );
+      requestAiDecision = async () => ({
+        text: JSON.stringify({
+          version: "1.0",
+          status: "verified",
+          message: "현재 근거 확인",
+          evidenceIds: [currentEvidence.id],
+          missingEvidence: [],
+          confidence: 0.99
+        }),
+        audit: null
+      });
+      const currentViewportEvidence = await requestAnswerGroundingVerification(
+        evidenceSession,
+        { message: "현재 화면 주장", summary: "", progress: "" },
+        currentContext,
+        2,
+        coherentScreenshot
+      );
+
+      return {
+        repairedStatus: repairedDecision.status,
+        completionVerified: repairedDecision.verifier?.status === "verified",
+        purposes,
+        allVisualVerificationCallsReceivedScreenshot: screenshotChecks.length >= 4 && screenshotChecks.every(Boolean),
+        previousViewportEvidenceStatus: previousViewportEvidence.status,
+        currentViewportEvidenceStatus: currentViewportEvidence.status
+      };
+    } finally {
+      requestAiDecision = original.requestAiDecision;
+      collectDecisionObservation = original.collectDecisionObservation;
+      loadMcpToolContext = original.loadMcpToolContext;
+      state.settings = original.settings;
+      state.runtimeSettings = original.runtimeSettings;
+      state.activeTab = original.activeTab;
+      state.lastContext = original.lastContext;
+      state.agentSession = original.agentSession;
+      state.agentRunUi = original.agentRunUi;
+      state.currentPlan = original.currentPlan;
+      state.conversation = original.conversation;
+      state.evaluationLogs = original.evaluationLogs;
+      elements.messageList.replaceChildren();
+      for (const message of state.conversation) {
+        appendChatMessage(message.role, message.text, { tone: message.tone || "", record: false });
+      }
+      updateAgentButtons();
+    }
+  })()`);
+}
+
+async function exerciseTabTransitionContracts({ cdp, panelSessionId }) {
+  return evaluate(cdp, panelSessionId, `(async () => {
+    const original = {
+      readActiveTabSummary,
+      persistCurrentSession,
+      restoreConversationForActiveTab,
+      activeTab: state.activeTab ? { ...state.activeTab } : null,
+      lastContext: state.lastContext ? structuredClone(state.lastContext) : null,
+      agentSession: state.agentSession,
+      conversation: structuredClone(state.conversation),
+      busy: state.busy,
+      pending: state.activeTabTransitionPending,
+      revision: state.activeTabTransitionRevision,
+      queued: state.activeTabTransitionQueued,
+      running: state.activeTabTransitionRunning
+    };
+    try {
+      await activeTabTransitionQueue.catch(() => {});
+      state.activeTabTransitionPending = false;
+      state.activeTabTransitionQueued = false;
+      state.activeTabTransitionRunning = false;
+      state.busy = false;
+      state.activeTab = { id: 980001, title: "Tab A", url: "https://example.test/a" };
+      state.lastContext = null;
+      state.conversation = [{ role: "user", text: "유지해야 하는 실행 중 메시지" }];
+      persistCurrentSession = async () => {};
+      restoreConversationForActiveTab = async () => false;
+
+      let releaseLookup;
+      readActiveTabSummary = () => new Promise((resolve) => {
+        releaseLookup = () => resolve({ id: 980002, title: "Tab B", url: "https://example.test/b" });
+      });
+      const firstTransition = scheduleActiveTabTransition();
+      await Promise.resolve();
+      await Promise.resolve();
+      state.busy = true;
+      state.agentSession = {
+        targetTabId: 980001,
+        status: "running",
+        stopRequested: false
+      };
+      releaseLookup();
+      await firstTransition;
+      const preservedRunningSession = state.activeTab.id === 980001
+        && state.agentSession?.targetTabId === 980001
+        && state.conversation[0]?.text === "유지해야 하는 실행 중 메시지"
+        && state.activeTabTransitionPending;
+
+      let deferredLookupCount = 0;
+      readActiveTabSummary = async () => {
+        deferredLookupCount += 1;
+        return { id: 980003, title: "Tab C", url: "https://example.test/c" };
+      };
+      scheduleActiveTabTransition();
+      await Promise.resolve();
+      const deferredWhileBound = deferredLookupCount === 0 && state.activeTabTransitionPending;
+      state.agentSession.status = "stopped";
+      state.agentSession.stopRequested = true;
+      state.busy = false;
+      resumeActiveTabTransition();
+      await settleActiveTabTransitions();
+      const resumedOnLatestTab = state.activeTab.id === 980003 && !state.activeTabTransitionPending;
+      return { preservedRunningSession, deferredWhileBound, resumedOnLatestTab };
+    } finally {
+      readActiveTabSummary = original.readActiveTabSummary;
+      persistCurrentSession = original.persistCurrentSession;
+      restoreConversationForActiveTab = original.restoreConversationForActiveTab;
+      state.activeTab = original.activeTab;
+      state.lastContext = original.lastContext;
+      state.agentSession = original.agentSession;
+      state.conversation = original.conversation;
+      state.busy = original.busy;
+      state.activeTabTransitionPending = original.pending;
+      state.activeTabTransitionRevision = original.revision;
+      state.activeTabTransitionQueued = original.queued;
+      state.activeTabTransitionRunning = original.running;
+      elements.messageList.replaceChildren();
+      for (const message of state.conversation) {
+        appendChatMessage(message.role, message.text, { tone: message.tone || "", record: false });
+      }
+      updateAgentButtons();
+    }
+  })()`);
+}
+
 async function extensionMessage(cdp, sessionId, message) {
   return evaluate(cdp, sessionId, `chrome.runtime.sendMessage(${JSON.stringify(message)})`);
+}
+
+function toolData(result) {
+  assert.notEqual(result?.isError, true, result?.content?.[0]?.text || "MCP tool call failed.");
+  if (result?.structuredContent && typeof result.structuredContent === "object") {
+    return result.structuredContent;
+  }
+  return JSON.parse(result?.content?.[0]?.text || "null");
 }
 
 async function readInputValue(cdp, targetId) {
   const sessionId = await attach(cdp, targetId);
   return evaluate(cdp, sessionId, "document.querySelector('#name')?.value || ''");
+}
+
+async function capturePanelScreenshot(cdp, panelSessionId, filename) {
+  await cdp.send("Emulation.setDeviceMetricsOverride", {
+    width: 420,
+    height: 900,
+    deviceScaleFactor: 1,
+    mobile: false,
+  }, panelSessionId);
+  const { data } = await cdp.send("Page.captureScreenshot", {
+    format: "png",
+    fromSurface: true,
+    captureBeyondViewport: false,
+  }, panelSessionId);
+  await writeFile(path.join(root, "docs", "assets", filename), Buffer.from(data, "base64"));
+}
+
+async function runLocalHarnessBridgeScenario({ cdp, companion, firstTargetId, panelSessionId }) {
+  const automationValue = `local-harness-${randomUUID().slice(0, 8)}`;
+  const mcpServerName = "my_assistant_web";
+  const mcpConfigPath = path.join(temporaryRoot, "local-harness-mcp.json");
+  const mcpConfig = {
+    mcpServers: {
+      [mcpServerName]: {
+        type: "http",
+        url: companion.endpoints.mcp,
+        headers: {
+          Authorization: `Bearer ${companion.mcpToken}`,
+        },
+      },
+    },
+  };
+  await writeFile(mcpConfigPath, `${JSON.stringify(mcpConfig, null, 2)}\n`, { mode: 0o600 });
+  await chmod(mcpConfigPath, 0o600);
+
+  const toolPrefix = `mcp__${mcpServerName}__`;
+  const allowedTools = [
+    "browser_status",
+    "browser_session_start",
+    "browser_observe",
+    "browser_execute",
+    "browser_operation_get",
+    "browser_session_close",
+  ].map((name) => `${toolPrefix}${name}`);
+  const prompt = [
+    "사용자는 MCP 도구를 지원하는 로컬 CLI 채팅만 사용하고 있습니다.",
+    "my_assistant_web MCP 도구로 공유된 탭의 현재 보이는 화면만 관찰한 뒤 Name 입력란에 아래 테스트 값을 입력하세요.",
+    `테스트 값: ${automationValue}`,
+    "browser_status, browser_session_start, browser_observe 순서로 시작하고, 관찰에서 받은 최신 ref만 사용하세요.",
+    "상태 변경 작업이 waiting_approval이면 새 작업을 만들지 말고 같은 operation_id를 browser_operation_get으로 조회하세요.",
+    "완료 뒤 다시 관찰하고 browser_session_close로 세션을 닫으세요.",
+    "모든 단계가 끝나기 전에는 진행 설명만 출력해서 턴을 끝내지 말고, 필요한 다음 MCP 도구 호출을 계속 반환하세요.",
+    "최종 답변에는 실제 관찰에서 보였던 제목과 상태, 입력한 테스트 값만 간단히 적고 관찰되지 않은 페이지 내용은 추측하지 마세요.",
+  ].join("\n");
+  const continuationSystemPrompt = [
+    "For an explicit tool-driven task, an intermediate text-only answer ends the CLI run and is therefore a failure.",
+    "While the objective is incomplete and a next tool call is possible, emit the next valid tool_use without progress narration.",
+    "After every tool result, follow its next instruction and continue autonomously.",
+    "Repair correctable schema errors with the existing session and returned IDs; do not restart a live session.",
+    "Return user-facing text only after the objective is verified and the browser session is closed.",
+  ].join(" ");
+  const harnessCommand = String(process.env.LOCAL_HARNESS_BIN || "").trim();
+  assert.ok(
+    harnessCommand,
+    "LOCAL_HARNESS_BIN must point to a compatible local CLI when --local-harness is enabled.",
+  );
+  const harnessProcess = spawn(harnessCommand, [
+    "--bare",
+    "--no-chrome",
+    "--tools",
+    "",
+    "--allowedTools",
+    ...allowedTools,
+    "--permission-mode",
+    "dontAsk",
+    "--append-system-prompt",
+    continuationSystemPrompt,
+    "--mcp-config",
+    mcpConfigPath,
+    "--strict-mcp-config",
+    "--no-session-persistence",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--print",
+    prompt,
+  ], {
+    cwd: root,
+    env: process.env,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const harnessResultPromise = collectProcessResult(harnessProcess, 180_000);
+
+  let pendingOperation;
+  try {
+    pendingOperation = await Promise.race([
+      poll(
+        async () => extensionMessage(cdp, panelSessionId, { type: "LIST_EXTERNAL_APPROVALS" }),
+        (response) => response?.ok && response.data.operations.some(
+          (operation) => operation.status === "waiting_approval",
+        ),
+        120_000,
+      ).then((response) => response.data.operations.find(
+        (operation) => operation.status === "waiting_approval",
+      )),
+      harnessResultPromise.then((result) => {
+        throw new Error(
+          `The local CLI harness exited before requesting extension approval.\n${summarizeHarnessFailure(result)}`,
+        );
+      }),
+    ]);
+  } catch (error) {
+    harnessProcess.kill("SIGTERM");
+    throw error;
+  }
+
+  const approvedOperation = await extensionMessage(cdp, panelSessionId, {
+    type: "APPROVE_EXTERNAL_OPERATION",
+    operationId: pendingOperation.operation_id,
+  });
+  assert.equal(approvedOperation.ok, true);
+  assert.equal(approvedOperation.data.operation.status, "completed");
+
+  const harnessResult = await harnessResultPromise;
+  assert.equal(harnessResult.code, 0, summarizeHarnessFailure(harnessResult));
+  const events = parseNdjson(harnessResult.stdout);
+  const initialization = events.find((event) => event.type === "system" && event.subtype === "init");
+  assert.equal(initialization?.model, "default");
+  assert.equal(initialization?.apiKeySource, "apiKeyHelper");
+  assert.equal(
+    initialization?.mcp_servers?.some(
+      (server) => server.name === mcpServerName && server.status === "connected",
+    ),
+    true,
+    `The local CLI harness did not connect the MCP server: ${JSON.stringify(initialization?.mcp_servers || [])}`,
+  );
+
+  const toolUses = events.flatMap((event) => (
+    event.type === "assistant" && Array.isArray(event.message?.content)
+      ? event.message.content.filter((item) => item.type === "tool_use")
+      : []
+  ));
+  const calledTools = new Set(toolUses.map((toolUse) => toolUse.name));
+  const harnessTraceSummary = [
+    `called tools: ${Array.from(calledTools).join(", ")}`,
+    `final result: ${events.findLast((event) => event.type === "result")?.result || ""}`,
+  ].join("\n");
+  for (const toolName of allowedTools) {
+    assert.equal(
+      calledTools.has(toolName),
+      true,
+      `The local CLI harness did not call ${toolName}.\n${harnessTraceSummary}`,
+    );
+  }
+  const observeToolIds = new Set(
+    toolUses
+      .filter((toolUse) => toolUse.name === `${toolPrefix}browser_observe`)
+      .map((toolUse) => toolUse.id),
+  );
+  const observeResults = events
+    .filter((event) => (
+      event.type === "user"
+      && event.message?.content?.some(
+        (item) => item.type === "tool_result" && observeToolIds.has(item.tool_use_id),
+      )
+    ))
+    .map((event) => event.tool_use_result?.structuredContent)
+    .filter(Boolean);
+  assert.ok(observeResults.length, "The local CLI harness did not receive a structured browser observation.");
+  for (const observation of observeResults) {
+    assert.equal(
+      Object.hasOwn(observation.context || {}, "browser"),
+      false,
+      "External browser observations must not expose unrelated tab inventory or browser IDs.",
+    );
+  }
+  assert.equal(
+    events
+      .filter((event) => event.type === "assistant")
+      .every((event) => event.message?.model === "default"),
+    true,
+    "Every local CLI assistant turn must be served by the vLLM model alias 'default'.",
+  );
+
+  const finalResult = events.findLast((event) => event.type === "result");
+  assert.equal(finalResult?.subtype, "success");
+  assert.match(finalResult?.result || "", new RegExp(automationValue));
+  assert.doesNotMatch(finalResult?.result || "", /Hidden DOM fact|Offscreen viewport fact/);
+  assert.equal(await readInputValue(cdp, firstTargetId), automationValue);
+
+  process.stdout.write(
+    `Local CLI + vLLM Bridge E2E passed: model=default, MCP tools=${calledTools.size}, value=${automationValue}.\n`,
+  );
+}
+
+function collectProcessResult(child, timeoutMs) {
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk) => {
+    stdout += chunk.toString("utf8");
+  });
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk.toString("utf8");
+  });
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      child.kill("SIGTERM");
+      reject(new Error(`Local CLI integration timed out after ${timeoutMs}ms.`));
+    }, timeoutMs);
+    child.once("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.once("close", (code, signal) => {
+      clearTimeout(timer);
+      resolve({ code, signal, stdout, stderr });
+    });
+  });
+}
+
+function parseNdjson(output) {
+  return output
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+}
+
+function summarizeHarnessFailure(result) {
+  const stdoutTail = result.stdout.slice(-4_000);
+  const stderrTail = result.stderr.slice(-4_000);
+  return [
+    `exit=${result.code ?? "unknown"} signal=${result.signal || "none"}`,
+    stdoutTail && `stdout:\n${stdoutTail}`,
+    stderrTail && `stderr:\n${stderrTail}`,
+  ].filter(Boolean).join("\n");
 }
 
 async function navigateTarget(cdp, targetId, url) {

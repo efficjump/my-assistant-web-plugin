@@ -82,6 +82,31 @@ test("rejects invented refs and completion without evidence", () => {
   assert.match(validation.errors.join(" "), /completionEvidence/);
 });
 
+test("rejects actions against controls that are visibly disabled", () => {
+  const disabledContext = {
+    ...context,
+    interactiveElements: [{ ...context.interactiveElements[0], disabled: true, actionability: "disabled" }]
+  };
+  const decision = Core.normalizeDecision(baseDecision(), { maxEffects: 3 });
+  const validation = Core.validateDecision(decision, { context: disabledContext });
+  assert.equal(validation.valid, false);
+  assert.match(validation.errors.join(" "), /비활성화/);
+
+  const ariaDisabledContext = {
+    ...context,
+    interactiveElements: [{ ...context.interactiveElements[0], ariaDisabled: true, actionability: "disabled" }]
+  };
+  const ariaValidation = Core.validateDecision(decision, { context: ariaDisabledContext });
+  assert.equal(ariaValidation.valid, false);
+  assert.match(ariaValidation.errors.join(" "), /aria-disabled/);
+});
+
+test("decision contract distinguishes the visual viewport from hidden DOM metadata", () => {
+  const contract = Core.buildDecisionContractText();
+  assert.match(contract, /visual viewport/i);
+  assert.match(contract, /offscreen, clipped, occluded, or hidden DOM/i);
+});
+
 test("rejects a syntactically valid but blank user-facing decision", () => {
   const decision = Core.normalizeDecision({
     version: "1.0",

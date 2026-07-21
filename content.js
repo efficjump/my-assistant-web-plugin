@@ -11,8 +11,42 @@ const assistantPageState = {
   documentId: createDocumentId(),
   scopes: [],
   observedRoots: new WeakSet(),
-  mutationObservers: []
+  mutationObservers: [],
+  visualOccluderCache: new WeakMap()
 };
+
+const INTERACTIVE_ROLES = new Set([
+  "button",
+  "checkbox",
+  "combobox",
+  "gridcell",
+  "link",
+  "menuitem",
+  "menuitemcheckbox",
+  "menuitemradio",
+  "option",
+  "radio",
+  "scrollbar",
+  "searchbox",
+  "slider",
+  "spinbutton",
+  "switch",
+  "tab",
+  "textbox",
+  "treeitem"
+]);
+
+const NATIVE_INTERACTIVE_TAGS = new Set([
+  "a",
+  "audio",
+  "button",
+  "input",
+  "label",
+  "select",
+  "summary",
+  "textarea",
+  "video"
+]);
 
 observePageMutations();
 
@@ -42,19 +76,19 @@ async function handleContentMessage(message) {
 
 function collectPageContext(options) {
   assistantPageState.elementsByRef.clear();
+  assistantPageState.visualOccluderCache = new WeakMap();
   assistantPageState.scopes = collectDomScopes();
   observeDomScopes(assistantPageState.scopes);
 
   const maxTextChars = clampNumber(options.maxTextChars, 4000, 50000, 16000);
   const maxElements = clampNumber(options.maxElements, 20, 180, 80);
   const redactSensitiveData = options.redactSensitiveData !== false;
-  const interactiveElements = collectInteractiveElements(maxElements, redactSensitiveData);
+  const interactiveElementCollection = collectInteractiveElements(maxElements, redactSensitiveData);
+  const interactiveElements = interactiveElementCollection.elements;
+  const collectedVisibleText = collectVisibleText(maxTextChars);
   const visibleText = redactSensitiveData
-    ? redactSensitiveText(collectVisibleText(maxTextChars))
-    : collectVisibleText(maxTextChars);
-  const documentTextExcerpt = redactSensitiveData
-    ? redactSensitiveText(normalizeWhitespace(document.body?.innerText || "").slice(0, maxTextChars))
-    : normalizeWhitespace(document.body?.innerText || "").slice(0, maxTextChars);
+    ? redactSensitiveText(collectedVisibleText)
+    : collectedVisibleText;
 
   return {
     documentId: assistantPageState.documentId,
@@ -72,7 +106,13 @@ function collectPageContext(options) {
     },
     selection: redactSensitiveData ? redactSensitiveText(getSelectionText()) : getSelectionText(),
     visibleText,
-    documentTextExcerpt,
+    // Kept as a compatibility alias, but deliberately scoped to the visual viewport.
+    documentTextExcerpt: visibleText,
+    observationScope: {
+      kind: "visual-viewport",
+      includes: ["painted text", "visually exposed controls"],
+      excludes: ["offscreen content", "clipped content", "occluded content", "hidden DOM"]
+    },
     headings: collectHeadings(24, redactSensitiveData),
     landmarks: collectLandmarks(24, redactSensitiveData),
     forms: collectForms(12, redactSensitiveData),
@@ -85,6 +125,7 @@ function collectPageContext(options) {
       parentId: scope.parentId || "",
       sameOrigin: scope.sameOrigin !== false
     })),
+    interactiveElementStats: interactiveElementCollection.stats,
     interactiveElements
   };
 }
@@ -193,6 +234,8 @@ function getGlobalRect(element) {
   const rect = element.getBoundingClientRect();
   let x = rect.left;
   let y = rect.top;
+  let width = rect.width;
+  let height = rect.height;
   let currentWindow = element.ownerDocument?.defaultView;
   const visited = new Set();
   while (currentWindow && currentWindow !== window && !visited.has(currentWindow)) {
@@ -202,11 +245,15 @@ function getGlobalRect(element) {
       break;
     }
     const frameRect = frame.getBoundingClientRect();
-    x += frameRect.left;
-    y += frameRect.top;
+    const scaleX = frame.offsetWidth ? frameRect.width / frame.offsetWidth : 1;
+    const scaleY = frame.offsetHeight ? frameRect.height / frame.offsetHeight : 1;
+    x = frameRect.left + (frame.clientLeft + x) * scaleX;
+    y = frameRect.top + (frame.clientTop + y) * scaleY;
+    width *= scaleX;
+    height *= scaleY;
     currentWindow = frame.ownerDocument?.defaultView;
   }
-  return { left: x, top: y, right: x + rect.width, bottom: y + rect.height, width: rect.width, height: rect.height };
+  return { left: x, top: y, right: x + width, bottom: y + height, width, height };
 }
 
 function isDomInstance(element, constructorName) {
@@ -215,40 +262,44 @@ function isDomInstance(element, constructorName) {
 }
 
 function collectInteractiveElements(maxElements, redactSensitiveData) {
-  const selector = [
-    "a[href]",
-    "button",
-    "input",
-    "textarea",
-    "select",
-    "summary",
-    "[contenteditable='']",
-    "[contenteditable='true']",
-    "[role='button']",
-    "[role='link']",
-    "[role='menuitem']",
-    "[role='checkbox']",
-    "[role='radio']",
-    "[role='switch']",
-    "[role='tab']",
-    "[role='option']",
-    "[tabindex]:not([tabindex='-1'])"
-  ].join(",");
+  const seen = new Set();
+  const candidates = [];
+  for (const [discoveryIndex, rawElement] of queryAllDom("*").entries()) {
+    if (!isPotentiallyInteractive(rawElement)) {
+      continue;
+    }
+    const rawHitPoint = findExposedPoint(rawElement);
+    if (!rawHitPoint) {
+      continue;
+    }
+    const element = canonicalInteractiveCandidate(rawElement);
+    if (!element || seen.has(element)) {
+      continue;
+    }
+    const hitPoint = element === rawElement ? rawHitPoint : findExposedPoint(element);
+    if (!hitPoint) {
+      continue;
+    }
+    seen.add(element);
+    candidates.push({
+      element,
+      hitPoint,
+      scope: findScopeForElement(element),
+      rect: getGlobalRect(element),
+      discoveryIndex
+    });
+  }
 
-  const scopeByElement = new Map();
-  const candidates = queryAllDom(selector)
-    .filter((element) => isVisible(element) && isNearViewport(element, 140))
-    .filter((element) => {
-      scopeByElement.set(element, findScopeForElement(element));
-      return true;
-    })
-    .slice(0, maxElements);
-
-  return candidates.map((element, index) => {
+  candidates.sort(compareInteractiveCandidatesByVisualPosition);
+  const includedCandidates = candidates.slice(0, maxElements);
+  const elements = includedCandidates.map((candidate, index) => {
+    const { element } = candidate;
     const ref = `e${index + 1}`;
     const info = describeInteractiveElement(element, ref, {
       redactSensitiveData,
-      scope: scopeByElement.get(element)
+      scope: candidate.scope,
+      hitPoint: candidate.hitPoint,
+      rect: candidate.rect
     });
     assistantPageState.elementsByRef.set(ref, {
       element,
@@ -257,11 +308,132 @@ function collectInteractiveElements(maxElements, redactSensitiveData) {
     });
     return info;
   });
+
+  return {
+    elements,
+    stats: {
+      total: candidates.length,
+      included: elements.length,
+      truncated: candidates.length > elements.length
+    }
+  };
+}
+
+function compareInteractiveCandidatesByVisualPosition(left, right) {
+  const topDifference = left.rect.top - right.rect.top;
+  if (Math.abs(topDifference) > 1) {
+    return topDifference;
+  }
+  const leftDifference = left.rect.left - right.rect.left;
+  if (Math.abs(leftDifference) > 1) {
+    return leftDifference;
+  }
+  return left.discoveryIndex - right.discoveryIndex;
+}
+
+function isPotentiallyInteractive(element) {
+  const tag = element.tagName?.toLowerCase() || "";
+  if (!tag || ["html", "body"].includes(tag) || shouldSkipElement(element)) {
+    return false;
+  }
+
+  if (hasStrongInteractionSignal(element)) {
+    return true;
+  }
+
+  const ownerWindow = element.ownerDocument?.defaultView || window;
+  const rect = element.getBoundingClientRect();
+  if (
+    rect.width <= 0 ||
+    rect.height <= 0 ||
+    rect.bottom <= 0 ||
+    rect.right <= 0 ||
+    rect.top >= ownerWindow.innerHeight ||
+    rect.left >= ownerWindow.innerWidth
+  ) {
+    return false;
+  }
+  return ownerWindow.getComputedStyle(element).cursor === "pointer" && hasActionDescriptor(element);
+}
+
+function hasStrongInteractionSignal(element) {
+  const tag = element.tagName?.toLowerCase() || "";
+
+  if (tag === "a" && element.hasAttribute("href")) {
+    return true;
+  }
+  if (tag === "label") {
+    return Boolean(element.htmlFor || element.querySelector?.("input,textarea,select,button"));
+  }
+  if (["audio", "video"].includes(tag) && !element.hasAttribute("controls")) {
+    return false;
+  }
+  if (NATIVE_INTERACTIVE_TAGS.has(tag) && tag !== "a") {
+    return String(element.getAttribute("type") || "").toLowerCase() !== "hidden";
+  }
+
+  const role = String(element.getAttribute("role") || "").trim().toLowerCase();
+  if (INTERACTIVE_ROLES.has(role)) {
+    return true;
+  }
+  if (element.isContentEditable || element.tabIndex >= 0) {
+    return true;
+  }
+  if (
+    typeof element.onclick === "function" ||
+    element.hasAttribute("onclick") ||
+    element.draggable ||
+    element.hasAttribute("aria-haspopup") ||
+    element.hasAttribute("aria-expanded") ||
+    element.hasAttribute("aria-pressed") ||
+    element.hasAttribute("aria-checked")
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function canonicalInteractiveCandidate(element) {
+  if (element.tagName?.toLowerCase() === "label" && element.control && isElementVisuallyExposed(element.control)) {
+    return element.control;
+  }
+  if (hasStrongInteractionSignal(element)) {
+    return element;
+  }
+
+  let ancestor = getLocalComposedParentElement(element);
+  while (ancestor?.ownerDocument === element.ownerDocument) {
+    if (hasStrongInteractionSignal(ancestor)) {
+      return ancestor;
+    }
+    ancestor = getLocalComposedParentElement(ancestor);
+  }
+
+  const ownerWindow = element.ownerDocument?.defaultView || window;
+  const hasPointerChild = Array.from(element.children || []).some((child) => (
+    !shouldSkipElement(child) &&
+    ownerWindow.getComputedStyle(child).cursor === "pointer" &&
+    hasActionDescriptor(child)
+  ));
+  return hasPointerChild ? null : element;
+}
+
+function hasActionDescriptor(element) {
+  if (
+    element.hasAttribute("aria-label") ||
+    element.hasAttribute("title") ||
+    element.hasAttribute("data-testid") ||
+    element.hasAttribute("data-test") ||
+    element.hasAttribute("data-cy")
+  ) {
+    return true;
+  }
+  return Boolean(normalizeWhitespace(element.innerText || element.textContent || ""));
 }
 
 function describeInteractiveElement(element, ref, options = {}) {
   const tag = element.tagName.toLowerCase();
-  const rect = getGlobalRect(element);
+  const rect = options.rect || getGlobalRect(element);
   const inputType = tag === "input" ? String(element.getAttribute("type") || "text").toLowerCase() : "";
   const controlType = "type" in element ? String(element.getAttribute("type") || element.type || "").toLowerCase() : "";
   const rawValue = readElementValue(element, inputType);
@@ -289,6 +461,10 @@ function describeInteractiveElement(element, ref, options = {}) {
     sensitive: isSensitiveElement(element, inputType, autocomplete),
     checked: "checked" in element ? Boolean(element.checked) : undefined,
     disabled: "disabled" in element ? Boolean(element.disabled) : undefined,
+    ariaDisabled: element.getAttribute("aria-disabled") === "true" || undefined,
+    actionability: ("disabled" in element && element.disabled) || element.getAttribute("aria-disabled") === "true"
+      ? "disabled"
+      : "interactive",
     href: href ? truncate(sanitizeUrlForContext(href, options.redactSensitiveData), 220) : undefined,
     formAction: formAction ? truncate(sanitizeUrlForContext(formAction, options.redactSensitiveData), 220) : undefined,
     formMethod: form ? String(form.method || "get").toLowerCase() : undefined,
@@ -300,13 +476,19 @@ function describeInteractiveElement(element, ref, options = {}) {
         disabled: option.disabled
       }))
       : undefined,
+    optionsSource: isDomInstance(element, "HTMLSelectElement")
+      ? "control-metadata-not-necessarily-visible"
+      : undefined,
     selector: buildCssSelector(element),
     rect: {
       x: Math.round(rect.left),
       y: Math.round(rect.top),
       width: Math.round(rect.width),
       height: Math.round(rect.height)
-    }
+    },
+    hitPoint: options.hitPoint
+      ? { x: Math.round(options.hitPoint.globalX), y: Math.round(options.hitPoint.globalY) }
+      : undefined
   });
 }
 
@@ -357,11 +539,11 @@ function readElementValue(element, inputType) {
 
 function collectHeadings(limit, redactSensitiveData) {
   return queryAllDom("h1,h2,h3,[role='heading']")
-    .filter((element) => isVisible(element))
+    .filter((element) => isElementVisuallyExposed(element))
     .slice(0, limit)
     .map((element) => ({
       level: Number(element.getAttribute("aria-level")) || Number(element.tagName.slice(1)) || undefined,
-      text: redactContextText(element.textContent || "", 220, redactSensitiveData)
+      text: redactContextText(collectVisibleTextWithin(element, 220), 220, redactSensitiveData)
     }))
     .filter((item) => item.text);
 }
@@ -384,27 +566,27 @@ function collectLandmarks(limit, redactSensitiveData) {
   ].join(",");
 
   return queryAllDom(selector)
-    .filter((element) => isVisible(element))
+    .filter((element) => isElementVisuallyExposed(element))
     .slice(0, limit)
     .map((element) => ({
       tag: element.tagName.toLowerCase(),
       role: element.getAttribute("role") || inferredRole(element, ""),
       label: redactContextText(getAccessibleName(element), 260, redactSensitiveData),
-      text: redactContextText(element.innerText || element.textContent || "", 280, redactSensitiveData)
+      text: redactContextText(collectVisibleTextWithin(element, 280), 280, redactSensitiveData)
     }))
     .filter((item) => item.label || item.text);
 }
 
 function collectForms(limit, redactSensitiveData) {
   return queryAllDom("form")
-    .filter((form) => isVisible(form))
+    .filter((form) => isElementVisuallyExposed(form))
     .slice(0, limit)
     .map((form) => ({
       label: redactContextText(getAccessibleName(form) || form.getAttribute("name") || "", 260, redactSensitiveData),
       action: truncate(sanitizeUrlForContext(form.action || location.href, redactSensitiveData), 220),
       method: String(form.method || "get").toLowerCase(),
       fields: Array.from(form.querySelectorAll("input,textarea,select,button"))
-        .filter((element) => isVisible(element))
+        .filter((element) => isElementVisuallyExposed(element))
         .slice(0, 30)
         .map((element) => ({
           tag: element.tagName.toLowerCase(),
@@ -424,27 +606,46 @@ function collectForms(limit, redactSensitiveData) {
 
 function collectTables(limit, redactSensitiveData) {
   return queryAllDom("table")
-    .filter((table) => isVisible(table))
+    .filter((table) => isElementVisuallyExposed(table))
     .slice(0, limit)
     .map((table) => {
-      const rows = Array.from(table.rows).slice(0, 12);
+      const rows = Array.from(table.rows)
+        .filter((row) => isElementVisuallyExposed(row))
+        .slice(0, 12);
       return {
-        caption: redactContextText(table.caption?.textContent || "", 220, redactSensitiveData),
-        headers: Array.from(table.querySelectorAll("th")).slice(0, 20).map((cell) => redactContextText(cell.textContent || "", 120, redactSensitiveData)),
-        rows: rows.map((row) => Array.from(row.cells).slice(0, 12).map((cell) => redactContextText(cell.textContent || "", 120, redactSensitiveData)))
+        caption: table.caption && isElementVisuallyExposed(table.caption)
+          ? redactContextText(collectVisibleTextWithin(table.caption, 220), 220, redactSensitiveData)
+          : "",
+        headers: Array.from(table.querySelectorAll("th"))
+          .filter((cell) => isElementVisuallyExposed(cell))
+          .slice(0, 20)
+          .map((cell) => redactContextText(collectVisibleTextWithin(cell, 120), 120, redactSensitiveData)),
+        rows: rows.map((row) => Array.from(row.cells)
+          .filter((cell) => isElementVisuallyExposed(cell))
+          .slice(0, 12)
+          .map((cell) => redactContextText(collectVisibleTextWithin(cell, 120), 120, redactSensitiveData)))
       };
     });
 }
 
 function collectIframes(limit, redactSensitiveData) {
   return queryAllDom("iframe")
-    .filter((iframe) => isVisible(iframe))
+    .filter((iframe) => isElementVisuallyExposed(iframe))
     .slice(0, limit)
     .map((iframe) => ({
       title: redactContextText(iframe.title || iframe.getAttribute("aria-label") || "", 260, redactSensitiveData),
       src: truncate(sanitizeUrlForContext(iframe.src || "", redactSensitiveData), 220),
+      contentAccess: getIframeContentAccess(iframe),
       rect: rectToJson(getGlobalRect(iframe))
     }));
+}
+
+function getIframeContentAccess(iframe) {
+  try {
+    return iframe.contentDocument?.documentElement ? "same-origin" : "metadata-only";
+  } catch {
+    return "metadata-only";
+  }
 }
 
 function collectPageState(redactSensitiveData) {
@@ -455,7 +656,7 @@ function collectPageState(redactSensitiveData) {
     domRevision: assistantPageState.domRevision,
     scrollWidth: Math.max(document.documentElement?.scrollWidth || 0, document.body?.scrollWidth || 0),
     scrollHeight: Math.max(document.documentElement?.scrollHeight || 0, document.body?.scrollHeight || 0),
-    activeElement: active && active !== document.body
+    activeElement: active && active !== document.body && isElementVisuallyExposed(active)
       ? {
         tag: active.tagName?.toLowerCase() || "",
         role: active.getAttribute?.("role") || "",
@@ -469,13 +670,13 @@ function collectLiveRegions(limit, redactSensitiveData) {
   return queryAllDom(
     "[role='alert'],[role='status'],[role='dialog'],[aria-live]:not([aria-live='off']),.error,.alert"
   )
-    .filter((element) => isVisible(element))
+    .filter((element) => isElementVisuallyExposed(element))
     .slice(0, limit)
     .map((element) => ({
       role: element.getAttribute("role") || "",
       ariaLive: element.getAttribute("aria-live") || "",
       label: redactContextText(getAccessibleName(element), 260, redactSensitiveData),
-      text: redactContextText(element.innerText || element.textContent || "", 500, redactSensitiveData)
+      text: redactContextText(collectVisibleTextWithin(element, 500), 500, redactSensitiveData)
     }))
     .filter((item) => item.label || item.text);
 }
@@ -500,7 +701,7 @@ function collectVisibleText(maxChars) {
           return ownerWindow.NodeFilter.FILTER_REJECT;
         }
         const parent = node.parentElement;
-        if (!parent || shouldSkipElement(parent) || !isVisible(parent) || !textNodeNearViewport(node)) {
+        if (!parent || shouldSkipElement(parent) || !isTextNodeVisuallyExposed(node)) {
           return ownerWindow.NodeFilter.FILTER_REJECT;
         }
         return ownerWindow.NodeFilter.FILTER_ACCEPT;
@@ -518,6 +719,34 @@ function collectVisibleText(maxChars) {
     }
   }
 
+  return normalizeWhitespace(parts.join("\n"));
+}
+
+function collectVisibleTextWithin(element, maxChars) {
+  const ownerDocument = element?.ownerDocument;
+  const ownerWindow = ownerDocument?.defaultView || window;
+  if (!ownerDocument || !element || maxChars <= 0) {
+    return "";
+  }
+
+  const parts = [];
+  let length = 0;
+  const walker = ownerDocument.createTreeWalker(element, ownerWindow.NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      const text = normalizeWhitespace(node.nodeValue || "");
+      if (!text || !isTextNodeVisuallyExposed(node)) {
+        return ownerWindow.NodeFilter.FILTER_REJECT;
+      }
+      return ownerWindow.NodeFilter.FILTER_ACCEPT;
+    }
+  });
+
+  while (walker.nextNode() && length < maxChars) {
+    const text = normalizeWhitespace(walker.currentNode.nodeValue || "");
+    const remaining = maxChars - length;
+    parts.push(text.slice(0, remaining));
+    length += text.length + 1;
+  }
   return normalizeWhitespace(parts.join("\n"));
 }
 
@@ -636,7 +865,7 @@ function executeSingleUndo(undo) {
   }
 
   if (undo.type === "restoreScroll") {
-    window.scrollTo({ left: Number(undo.x) || 0, top: Number(undo.y) || 0, behavior: "smooth" });
+    window.scrollTo({ left: Number(undo.x) || 0, top: Number(undo.y) || 0, behavior: "auto" });
     return { restoredScroll: true };
   }
 
@@ -881,7 +1110,7 @@ function tryResolveWaitElement(condition) {
 
 function readElementState(element, stateName) {
   if (stateName === "visible") {
-    return isVisible(element);
+    return isElementVisuallyExposed(element);
   }
   if (stateName === "enabled") {
     return !("disabled" in element) || !element.disabled;
@@ -940,14 +1169,23 @@ function clickElement(action) {
   const element = resolveElement(action);
   const mayNavigate = actionMayUnloadPage(element);
   prepareElementForAction(element);
+  assistantPageState.visualOccluderCache = new WeakMap();
+  const point = findExposedPoint(element);
+  if (!point) {
+    throw new Error("Resolved target is not exposed to the user or is covered by another element. Re-observe the page before clicking.");
+  }
+  dispatchPointerSequence(element, point, { activate: true });
+  const activate = () => activateDeepestHitTarget(element, point);
   if (mayNavigate) {
-    window.setTimeout(() => element.click(), 80);
+    window.setTimeout(activate, 80);
   } else {
-    element.click();
+    activate();
   }
   return {
     clicked: getAccessibleName(element) || element.tagName.toLowerCase(),
-    mayNavigate
+    mayNavigate,
+    point: { x: Math.round(point.globalX), y: Math.round(point.globalY) },
+    inputSequence: "pointer-mouse-click"
   };
 }
 
@@ -1018,18 +1256,16 @@ function focusElement(action) {
 function hoverElement(action) {
   const element = resolveElement(action);
   prepareElementForAction(element);
-  const rect = element.getBoundingClientRect();
-  for (const type of ["pointerover", "mouseover", "mouseenter", "pointermove", "mousemove"]) {
-    const EventType = type.startsWith("pointer") && globalThis.PointerEvent ? PointerEvent : MouseEvent;
-    element.dispatchEvent(new EventType(type, {
-      bubbles: type !== "mouseenter",
-      cancelable: true,
-      clientX: rect.left + rect.width / 2,
-      clientY: rect.top + rect.height / 2,
-      view: window
-    }));
+  assistantPageState.visualOccluderCache = new WeakMap();
+  const point = findExposedPoint(element);
+  if (!point) {
+    throw new Error("Resolved target is not exposed to the user or is covered by another element. Re-observe the page before hovering.");
   }
-  return { hovered: getAccessibleName(element) || element.tagName.toLowerCase() };
+  dispatchPointerSequence(element, point, { activate: false });
+  return {
+    hovered: getAccessibleName(element) || element.tagName.toLowerCase(),
+    point: { x: Math.round(point.globalX), y: Math.round(point.globalY) }
+  };
 }
 
 function submitElement(action) {
@@ -1087,7 +1323,7 @@ function scrollPage(action) {
     element.scrollIntoView({
       block: String(action.block || "center"),
       inline: String(action.inline || "nearest"),
-      behavior: "smooth"
+      behavior: "auto"
     });
     return { target: getAccessibleName(element) || element.tagName.toLowerCase() };
   }
@@ -1100,7 +1336,7 @@ function scrollPage(action) {
     right: { top: 0, left: amount }
   }[direction] || { top: amount, left: 0 };
 
-  window.scrollBy({ ...vector, behavior: "smooth" });
+  window.scrollBy({ ...vector, behavior: "auto" });
   return { direction, amount };
 }
 
@@ -1142,8 +1378,9 @@ function resolveElement(action) {
 
   if (action.text) {
     const text = normalizeWhitespace(String(action.text)).toLowerCase();
-    const matched = queryAllDom("a,button,input,textarea,select,[role],[tabindex]")
-      .filter((element) => isVisible(element))
+    const matched = queryAllDom("*")
+      .filter((element) => isPotentiallyInteractive(element))
+      .filter((element) => isElementVisuallyExposed(element))
       .find((element) => getAccessibleName(element).toLowerCase().includes(text));
     if (matched) {
       return matched;
@@ -1161,15 +1398,96 @@ function prepareElementForAction(element) {
   if ("disabled" in element && element.disabled) {
     throw new Error("Resolved target is disabled.");
   }
+  if (element.getAttribute("aria-disabled") === "true") {
+    throw new Error("Resolved target is aria-disabled.");
+  }
+  if (!isElementBoxRendered(element)) {
+    throw new Error("Resolved target is not rendered.");
+  }
 
   if (isDomInstance(element, "HTMLElement")) {
-    element.scrollIntoView({ block: "center", inline: "center", behavior: "smooth" });
+    element.scrollIntoView({ block: "center", inline: "center", behavior: "auto" });
     element.focus({ preventScroll: true });
   } else {
-    element.scrollIntoView({ block: "center", inline: "center", behavior: "smooth" });
+    element.scrollIntoView({ block: "center", inline: "center", behavior: "auto" });
   }
 
   highlightElement(element);
+}
+
+function dispatchPointerSequence(element, point, options = {}) {
+  const ownerWindow = element.ownerDocument?.defaultView || window;
+  const target = point.hitTarget || element;
+  const common = {
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+    clientX: point.x,
+    clientY: point.y,
+    screenX: point.globalX,
+    screenY: point.globalY,
+    button: 0,
+    buttons: 0,
+    view: ownerWindow
+  };
+
+  if (ownerWindow.PointerEvent) {
+    for (const type of ["pointerover", "pointerenter", "pointermove", ...(options.activate ? ["pointerdown"] : [])]) {
+      target.dispatchEvent(new ownerWindow.PointerEvent(type, {
+        ...common,
+        bubbles: type !== "pointerenter",
+        buttons: type === "pointerdown" ? 1 : 0,
+        pointerId: 1,
+        pointerType: "mouse",
+        isPrimary: true
+      }));
+    }
+  }
+  for (const type of ["mouseover", "mouseenter", "mousemove", ...(options.activate ? ["mousedown"] : [])]) {
+    target.dispatchEvent(new ownerWindow.MouseEvent(type, {
+      ...common,
+      bubbles: type !== "mouseenter",
+      buttons: type === "mousedown" ? 1 : 0
+    }));
+  }
+
+  if (!options.activate) {
+    return;
+  }
+  element.focus?.({ preventScroll: true });
+  if (ownerWindow.PointerEvent) {
+    target.dispatchEvent(new ownerWindow.PointerEvent("pointerup", {
+      ...common,
+      pointerId: 1,
+      pointerType: "mouse",
+      isPrimary: true
+    }));
+  }
+  target.dispatchEvent(new ownerWindow.MouseEvent("mouseup", common));
+}
+
+function activateDeepestHitTarget(element, point) {
+  const target = point.hitTarget && (point.hitTarget === element || element.contains(point.hitTarget))
+    ? point.hitTarget
+    : element;
+  if (typeof target.click === "function") {
+    target.click();
+    return;
+  }
+
+  const ownerWindow = target.ownerDocument?.defaultView || window;
+  target.dispatchEvent(new ownerWindow.MouseEvent("click", {
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+    clientX: point.x,
+    clientY: point.y,
+    screenX: point.globalX,
+    screenY: point.globalY,
+    button: 0,
+    buttons: 0,
+    view: ownerWindow
+  }));
 }
 
 function actionMayUnloadPage(element) {
@@ -1316,7 +1634,7 @@ function isSensitiveElement(element, inputType, autocomplete) {
 }
 
 function highlightElement(element) {
-  const rect = element.getBoundingClientRect();
+  const rect = getGlobalRect(element);
   const overlay = getOrCreateHighlightOverlay();
   overlay.style.left = `${Math.max(0, rect.left - 4)}px`;
   overlay.style.top = `${Math.max(0, rect.top - 4)}px`;
@@ -1562,67 +1880,507 @@ function getStableAttribute(element) {
   return null;
 }
 
-function isVisible(element) {
+function isElementTreeRendered(element) {
   if (!element?.ownerDocument || !element?.tagName) {
     return false;
   }
 
-  if (shouldSkipElement(element)) {
-    return false;
+  let current = element;
+  let cumulativeOpacity = 1;
+  while (current?.ownerDocument) {
+    const ownerWindow = current.ownerDocument.defaultView || window;
+    const style = ownerWindow.getComputedStyle(current);
+    if (
+      style.display === "none" ||
+      style.contentVisibility === "hidden" ||
+      (current === element && ["hidden", "collapse"].includes(style.visibility))
+    ) {
+      return false;
+    }
+    cumulativeOpacity *= clampNumber(style.opacity, 0, 1, 1);
+    if (cumulativeOpacity <= 0.01) {
+      return false;
+    }
+    current = getComposedParentElement(current);
   }
 
-  const ownerWindow = element.ownerDocument?.defaultView || window;
-  const style = ownerWindow.getComputedStyle(element);
-  if (
-    style.display === "none" ||
-    style.visibility === "hidden" ||
-    style.visibility === "collapse" ||
-    Number(style.opacity) === 0
-  ) {
+  return true;
+}
+
+function isElementBoxRendered(element) {
+  if (!isElementTreeRendered(element)) {
     return false;
   }
-
   const rect = element.getBoundingClientRect();
   return rect.width > 0 && rect.height > 0;
 }
 
-function isNearViewport(element, margin) {
-  const rect = getGlobalRect(element);
+function isElementVisuallyExposed(element) {
+  return Boolean(findExposedPoint(element));
+}
+
+function findExposedPoint(element) {
+  if (!isElementBoxRendered(element)) {
+    return null;
+  }
+  const visibleRect = clipLocalRectForElement(element, element.getBoundingClientRect());
+  if (!visibleRect) {
+    return null;
+  }
+
+  for (const point of sampleRectPoints(visibleRect)) {
+    const hitTarget = hitTestForElement(element, point.x, point.y);
+    if (!hitTarget || !(hitTarget === element || element.contains(hitTarget))) {
+      continue;
+    }
+    if (hasPointerTransparentOccluder(element, point.x, point.y)) {
+      continue;
+    }
+    const framePoint = exposePointThroughFrameChain(element, point.x, point.y);
+    if (framePoint) {
+      return { ...point, ...framePoint, hitTarget };
+    }
+  }
+  return null;
+}
+
+function isTextNodeVisuallyExposed(textNode) {
+  const ownerDocument = textNode.ownerDocument || document;
+  const element = textNode.parentElement;
+  if (!element || !isElementTreeRendered(element)) {
+    return false;
+  }
+  const range = ownerDocument.createRange();
+  range.selectNodeContents(textNode);
+  const rects = Array.from(range.getClientRects());
+  range.detach?.();
+
+  return rects.some((rect) => {
+    const visibleRect = clipLocalRectForElement(element, rect, { includeSelf: true });
+    if (!visibleRect) {
+      return false;
+    }
+    return sampleRectPoints(visibleRect).some((point) => {
+      const hitTarget = hitTestForElement(element, point.x, point.y);
+      if (!hitTarget || !(hitTarget === element || element.contains(hitTarget))) {
+        return false;
+      }
+      if (hasPointerTransparentOccluder(element, point.x, point.y, { includeDescendants: true })) {
+        return false;
+      }
+      return Boolean(exposePointThroughFrameChain(element, point.x, point.y));
+    });
+  });
+}
+
+function clipLocalRectForElement(element, sourceRect, options = {}) {
+  const ownerWindow = element.ownerDocument?.defaultView || window;
+  let clipped = intersectRects(normalizeRect(sourceRect), {
+    left: 0,
+    top: 0,
+    right: ownerWindow.innerWidth,
+    bottom: ownerWindow.innerHeight
+  });
+  if (!clipped) {
+    return null;
+  }
+
+  let ancestor = options.includeSelf ? element : getLocalComposedParentElement(element);
+  while (ancestor?.ownerDocument === element.ownerDocument) {
+    const style = ownerWindow.getComputedStyle(ancestor);
+    const clipsX = clipsOverflow(style.overflowX) || String(style.contain || "").includes("paint");
+    const clipsY = clipsOverflow(style.overflowY) || String(style.contain || "").includes("paint");
+    if (clipsX || clipsY) {
+      const ancestorRect = normalizeRect(ancestor.getBoundingClientRect());
+      clipped = intersectRects(clipped, {
+        left: clipsX ? ancestorRect.left + ancestor.clientLeft : clipped.left,
+        right: clipsX ? ancestorRect.left + ancestor.clientLeft + ancestor.clientWidth : clipped.right,
+        top: clipsY ? ancestorRect.top + ancestor.clientTop : clipped.top,
+        bottom: clipsY ? ancestorRect.top + ancestor.clientTop + ancestor.clientHeight : clipped.bottom
+      });
+      if (!clipped) {
+        return null;
+      }
+    }
+    ancestor = getLocalComposedParentElement(ancestor);
+  }
+  return clipped;
+}
+
+function getLocalComposedParentElement(element) {
+  if (element.parentElement) {
+    return element.parentElement;
+  }
+  const root = element.getRootNode?.();
+  return root?.host || null;
+}
+
+function getComposedParentElement(element) {
+  const localParent = getLocalComposedParentElement(element);
+  if (localParent) {
+    return localParent;
+  }
+  const ownerWindow = element.ownerDocument?.defaultView;
+  if (!ownerWindow || ownerWindow === window) {
+    return null;
+  }
+  try {
+    return ownerWindow.frameElement || null;
+  } catch {
+    return null;
+  }
+}
+
+function clipsOverflow(value) {
+  return ["auto", "clip", "hidden", "scroll"].includes(String(value || "").toLowerCase());
+}
+
+function normalizeRect(rect) {
+  const left = Number(rect?.left) || 0;
+  const top = Number(rect?.top) || 0;
+  const right = Number.isFinite(Number(rect?.right)) ? Number(rect.right) : left + (Number(rect?.width) || 0);
+  const bottom = Number.isFinite(Number(rect?.bottom)) ? Number(rect.bottom) : top + (Number(rect?.height) || 0);
+  return { left, top, right, bottom, width: right - left, height: bottom - top };
+}
+
+function intersectRects(leftRect, rightRect) {
+  const left = Math.max(leftRect.left, rightRect.left);
+  const top = Math.max(leftRect.top, rightRect.top);
+  const right = Math.min(leftRect.right, rightRect.right);
+  const bottom = Math.min(leftRect.bottom, rightRect.bottom);
+  if (right - left <= 0.5 || bottom - top <= 0.5) {
+    return null;
+  }
+  return { left, top, right, bottom, width: right - left, height: bottom - top };
+}
+
+function sampleRectPoints(rect) {
+  const insetX = Math.min(2, rect.width / 4);
+  const insetY = Math.min(2, rect.height / 4);
+  const left = rect.left + insetX;
+  const right = rect.right - insetX;
+  const top = rect.top + insetY;
+  const bottom = rect.bottom - insetY;
+  const centerX = (left + right) / 2;
+  const centerY = (top + bottom) / 2;
+  return [
+    { x: centerX, y: centerY },
+    { x: left, y: top },
+    { x: right, y: top },
+    { x: left, y: bottom },
+    { x: right, y: bottom },
+    { x: centerX, y: top },
+    { x: centerX, y: bottom },
+    { x: left, y: centerY },
+    { x: right, y: centerY }
+  ];
+}
+
+function hitTestForElement(element, x, y) {
+  const root = element.getRootNode?.();
+  if (root && typeof root.elementFromPoint === "function") {
+    return root.elementFromPoint(x, y);
+  }
+  return element.ownerDocument?.elementFromPoint(x, y) || null;
+}
+
+function hasPointerTransparentOccluder(target, x, y, options = {}) {
+  const root = target.getRootNode?.() || target.ownerDocument;
+  for (const occluder of getPointerTransparentOccluders(root)) {
+    if (
+      occluder === target ||
+      occluder.hasAttribute?.("data-my-assistant-overlay") ||
+      occluder.contains(target) ||
+      (!options.includeDescendants && target.contains(occluder))
+    ) {
+      continue;
+    }
+    const rect = occluder.getBoundingClientRect();
+    if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) {
+      continue;
+    }
+    if (elementPaintsAtPoint(occluder, x, y) && isPaintedAbove(occluder, target)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function getPointerTransparentOccluders(root) {
+  const cached = assistantPageState.visualOccluderCache.get(root);
+  if (cached?.revision === assistantPageState.domRevision) {
+    return cached.elements;
+  }
+
+  const elements = [];
+  const ownerDocument = root.nodeType === 9 ? root : root.ownerDocument;
+  const ownerWindow = ownerDocument?.defaultView || window;
+  for (const element of Array.from(root.querySelectorAll?.("*") || [])) {
+    const style = ownerWindow.getComputedStyle(element);
+    if (style.pointerEvents !== "none" || !isElementBoxRendered(element) || !elementHasVisualPaint(element, style)) {
+      continue;
+    }
+    elements.push(element);
+  }
+  assistantPageState.visualOccluderCache.set(root, {
+    revision: assistantPageState.domRevision,
+    elements
+  });
+  return elements;
+}
+
+function elementHasVisualPaint(element, style) {
+  if (backgroundPaints(style) || borderPaints(style)) {
+    return true;
+  }
+  if (["canvas", "img", "picture", "svg", "video"].includes(element.tagName?.toLowerCase())) {
+    return true;
+  }
+  for (const pseudo of ["::before", "::after"]) {
+    const pseudoStyle = (element.ownerDocument?.defaultView || window).getComputedStyle(element, pseudo);
+    if (
+      pseudoStyle.content !== "none" &&
+      pseudoStyle.content !== "normal" &&
+      (backgroundPaints(pseudoStyle) || borderPaints(pseudoStyle))
+    ) {
+      return true;
+    }
+  }
+  return Array.from(element.childNodes || []).some((node) => (
+    node.nodeType === 3 && Boolean(normalizeWhitespace(node.nodeValue || ""))
+  ));
+}
+
+function elementPaintsAtPoint(element, x, y) {
+  const ownerWindow = element.ownerDocument?.defaultView || window;
+  const style = ownerWindow.getComputedStyle(element);
+  if (backgroundPaints(style)) {
+    return true;
+  }
+  if (["canvas", "img", "picture", "svg", "video"].includes(element.tagName?.toLowerCase())) {
+    return true;
+  }
+
+  const rect = element.getBoundingClientRect();
+  if (pointTouchesPaintedBorder(style, rect, x, y)) {
+    return true;
+  }
+  for (const node of Array.from(element.childNodes || [])) {
+    if (node.nodeType !== 3 || !normalizeWhitespace(node.nodeValue || "")) {
+      continue;
+    }
+    const range = element.ownerDocument.createRange();
+    range.selectNodeContents(node);
+    const containsPoint = Array.from(range.getClientRects()).some((textRect) => (
+      x >= textRect.left && x <= textRect.right && y >= textRect.top && y <= textRect.bottom
+    ));
+    range.detach?.();
+    if (containsPoint) {
+      return true;
+    }
+  }
+  for (const pseudo of ["::before", "::after"]) {
+    const pseudoStyle = ownerWindow.getComputedStyle(element, pseudo);
+    if (
+      pseudoStyle.content !== "none" &&
+      pseudoStyle.content !== "normal" &&
+      (backgroundPaints(pseudoStyle) || borderPaints(pseudoStyle))
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function backgroundPaints(style) {
   return (
-    rect.bottom >= -margin &&
-    rect.right >= -margin &&
-    rect.top <= window.innerHeight + margin &&
-    rect.left <= window.innerWidth + margin
+    colorAlpha(style.backgroundColor) > 0.01 ||
+    hasNonNoneCssValue(style.backgroundImage) ||
+    hasNonNoneCssValue(style.backdropFilter) ||
+    hasNonNoneCssValue(style.webkitBackdropFilter)
   );
 }
 
-function textNodeNearViewport(textNode) {
-  const ownerDocument = textNode.ownerDocument || document;
-  const range = ownerDocument.createRange();
-  range.selectNodeContents(textNode);
-  const element = textNode.parentElement;
-  const baseRect = element ? getGlobalRect(element) : null;
-  const localElementRect = element?.getBoundingClientRect();
-  const offsetX = baseRect && localElementRect ? baseRect.left - localElementRect.left : 0;
-  const offsetY = baseRect && localElementRect ? baseRect.top - localElementRect.top : 0;
-  const rects = Array.from(range.getClientRects()).map((rect) => ({
-    left: rect.left + offsetX,
-    right: rect.right + offsetX,
-    top: rect.top + offsetY,
-    bottom: rect.bottom + offsetY
-  }));
-  range.detach?.();
-  return rects.some((rect) => (
-    rect.bottom >= -20 &&
-    rect.right >= -20 &&
-    rect.top <= window.innerHeight + 20 &&
-    rect.left <= window.innerWidth + 20
+function hasNonNoneCssValue(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return Boolean(normalized && normalized !== "none");
+}
+
+function borderPaints(style) {
+  return ["Top", "Right", "Bottom", "Left"].some((side) => (
+    style[`border${side}Style`] !== "none" &&
+    Number.parseFloat(style[`border${side}Width`]) > 0 &&
+    colorAlpha(style[`border${side}Color`]) > 0.01
   ));
+}
+
+function pointTouchesPaintedBorder(style, rect, x, y) {
+  const sides = [
+    ["Top", y - rect.top],
+    ["Right", rect.right - x],
+    ["Bottom", rect.bottom - y],
+    ["Left", x - rect.left]
+  ];
+  return sides.some(([side, distance]) => (
+    distance >= 0 &&
+    distance <= Number.parseFloat(style[`border${side}Width`] || 0) &&
+    style[`border${side}Style`] !== "none" &&
+    colorAlpha(style[`border${side}Color`]) > 0.01
+  ));
+}
+
+function colorAlpha(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (!normalized || normalized === "transparent") {
+    return 0;
+  }
+  const rgba = normalized.match(/^rgba?\((.*)\)$/);
+  if (!rgba) {
+    return 1;
+  }
+  const parts = rgba[1].split(/[\s,/]+/).filter(Boolean);
+  return parts.length >= 4 ? clampNumber(parts[3], 0, 1, 1) : 1;
+}
+
+function isPaintedAbove(candidate, target) {
+  const candidateContexts = getStackingContextChain(candidate);
+  const targetContexts = getStackingContextChain(target);
+  let shared = 0;
+  while (
+    shared < candidateContexts.length &&
+    shared < targetContexts.length &&
+    candidateContexts[shared].element === targetContexts[shared].element
+  ) {
+    shared += 1;
+  }
+
+  const candidateLayer = candidateContexts[shared] || paintLayer(candidate);
+  const targetLayer = targetContexts[shared] || paintLayer(target);
+  if (candidateLayer.zIndex !== targetLayer.zIndex) {
+    return candidateLayer.zIndex > targetLayer.zIndex;
+  }
+  if (candidateLayer.layer !== targetLayer.layer) {
+    return candidateLayer.layer > targetLayer.layer;
+  }
+
+  const candidateAnchor = candidateLayer.element || candidate;
+  const targetAnchor = targetLayer.element || target;
+  if (candidateAnchor === targetAnchor || candidateAnchor.contains(targetAnchor)) {
+    return false;
+  }
+  if (targetAnchor.contains(candidateAnchor)) {
+    return true;
+  }
+  const position = candidateAnchor.compareDocumentPosition(targetAnchor);
+  const preceding = candidateAnchor.ownerDocument?.defaultView?.Node?.DOCUMENT_POSITION_PRECEDING || 2;
+  return Boolean(position & preceding);
+}
+
+function getStackingContextChain(element) {
+  const chain = [];
+  let current = element;
+  while (current?.ownerDocument) {
+    const style = (current.ownerDocument.defaultView || window).getComputedStyle(current);
+    if (createsStackingContext(current, style)) {
+      chain.unshift(paintLayer(current, style));
+    }
+    current = getLocalComposedParentElement(current);
+  }
+  return chain;
+}
+
+function createsStackingContext(element, style) {
+  const position = style.position;
+  const zIndex = style.zIndex;
+  const parentDisplay = element.parentElement
+    ? (element.ownerDocument.defaultView || window).getComputedStyle(element.parentElement).display
+    : "";
+  return (
+    element === element.ownerDocument.documentElement ||
+    ["fixed", "sticky"].includes(position) ||
+    (zIndex !== "auto" && (position !== "static" || /^(flex|inline-flex|grid|inline-grid)$/.test(parentDisplay))) ||
+    Number(style.opacity) < 1 ||
+    hasNonNoneCssValue(style.transform) ||
+    hasNonNoneCssValue(style.perspective) ||
+    hasNonNoneCssValue(style.filter) ||
+    hasNonNoneCssValue(style.backdropFilter) ||
+    style.isolation === "isolate" ||
+    Boolean(style.mixBlendMode && style.mixBlendMode !== "normal") ||
+    /(?:paint|layout|strict|content)/.test(style.contain || "") ||
+    /(?:transform|opacity|filter|perspective)/.test(style.willChange || "")
+  );
+}
+
+function paintLayer(element, providedStyle) {
+  const style = providedStyle || (element.ownerDocument.defaultView || window).getComputedStyle(element);
+  const parsedZIndex = Number.parseInt(style.zIndex, 10);
+  const zIndex = Number.isFinite(parsedZIndex) ? parsedZIndex : 0;
+  let layer;
+  if (zIndex < 0) {
+    layer = 0;
+  } else if (!["static", ""].includes(style.position) || createsStackingContext(element, style)) {
+    layer = zIndex > 0 ? 5 : 4;
+  } else if (style.float !== "none") {
+    layer = 2;
+  } else if (/^(inline|inline-block|inline-flex|inline-grid)$/.test(style.display)) {
+    layer = 3;
+  } else {
+    layer = 1;
+  }
+  return { element, zIndex, layer };
+}
+
+function exposePointThroughFrameChain(element, localX, localY) {
+  let currentElement = element;
+  let currentRoot = currentElement.getRootNode?.();
+  while (currentRoot?.host) {
+    const host = currentRoot.host;
+    const hitTarget = hitTestForElement(host, localX, localY);
+    if (!hitTarget || !(hitTarget === host || host.contains(hitTarget))) {
+      return null;
+    }
+    if (hasPointerTransparentOccluder(host, localX, localY)) {
+      return null;
+    }
+    currentElement = host;
+    currentRoot = currentElement.getRootNode?.();
+  }
+
+  let x = localX;
+  let y = localY;
+  let currentWindow = element.ownerDocument?.defaultView;
+  const visited = new Set();
+  while (currentWindow && currentWindow !== window && !visited.has(currentWindow)) {
+    visited.add(currentWindow);
+    let frame;
+    try {
+      frame = currentWindow.frameElement;
+    } catch {
+      return null;
+    }
+    if (!frame || !isElementBoxRendered(frame)) {
+      return null;
+    }
+    const frameRect = frame.getBoundingClientRect();
+    const scaleX = frame.offsetWidth ? frameRect.width / frame.offsetWidth : 1;
+    const scaleY = frame.offsetHeight ? frameRect.height / frame.offsetHeight : 1;
+    x = frameRect.left + (frame.clientLeft + x) * scaleX;
+    y = frameRect.top + (frame.clientTop + y) * scaleY;
+    const hitTarget = hitTestForElement(frame, x, y);
+    if (!hitTarget || !(hitTarget === frame || frame.contains(hitTarget))) {
+      return null;
+    }
+    if (hasPointerTransparentOccluder(frame, x, y)) {
+      return null;
+    }
+    currentWindow = frame.ownerDocument?.defaultView;
+  }
+  return { globalX: x, globalY: y };
 }
 
 function shouldSkipElement(element) {
   const tag = element.tagName?.toLowerCase();
-  return ["script", "style", "noscript", "template", "svg", "canvas"].includes(tag);
+  return ["script", "style", "noscript", "template", "canvas"].includes(tag);
 }
 
 function getSelectionText() {

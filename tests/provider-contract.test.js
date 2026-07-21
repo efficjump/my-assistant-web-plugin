@@ -12,7 +12,7 @@ function loadBackgroundFunctions(fetchImplementation = globalThis.fetch) {
       onInstalled: { addListener: (listener) => listeners.installed.push(listener) },
       onMessage: { addListener: (listener) => listeners.message.push(listener) },
       getURL: (value) => `chrome-extension://test/${value}`,
-      getManifest: () => ({ version: "0.3.1" }),
+      getManifest: () => ({ version: "0.4.0" }),
       lastError: null
     },
     action: { onClicked: { addListener: (listener) => listeners.clicked.push(listener) } },
