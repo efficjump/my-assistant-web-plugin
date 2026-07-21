@@ -9,30 +9,12 @@
   <body>
     <main class="app-shell">
       <header class="topbar">
-        <div class="agent-title">
-          <div class="agent-mark" aria-hidden="true">A</div>
-          <div class="agent-heading">
-            <h1>Agent</h1>
-            <div class="agent-subtitle" id="statusLine" aria-live="polite"></div>
-          </div>
+        <div class="agent-heading">
+          <h1 id="pageTitle">대기 중</h1>
+          <div class="agent-subtitle" id="statusLine" aria-live="polite"></div>
+          <span class="visually-hidden" id="pageUrl"></span>
         </div>
         <div class="topbar-actions">
-          <button class="icon-button" id="openContextButton" type="button" title="컨텍스트" aria-label="컨텍스트">
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M4 5h16" />
-              <path d="M4 12h10" />
-              <path d="M4 19h16" />
-              <path d="M18 10v4" />
-              <path d="M16 12h4" />
-            </svg>
-          </button>
-          <button class="icon-button" id="openExportButton" type="button" title="내보내기" aria-label="내보내기">
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M12 3v12" />
-              <path d="m7 10 5 5 5-5" />
-              <path d="M5 21h14" />
-            </svg>
-          </button>
           <button class="icon-button" id="pickElementButton" type="button" title="요소 선택" aria-label="요소 선택">
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <path d="M4 4h6" />
@@ -42,52 +24,68 @@
               <path d="m12 12 7-3-3 7-2-2-2 4-2-1 2-4-2-1Z" />
             </svg>
           </button>
-          <button class="icon-button" id="undoActionButton" type="button" title="되돌리기" aria-label="되돌리기" disabled>
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M9 14 4 9l5-5" />
-              <path d="M4 9h10a6 6 0 1 1 0 12h-2" />
-            </svg>
-          </button>
-          <button class="icon-button" id="refreshContextButton" type="button" title="새로고침" aria-label="새로고침">
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M20 12a8 8 0 1 1-2.34-5.66" />
-              <path d="M20 4v6h-6" />
-            </svg>
-          </button>
-          <button class="icon-button" id="clearChatButton" type="button" title="대화 비우기" aria-label="대화 비우기">
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M3 6h18" />
-              <path d="M8 6V4h8v2" />
-              <path d="M6 6l1 15h10l1-15" />
-              <path d="M10 11v6" />
-              <path d="M14 11v6" />
-            </svg>
-          </button>
           <button class="icon-button" id="openSettingsButton" type="button" title="설정" aria-label="설정">
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z" />
               <path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06A1.7 1.7 0 0 0 15 19.37a1.7 1.7 0 0 0-1 .58l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 11.5 15a1.7 1.7 0 0 0-.58-1l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 15 11.5a1.7 1.7 0 0 0 1-.58l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.7 1.7 0 0 0 19.4 15Z" />
             </svg>
           </button>
+          <details class="utility-menu" id="utilityMenu">
+            <summary class="icon-button" id="utilityMenuButton" title="더보기" aria-label="더보기">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <circle cx="5" cy="12" r="1" />
+                <circle cx="12" cy="12" r="1" />
+                <circle cx="19" cy="12" r="1" />
+              </svg>
+            </summary>
+            <div class="utility-menu-panel" aria-label="보조 기능">
+              <button class="utility-action" id="openContextButton" type="button">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M4 5h16" />
+                  <path d="M4 12h10" />
+                  <path d="M4 19h16" />
+                  <path d="M18 10v4" />
+                  <path d="M16 12h4" />
+                </svg>
+                <span>컨텍스트 확인</span>
+              </button>
+              <button class="utility-action" id="undoActionButton" type="button" disabled>
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M9 14 4 9l5-5" />
+                  <path d="M4 9h10a6 6 0 1 1 0 12h-2" />
+                </svg>
+                <span>마지막 작업 되돌리기</span>
+              </button>
+              <button class="utility-action" id="openExportButton" type="button">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M12 3v12" />
+                  <path d="m7 10 5 5 5-5" />
+                  <path d="M5 21h14" />
+                </svg>
+                <span>대화 내보내기</span>
+              </button>
+              <button class="utility-action danger-text" id="clearChatButton" type="button">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M3 6h18" />
+                  <path d="M8 6V4h8v2" />
+                  <path d="M6 6l1 15h10l1-15" />
+                  <path d="M10 11v6" />
+                  <path d="M14 11v6" />
+                </svg>
+                <span>대화만 비우기</span>
+              </button>
+            </div>
+          </details>
         </div>
       </header>
 
       <section class="context-strip" aria-live="polite">
-        <div class="context-main">
-          <div class="page-title" id="pageTitle">대기 중</div>
-          <div class="page-url" id="pageUrl"></div>
-        </div>
         <div class="capability-row">
-          <span class="status-badge" id="agentModeBadge">승인형</span>
-          <span class="status-badge muted" id="mcpStatusBadge">MCP 꺼짐</span>
+          <span class="status-badge" id="agentModeBadge" hidden>자동형</span>
+          <span class="status-badge muted" id="mcpStatusBadge" hidden>MCP 꺼짐</span>
+          <span class="status-badge muted" id="bridgeStatusBadge" hidden>Bridge 꺼짐</span>
           <span class="status-badge muted" id="pickedElementBadge" hidden>선택 없음</span>
         </div>
-      </section>
-
-      <section class="goal-panel">
-        <input id="goalInput" type="text" autocomplete="off" placeholder="작업 목표 고정">
-        <button class="secondary-button compact" id="pinGoalButton" type="button">고정</button>
-        <button class="secondary-button compact" id="clearGoalButton" type="button">해제</button>
       </section>
 
       <section class="restricted-panel" id="restrictedPanel" hidden>
@@ -98,35 +96,100 @@
         <button class="secondary-button compact" id="restrictedRefreshButton" type="button">다시 확인</button>
       </section>
 
-      <section class="chat-log" id="messageList" aria-live="polite"></section>
+      <section class="conversation-workspace" id="conversationWorkspace">
+        <section class="chat-log" id="messageList" aria-live="polite"></section>
 
-      <section class="approval-panel" id="approvalPanel" hidden>
-        <div class="plan-summary" id="planSummary"></div>
-        <img class="annotation-preview" id="annotationPreview" alt="실행 대상 미리보기" hidden>
-        <ol class="action-list" id="actionList"></ol>
-        <div class="button-row">
-          <button class="danger-button" id="approveActionButton" type="button">승인 후 실행</button>
-          <button class="secondary-button" id="rejectActionButton" type="button">취소</button>
-        </div>
+        <section class="approval-stack" id="approvalStack" aria-label="승인 대기 작업" hidden>
+          <section class="approval-panel external-approval-panel" id="externalApprovalPanel" aria-labelledby="externalApprovalTitle" hidden>
+            <div class="external-approval-header">
+              <div>
+                <strong id="externalApprovalTitle">외부 도구 실행 승인</strong>
+                <p id="externalApprovalStatus" role="status" aria-live="polite" hidden></p>
+              </div>
+              <span class="status-badge muted" id="externalApprovalCount">0건</span>
+            </div>
+            <label class="approval-request-picker" id="externalApprovalPicker">
+              <span>검토할 요청</span>
+              <select id="externalApprovalSelect" aria-label="검토할 외부 승인 요청"></select>
+            </label>
+            <div class="plan-summary" id="externalApprovalSummary"></div>
+            <ol class="action-list" id="externalApprovalList"></ol>
+            <div class="button-row approval-controls" id="externalApprovalControls">
+              <button class="danger-button" id="approveExternalActionButton" type="button">승인 후 실행</button>
+              <button class="secondary-button" id="rejectExternalActionButton" type="button">거부</button>
+            </div>
+          </section>
+
+          <section class="approval-panel" id="approvalPanel" aria-labelledby="approvalTitle" tabindex="-1" hidden>
+            <div class="approval-header">
+              <strong id="approvalTitle">에이전트 작업 승인</strong>
+              <span class="status-badge muted" id="approvalEffectCount">0개 작업</span>
+            </div>
+            <div class="plan-summary" id="approvalSummary"></div>
+            <ol class="action-list" id="actionList"></ol>
+            <details class="approval-details">
+              <summary>계획과 확인 기준 보기</summary>
+              <div class="plan-summary" id="planSummary"></div>
+            </details>
+            <details class="approval-details preview-disclosure" id="annotationDetails" hidden>
+              <summary>실행 대상 미리보기 보기</summary>
+              <img class="annotation-preview" id="annotationPreview" alt="실행 대상 미리보기" hidden>
+            </details>
+            <div class="button-row approval-controls">
+              <button class="danger-button" id="approveActionButton" type="button">승인 후 실행</button>
+              <button class="secondary-button" id="rejectActionButton" type="button">취소</button>
+            </div>
+          </section>
+        </section>
       </section>
 
-      <section class="composer">
-        <div class="template-row">
-          <select id="templateSelect" aria-label="작업 템플릿">
-            <option value="">템플릿 선택</option>
-          </select>
-          <button class="secondary-button compact" id="insertTemplateButton" type="button">삽입</button>
-          <button class="secondary-button compact" id="saveTemplateButton" type="button">저장</button>
+      <section class="composer" id="composer">
+        <div class="composer-tools">
+          <details class="composer-popover" id="goalPopover">
+            <summary>
+              <span>목표</span>
+              <span class="goal-state" id="goalState" hidden>적용 중</span>
+            </summary>
+            <div class="composer-popover-panel goal-panel" role="group" aria-labelledby="goalLabel">
+              <div class="popover-heading">
+                <label id="goalLabel" for="goalInput">작업 목표</label>
+                <p id="goalHelp">여러 요청에 계속 적용할 범위와 완료 기준입니다. 적용만으로 작업이 실행되지는 않습니다.</p>
+              </div>
+              <div class="goal-controls">
+                <input id="goalInput" type="text" autocomplete="off" aria-describedby="goalHelp" placeholder="예: 비교 결과를 확인하고 보고서 초안까지 완성">
+                <button class="secondary-button compact" id="pinGoalButton" type="button">고정</button>
+                <button class="secondary-button compact" id="clearGoalButton" type="button">해제</button>
+              </div>
+            </div>
+          </details>
+          <details class="composer-popover" id="templatePopover">
+            <summary>템플릿</summary>
+            <div class="composer-popover-panel template-panel" role="group" aria-labelledby="templateLabel">
+              <div class="popover-heading">
+                <strong id="templateLabel">요청 템플릿</strong>
+                <p id="templateHelp">자주 쓰는 요청 문구를 불러와 확인하거나 수정한 뒤 보냅니다.</p>
+              </div>
+              <select id="templateSelect" aria-label="작업 템플릿" aria-describedby="templateHelp">
+                <option value="">템플릿 선택 · 불러온 뒤 수정 가능</option>
+              </select>
+              <div class="template-actions">
+                <button class="secondary-button compact" id="insertTemplateButton" type="button">불러오기</button>
+                <button class="secondary-button compact" id="saveTemplateButton" type="button">현재 문구 저장</button>
+              </div>
+            </div>
+          </details>
         </div>
-        <textarea id="chatInput" rows="3" placeholder="무엇을 할까요?" autocomplete="off"></textarea>
-        <div class="composer-actions">
-          <button class="secondary-button stop-button" id="stopAgentButton" type="button" disabled>중지</button>
-          <button class="send-button" id="sendButton" type="button" title="보내기" aria-label="보내기">
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M22 2 11 13" />
-              <path d="m22 2-7 20-4-9-9-4 20-7Z" />
-            </svg>
-          </button>
+        <div class="composer-input-row">
+          <textarea id="chatInput" rows="1" placeholder="무엇을 할까요?" autocomplete="off"></textarea>
+          <div class="composer-actions">
+            <button class="secondary-button stop-button" id="stopAgentButton" type="button" disabled>중지</button>
+            <button class="send-button" id="sendButton" type="button" title="보내기" aria-label="보내기">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M22 2 11 13" />
+                <path d="m22 2-7 20-4-9-9-4 20-7Z" />
+              </svg>
+            </button>
+          </div>
         </div>
       </section>
     </main>
@@ -149,8 +212,9 @@
         <nav class="settings-tabs" aria-label="설정" role="tablist">
           <button class="settings-tab active" id="apiTab" type="button" role="tab" aria-controls="apiPanel" aria-selected="true" data-settings-tab="api">AI</button>
           <button class="settings-tab" id="agentTab" type="button" role="tab" aria-controls="agentPanel" aria-selected="false" data-settings-tab="agent">Agent</button>
-          <button class="settings-tab" id="siteTab" type="button" role="tab" aria-controls="sitePanel" aria-selected="false" data-settings-tab="site">Site</button>
+          <button class="settings-tab" id="siteTab" type="button" role="tab" aria-controls="sitePanel" aria-selected="false" data-settings-tab="site">사이트별</button>
           <button class="settings-tab" id="mcpTab" type="button" role="tab" aria-controls="mcpPanel" aria-selected="false" data-settings-tab="mcp">MCP</button>
+          <button class="settings-tab" id="bridgeTab" type="button" role="tab" aria-controls="bridgePanel" aria-selected="false" data-settings-tab="bridge">Bridge</button>
           <button class="settings-tab" id="advancedTab" type="button" role="tab" aria-controls="advancedPanel" aria-selected="false" data-settings-tab="advanced">고급</button>
         </nav>
 
@@ -280,7 +344,7 @@
 
               <label class="toggle-field">
                 <input id="includeScreenshotInput" type="checkbox">
-                <span>스크린샷 포함</span>
+                <span>AI 판단과 승인 미리보기에 스크린샷 사용</span>
               </label>
 
               <label class="toggle-field">
@@ -301,33 +365,47 @@
           </section>
 
           <section class="settings-panel" id="sitePanel" role="tabpanel" aria-labelledby="siteTab" data-settings-panel="site">
+            <div class="settings-intro">
+              <strong id="siteProfileTarget">현재 사이트 확인 중</strong>
+              <p id="siteProfileDescription">브라우저 권한이 아니라, 현재 사이트에서만 사용할 에이전트 동작을 정합니다. 별도로 지정하지 않은 항목은 기본 설정을 따릅니다.</p>
+              <p class="effective-settings" id="siteEffectiveSettings"></p>
+            </div>
             <div class="settings-grid">
               <label class="toggle-field">
                 <input id="siteProfileEnabledInput" type="checkbox">
-                <span>현재 사이트 프로필 사용</span>
+                <span>이 사이트에 별도 설정 적용</span>
               </label>
 
               <label class="field">
                 <span>사이트 동작 모드</span>
                 <select id="siteAgentModeInput">
+                  <option value="inherit">기본 설정 따르기</option>
                   <option value="approve">승인형</option>
                   <option value="auto">자동형</option>
                 </select>
               </label>
 
-              <label class="toggle-field">
-                <input id="siteIncludeScreenshotInput" type="checkbox">
-                <span>사이트에서 스크린샷 포함</span>
+              <label class="field">
+                <span>스크린샷</span>
+                <select id="siteIncludeScreenshotInput">
+                  <option value="inherit">기본 설정 따르기</option>
+                  <option value="on">사용</option>
+                  <option value="off">사용 안 함</option>
+                </select>
               </label>
 
-              <label class="toggle-field">
-                <input id="siteMcpEnabledInput" type="checkbox">
-                <span>사이트에서 MCP 사용</span>
+              <label class="field">
+                <span>MCP</span>
+                <select id="siteMcpEnabledInput">
+                  <option value="inherit">기본 설정 따르기</option>
+                  <option value="on">사용</option>
+                  <option value="off">사용 안 함</option>
+                </select>
               </label>
 
               <div class="button-row full inline-actions">
                 <button class="secondary-button" id="saveSiteProfileButton" type="button">사이트 프로필 저장</button>
-                <button class="secondary-button" id="removeSiteProfileButton" type="button">삭제</button>
+                <button class="secondary-button" id="removeSiteProfileButton" type="button">기본 설정으로 되돌리기</button>
               </div>
             </div>
           </section>
@@ -451,6 +529,66 @@
             </div>
           </section>
 
+          <section class="settings-panel" id="bridgePanel" role="tabpanel" aria-labelledby="bridgeTab" data-settings-panel="bridge">
+            <div class="settings-grid">
+              <div class="bridge-intro full">
+                <strong>개발 도구 연결</strong>
+                <p>로컬 브리지를 통해 외부 개발 도구가 현재 브라우저 탭을 관찰하고, 승인된 작업을 실행할 수 있습니다.</p>
+              </div>
+
+              <label class="toggle-field">
+                <input id="bridgeEnabledInput" type="checkbox">
+                <span>Bridge 사용</span>
+              </label>
+
+              <label class="toggle-field">
+                <input id="bridgeRequireApprovalInput" type="checkbox">
+                <span>상태 변경 작업 전 항상 승인</span>
+              </label>
+
+              <label class="field full">
+                <span>Bridge endpoint</span>
+                <input id="bridgeEndpointInput" type="url" autocomplete="off" placeholder="로컬 브리지 실행 후 표시되는 WebSocket endpoint" aria-describedby="bridgeEndpointHelp">
+                <small class="field-help" id="bridgeEndpointHelp">고정 주소를 가정하지 않습니다. 브리지가 출력한 endpoint를 입력해 주세요.</small>
+              </label>
+
+              <div class="button-row full inline-actions bridge-actions">
+                <button class="secondary-button" id="bridgeConnectButton" type="button">연결</button>
+                <button class="secondary-button" id="bridgeDisconnectButton" type="button" disabled>연결 해제</button>
+              </div>
+
+              <label class="field full">
+                <span>일회용 페어링 코드</span>
+                <input id="bridgePairingCodeInput" type="text" autocomplete="one-time-code" autocapitalize="off" spellcheck="false" data-transient="true" placeholder="브리지가 표시한 페어링 코드" aria-describedby="bridgePairingHelp">
+                <small class="field-help" id="bridgePairingHelp">코드는 연결 과정에서만 사용하며 설정에 저장하지 않습니다.</small>
+              </label>
+
+              <div class="button-row full inline-actions bridge-actions">
+                <button class="primary-button" id="bridgePairButton" type="button">페어링</button>
+                <button class="secondary-button" id="bridgeRevokeButton" type="button" disabled>연결 권한 폐기</button>
+              </div>
+
+              <div class="tool-browser full bridge-status-card" aria-labelledby="bridgeConnectionStatus">
+                <div class="bridge-status-line">
+                  <strong id="bridgeConnectionStatus">연결 안 됨</strong>
+                  <span class="status-badge muted" id="bridgeSessionStatus">세션 없음</span>
+                </div>
+                <p id="bridgeStatusDetail" role="status" aria-live="polite">Bridge endpoint를 입력하고 연결하거나 페어링해 주세요.</p>
+              </div>
+
+              <div class="tool-browser full bridge-tab-card">
+                <div>
+                  <strong>현재 탭 제어</strong>
+                  <p id="bridgeAttachedTabStatus" role="status" aria-live="polite">연결된 탭이 없습니다.</p>
+                </div>
+                <div class="button-row inline-actions bridge-actions">
+                  <button class="secondary-button" id="bridgeAttachTabButton" type="button" disabled>현재 탭 연결</button>
+                  <button class="secondary-button" id="bridgeDetachTabButton" type="button" disabled>탭 연결 해제</button>
+                </div>
+              </div>
+            </div>
+          </section>
+
           <section class="settings-panel" id="advancedPanel" role="tabpanel" aria-labelledby="advancedTab" data-settings-panel="advanced">
             <div class="settings-grid">
               <label class="field full">
@@ -468,13 +606,15 @@
                 <textarea id="systemInstructionInput" rows="6" spellcheck="false"></textarea>
               </label>
             </div>
+            <div class="settings-reset">
+              <div>
+                <strong>설정 초기화</strong>
+                <p>변경 내용은 자동 저장됩니다. 초기화하면 기본 설정으로 되돌립니다.</p>
+              </div>
+              <button class="secondary-button compact" id="resetSettingsButton" type="button">초기화</button>
+            </div>
           </section>
         </div>
-
-        <footer class="settings-footer">
-          <button class="secondary-button" id="resetSettingsButton" type="button">초기화</button>
-          <button class="primary-button" id="saveSettingsButton" type="button">저장</button>
-        </footer>
       </div>
     </section>
 
