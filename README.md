@@ -224,7 +224,7 @@ The command reports the temporary development address. The E2E suite exercises t
 
 ## Public-release audit
 
-The repository was re-audited on 2026-07-22 before publication.
+The repository was re-audited on 2026-07-23 before publication.
 
 - No third-party product is used as the project identity, name, or logo.
 - No third-party logos, fonts, minified bundles, or vendored source are included.
