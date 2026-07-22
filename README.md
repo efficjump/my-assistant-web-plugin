@@ -4,7 +4,7 @@ A Manifest V3 browser extension that observes the active page, plans the next ac
 
 ![Agent side panel](docs/assets/agent-panel.png)
 
-Version `0.4.0` targets Chromium-based browsers version 116 or later. This repository contains a source-loaded development build rather than a store package.
+Version `0.4.1` targets Chromium-based browsers version 116 or later. This repository contains a source-loaded development build rather than a store package.
 
 ## Why this project exists
 
@@ -85,7 +85,9 @@ The panel keeps only the current page, element picker, settings, and request com
 
 **Task goal** is persistent guidance for the current tab and URL, not a command that starts work. Open **목표** above the composer, enter the scope or completion criteria that should carry across several messages, select **고정**, and then send individual requests. A pinned goal becomes read-only until **수정** is selected. Clearing the conversation keeps the pinned goal; **해제** removes it. The latest message still takes priority when it narrows or updates the goal.
 
-**Templates** are reusable request text, not an automatic workflow. Open **템플릿** above the composer, choose a template, select **불러오기**, review or edit the inserted text, and then send it. Loading a template preserves the existing draft and inserts the template at the current cursor or selection. **현재 문구 저장** stores the composer text as a personal template.
+**Templates** are reusable request text, not an automatic workflow. Open **템플릿** above the composer to create a template or select an existing one, then edit its title and request text directly. **변경 저장** updates the selected item instead of creating a duplicate. Personal-template deletion and built-in-template restoration both use a two-step confirmation. **현재 입력 가져오기** copies the composer draft into the editor without saving it, and **입력창에 넣기** preserves the existing draft while inserting the edited template at the current cursor or selection.
+
+![Template editor with a selected personal template](docs/assets/template-manager.png)
 
 Global settings are saved when a field changes, so there is no separate global save button; site-specific profiles still use their own apply action. The full reset action is under **Settings → 고급**. While a local action plan is waiting for approval, the new-request composer is hidden because the running task cannot accept another request; rejecting or completing the approval restores the unchanged draft. External Bridge approvals do not hide the composer.
 

@@ -138,6 +138,22 @@ test("goal and template tools are closed popovers above a single-row composer", 
   assert.equal(hasElementId(composerMarkup, "sendButton"), true);
   assert.match(html, /id="goalHelp"/);
   assert.match(html, /id="templateHelp"/);
+  for (const id of [
+    "templateTitleInput",
+    "templatePromptInput",
+    "templateStatus",
+    "newTemplateButton",
+    "importCurrentInputButton",
+    "insertTemplateButton",
+    "saveTemplateButton",
+    "deleteTemplateButton"
+  ]) {
+    assert.equal(hasElementId(composerMarkup, id), true, `${id} should be available in the template editor`);
+  }
+  assert.doesNotMatch(composerMarkup, /현재 문구 저장/);
+  assert.match(script, /selectedTemplate\?\.id\s*\|\|\s*createTaskTemplateId\(\)/);
+  assert.match(script, /state\.templateDeleteConfirmationId/);
+  assert.match(script, /MAX_TASK_TEMPLATES/);
   assert.match(script, /resizeComposerInput/);
 });
 
@@ -189,7 +205,9 @@ test("legacy sessions are consumed once and resetting settings refreshes the sit
   assert.match(script, /delete sessions\[legacyKey\]/);
   const resetStart = script.indexOf("async function resetSettings()");
   const resetEnd = script.indexOf("function updateCustomVisibility", resetStart);
-  assert.match(script.slice(resetStart, resetEnd), /applySiteProfileForActiveTab\(\)/);
+  const resetFunction = script.slice(resetStart, resetEnd);
+  assert.match(resetFunction, /applySiteProfileForActiveTab\(\)/);
+  assert.match(resetFunction, /renderTemplateSelect\(""\)/);
 });
 
 test("manifest and package versions stay aligned", () => {

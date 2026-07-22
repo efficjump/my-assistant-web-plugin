@@ -69,6 +69,10 @@ const DEFAULT_TASK_TEMPLATES = [
   { id: "compare-doc", title: "문서 비교", prompt: "현재 페이지의 문서 내용에서 변경점이나 중요한 차이를 찾아줘." },
   { id: "test-cases", title: "테스트 케이스", prompt: "현재 화면의 기능을 기준으로 테스트 케이스를 작성해줘." }
 ];
+const DEFAULT_TASK_TEMPLATE_IDS = new Set(DEFAULT_TASK_TEMPLATES.map((template) => template.id));
+const MAX_TASK_TEMPLATES = 20;
+const MAX_TASK_TEMPLATE_TITLE_LENGTH = 80;
+const MAX_TASK_TEMPLATE_PROMPT_LENGTH = 8000;
 const MAX_SAVED_SESSIONS = 20;
 const MAX_UNDO_ITEMS = 20;
 let sessionWriteQueue = Promise.resolve();
@@ -108,6 +112,7 @@ const state = {
   bridgeStatus: null,
   externalApprovals: [],
   selectedExternalOperationId: "",
+  templateDeleteConfirmationId: "",
   approvalPreviewToken: 0,
   activeTabTransitionPending: false,
   activeTabTransitionRevision: 0,
@@ -165,8 +170,14 @@ const elements = {
   goalPopover: document.getElementById("goalPopover"),
   templatePopover: document.getElementById("templatePopover"),
   templateSelect: document.getElementById("templateSelect"),
+  templateTitleInput: document.getElementById("templateTitleInput"),
+  templatePromptInput: document.getElementById("templatePromptInput"),
+  templateStatus: document.getElementById("templateStatus"),
+  newTemplateButton: document.getElementById("newTemplateButton"),
+  importCurrentInputButton: document.getElementById("importCurrentInputButton"),
   insertTemplateButton: document.getElementById("insertTemplateButton"),
   saveTemplateButton: document.getElementById("saveTemplateButton"),
+  deleteTemplateButton: document.getElementById("deleteTemplateButton"),
   sendButton: document.getElementById("sendButton"),
   stopAgentButton: document.getElementById("stopAgentButton"),
   statusLine: document.getElementById("statusLine"),
@@ -337,7 +348,13 @@ function bindEvents() {
   });
   [elements.goalPopover, elements.templatePopover].forEach((popover) => {
     popover.addEventListener("toggle", () => {
-      if (!popover.open) return;
+      if (!popover.open) {
+        if (popover === elements.templatePopover) {
+          state.templateDeleteConfirmationId = "";
+          updateTemplateEditorActions();
+        }
+        return;
+      }
       closeUtilityMenu();
       closeComposerPopovers(popover);
     });
@@ -359,8 +376,17 @@ function bindEvents() {
       pinGoalFromInput();
     }
   });
+  elements.templateSelect.addEventListener("change", () => {
+    state.templateDeleteConfirmationId = "";
+    renderTemplateEditor();
+  });
+  elements.templateTitleInput.addEventListener("input", handleTemplateDraftInput);
+  elements.templatePromptInput.addEventListener("input", handleTemplateDraftInput);
+  elements.newTemplateButton.addEventListener("click", startNewTemplate);
+  elements.importCurrentInputButton.addEventListener("click", importCurrentInputToTemplateEditor);
   elements.insertTemplateButton.addEventListener("click", insertSelectedTemplate);
-  elements.saveTemplateButton.addEventListener("click", saveCurrentInputAsTemplate);
+  elements.saveTemplateButton.addEventListener("click", saveTemplateEditor);
+  elements.deleteTemplateButton.addEventListener("click", deleteSelectedTemplate);
   elements.sendButton.addEventListener("click", submitChatMessage);
   elements.approveActionButton.addEventListener("click", executeCurrentPlan);
   elements.rejectActionButton.addEventListener("click", rejectCurrentPlan);
@@ -784,37 +810,280 @@ function getContextSelection(context) {
   return String(context?.selection || context?.selectedText || "");
 }
 
-function getTaskTemplates() {
-  const custom = Array.isArray(state.settings.taskTemplates) ? state.settings.taskTemplates : [];
-  const merged = [...DEFAULT_TASK_TEMPLATES, ...custom];
-  const seen = new Set();
-  return merged.filter((template) => {
-    const id = String(template.id || template.title || "").trim();
-    if (!id || seen.has(id)) {
-      return false;
-    }
-    seen.add(id);
-    return template.prompt;
-  });
+function normalizeTaskTemplate(template) {
+  if (!template || typeof template !== "object") {
+    return null;
+  }
+  const id = String(template.id || "").trim().slice(0, 160);
+  const title = String(template.title || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, MAX_TASK_TEMPLATE_TITLE_LENGTH);
+  const prompt = String(template.prompt || "").trim().slice(0, MAX_TASK_TEMPLATE_PROMPT_LENGTH);
+  return id && title && prompt ? { id, title, prompt } : null;
 }
 
-function renderTemplateSelect() {
+function getSavedTaskTemplates() {
+  const rawTemplates = Array.isArray(state.settings.taskTemplates) ? state.settings.taskTemplates : [];
+  const deduplicated = new Map();
+  for (const rawTemplate of rawTemplates) {
+    const template = normalizeTaskTemplate(rawTemplate);
+    if (!template) {
+      continue;
+    }
+    if (deduplicated.has(template.id)) {
+      deduplicated.delete(template.id);
+    }
+    deduplicated.set(template.id, template);
+  }
+  return Array.from(deduplicated.values()).slice(-MAX_TASK_TEMPLATES);
+}
+
+function getDefaultTaskTemplate(id) {
+  return DEFAULT_TASK_TEMPLATES.find((template) => template.id === id) || null;
+}
+
+function getTaskTemplates() {
+  const savedTemplates = getSavedTaskTemplates();
+  const savedById = new Map(savedTemplates.map((template) => [template.id, template]));
+  const builtInTemplates = DEFAULT_TASK_TEMPLATES.map((defaultTemplate) => {
+    const override = savedById.get(defaultTemplate.id);
+    return {
+      ...(override || defaultTemplate),
+      builtIn: true,
+      customized: Boolean(override)
+    };
+  });
+  const customTemplates = savedTemplates
+    .filter((template) => !DEFAULT_TASK_TEMPLATE_IDS.has(template.id))
+    .map((template) => ({ ...template, builtIn: false, customized: true }));
+  return [...builtInTemplates, ...customTemplates];
+}
+
+function renderTemplateSelect(preferredId = elements.templateSelect.value) {
+  const selectedId = String(preferredId || "");
+  const templates = getTaskTemplates();
   elements.templateSelect.replaceChildren();
+
   const placeholder = document.createElement("option");
   placeholder.value = "";
-  placeholder.textContent = "템플릿 선택 · 불러온 뒤 수정 가능";
+  placeholder.textContent = "새 템플릿 만들기";
   elements.templateSelect.append(placeholder);
-  for (const template of getTaskTemplates()) {
+
+  const builtInGroup = document.createElement("optgroup");
+  builtInGroup.label = "기본 템플릿";
+  const customGroup = document.createElement("optgroup");
+  customGroup.label = "내 템플릿";
+  for (const template of templates) {
     const option = document.createElement("option");
     option.value = template.id;
-    option.textContent = template.title;
-    elements.templateSelect.append(option);
+    option.textContent = template.builtIn && template.customized
+      ? `${template.title} · 수정됨`
+      : template.title;
+    (template.builtIn ? builtInGroup : customGroup).append(option);
+  }
+  elements.templateSelect.append(builtInGroup);
+  if (customGroup.children.length) {
+    elements.templateSelect.append(customGroup);
+  }
+  elements.templateSelect.value = templates.some((template) => template.id === selectedId) ? selectedId : "";
+  renderTemplateEditor();
+}
+
+function getSelectedTaskTemplate() {
+  return getTaskTemplates().find((template) => template.id === elements.templateSelect.value) || null;
+}
+
+function getTemplateEditorDraft() {
+  return {
+    title: elements.templateTitleInput.value.replace(/\s+/g, " ").trim(),
+    prompt: elements.templatePromptInput.value.trim()
+  };
+}
+
+function renderTemplateEditor() {
+  const template = getSelectedTaskTemplate();
+  state.templateDeleteConfirmationId = "";
+  elements.templateTitleInput.value = template?.title || "";
+  elements.templatePromptInput.value = template?.prompt || "";
+  updateTemplateEditorActions();
+  if (!template) {
+    setTemplateStatus("제목과 요청 문구를 입력하거나 현재 입력을 가져오세요.");
+  } else if (template.builtIn && template.customized) {
+    setTemplateStatus("기본 템플릿의 수정본입니다. 저장하거나 기본값으로 복원할 수 있습니다.");
+  } else if (template.builtIn) {
+    setTemplateStatus("기본 제공 템플릿입니다. 수정 내용을 저장하면 이 브라우저에 덮어씁니다.");
+  } else {
+    setTemplateStatus("저장된 내 템플릿입니다. 제목과 요청 문구를 바로 수정할 수 있습니다.");
   }
 }
 
+function updateTemplateEditorActions() {
+  const selectedTemplate = getSelectedTaskTemplate();
+  const draft = getTemplateEditorDraft();
+  const changed = selectedTemplate
+    ? draft.title !== selectedTemplate.title || draft.prompt !== selectedTemplate.prompt
+    : Boolean(draft.title || draft.prompt);
+  elements.insertTemplateButton.disabled = !draft.prompt;
+  elements.saveTemplateButton.disabled = !changed;
+  elements.saveTemplateButton.textContent = selectedTemplate ? "변경 저장" : "새로 저장";
+
+  if (selectedTemplate?.builtIn) {
+    const confirming = state.templateDeleteConfirmationId === selectedTemplate.id;
+    elements.deleteTemplateButton.textContent = confirming ? "복원 확인" : "기본값 복원";
+    elements.deleteTemplateButton.disabled = !selectedTemplate.customized;
+    elements.deleteTemplateButton.classList.add("restore-button");
+  } else {
+    const confirming = state.templateDeleteConfirmationId === selectedTemplate?.id;
+    elements.deleteTemplateButton.textContent = confirming ? "삭제 확인" : "삭제";
+    elements.deleteTemplateButton.disabled = !selectedTemplate;
+    elements.deleteTemplateButton.classList.remove("restore-button");
+  }
+}
+
+function setTemplateStatus(message, tone = "") {
+  elements.templateStatus.textContent = message;
+  elements.templateStatus.dataset.tone = tone;
+}
+
+function handleTemplateDraftInput() {
+  state.templateDeleteConfirmationId = "";
+  updateTemplateEditorActions();
+  setTemplateStatus("저장되지 않은 변경사항이 있습니다.", "warning");
+}
+
+function startNewTemplate() {
+  elements.templateSelect.value = "";
+  renderTemplateEditor();
+  elements.templateTitleInput.focus();
+}
+
+function importCurrentInputToTemplateEditor() {
+  const prompt = elements.chatInput.value.trim();
+  if (!prompt) {
+    setTemplateStatus("현재 입력창에 가져올 내용이 없습니다.", "warning");
+    return;
+  }
+  if (!elements.templateTitleInput.value.trim()) {
+    elements.templateTitleInput.value = truncate(prompt.replace(/\s+/g, " "), 32);
+  }
+  elements.templatePromptInput.value = prompt.slice(0, MAX_TASK_TEMPLATE_PROMPT_LENGTH);
+  state.templateDeleteConfirmationId = "";
+  updateTemplateEditorActions();
+  setTemplateStatus("현재 입력을 편집기로 가져왔습니다. 저장 전 제목과 문구를 확인하세요.");
+  elements.templatePromptInput.focus();
+}
+
+function createTaskTemplateId() {
+  const suffix = globalThis.crypto?.randomUUID?.()
+    || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  return `custom-${suffix}`;
+}
+
+function upsertSavedTaskTemplate(template) {
+  const savedTemplates = getSavedTaskTemplates();
+  const existingIndex = savedTemplates.findIndex((item) => item.id === template.id);
+  if (existingIndex < 0 && savedTemplates.length >= MAX_TASK_TEMPLATES) {
+    return false;
+  }
+  if (existingIndex >= 0) {
+    savedTemplates[existingIndex] = template;
+  } else {
+    savedTemplates.push(template);
+  }
+  state.settings.taskTemplates = savedTemplates;
+  return true;
+}
+
+function removeSavedTaskTemplate(id) {
+  const savedTemplates = getSavedTaskTemplates();
+  const nextTemplates = savedTemplates.filter((template) => template.id !== id);
+  const removed = nextTemplates.length !== savedTemplates.length;
+  state.settings.taskTemplates = nextTemplates;
+  return removed;
+}
+
+async function saveTemplateEditor() {
+  const draft = getTemplateEditorDraft();
+  if (!draft.title) {
+    setTemplateStatus("템플릿 제목을 입력해 주세요.", "warning");
+    elements.templateTitleInput.focus();
+    return;
+  }
+  if (!draft.prompt) {
+    setTemplateStatus("저장할 요청 문구를 입력해 주세요.", "warning");
+    elements.templatePromptInput.focus();
+    return;
+  }
+  const selectedTemplate = getSelectedTaskTemplate();
+  const titleConflict = getTaskTemplates().find((template) => (
+    template.id !== selectedTemplate?.id
+    && template.title.localeCompare(draft.title, undefined, { sensitivity: "accent" }) === 0
+  ));
+  if (titleConflict) {
+    setTemplateStatus("같은 제목의 템플릿이 이미 있습니다. 다른 제목을 사용해 주세요.", "warning");
+    elements.templateTitleInput.focus();
+    return;
+  }
+
+  const targetId = selectedTemplate?.id || createTaskTemplateId();
+  const normalizedTemplate = normalizeTaskTemplate({ id: targetId, ...draft });
+  const defaultTemplate = getDefaultTaskTemplate(targetId);
+  if (
+    defaultTemplate
+    && normalizedTemplate.title === defaultTemplate.title
+    && normalizedTemplate.prompt === defaultTemplate.prompt
+  ) {
+    removeSavedTaskTemplate(targetId);
+  } else if (!upsertSavedTaskTemplate(normalizedTemplate)) {
+    setTemplateStatus(`템플릿은 최대 ${MAX_TASK_TEMPLATES}개까지 저장할 수 있습니다. 기존 템플릿을 삭제한 뒤 다시 시도해 주세요.`, "warning");
+    return;
+  }
+
+  await persistSettings();
+  renderTemplateSelect(targetId);
+  setTemplateStatus(selectedTemplate ? "템플릿 변경사항을 저장했습니다." : "새 템플릿을 저장했습니다.");
+}
+
+async function deleteSelectedTemplate() {
+  const selectedTemplate = getSelectedTaskTemplate();
+  if (!selectedTemplate) {
+    return;
+  }
+  if (selectedTemplate.builtIn) {
+    if (!selectedTemplate.customized) {
+      return;
+    }
+    if (state.templateDeleteConfirmationId !== selectedTemplate.id) {
+      state.templateDeleteConfirmationId = selectedTemplate.id;
+      updateTemplateEditorActions();
+      setTemplateStatus("복원 확인을 한 번 더 누르면 저장한 수정본을 지우고 기본값으로 되돌립니다.", "warning");
+      return;
+    }
+    removeSavedTaskTemplate(selectedTemplate.id);
+    await persistSettings();
+    renderTemplateSelect(selectedTemplate.id);
+    setTemplateStatus("기본 템플릿을 원래 제목과 요청 문구로 복원했습니다.");
+    return;
+  }
+  if (state.templateDeleteConfirmationId !== selectedTemplate.id) {
+    state.templateDeleteConfirmationId = selectedTemplate.id;
+    updateTemplateEditorActions();
+    setTemplateStatus("삭제 확인을 한 번 더 누르면 이 템플릿이 삭제됩니다.", "warning");
+    return;
+  }
+  removeSavedTaskTemplate(selectedTemplate.id);
+  await persistSettings();
+  renderTemplateSelect("");
+  setTemplateStatus("템플릿을 삭제했습니다.");
+  elements.templateTitleInput.focus();
+}
+
 function insertSelectedTemplate() {
-  const template = getTaskTemplates().find((item) => item.id === elements.templateSelect.value);
-  if (!template) {
+  const prompt = elements.templatePromptInput.value.trim();
+  if (!prompt) {
+    setTemplateStatus("입력창에 넣을 요청 문구가 없습니다.", "warning");
+    elements.templatePromptInput.focus();
     return;
   }
   const input = elements.chatInput;
@@ -825,7 +1094,7 @@ function insertSelectedTemplate() {
   const after = currentValue.slice(selectionEnd);
   const leadingSeparator = before && !/\s$/.test(before) ? "\n\n" : "";
   const trailingSeparator = after && !/^\s/.test(after) ? "\n\n" : "";
-  const inserted = `${leadingSeparator}${template.prompt}${trailingSeparator}`;
+  const inserted = `${leadingSeparator}${prompt}${trailingSeparator}`;
   input.value = `${before}${inserted}${after}`;
   const nextCursor = before.length + inserted.length;
   input.setSelectionRange?.(nextCursor, nextCursor);
@@ -833,27 +1102,6 @@ function insertSelectedTemplate() {
   resizeComposerInput();
   elements.chatInput.focus();
   setStatusLine("템플릿을 입력창에 불러왔습니다. 확인하거나 수정한 뒤 보내세요.");
-}
-
-async function saveCurrentInputAsTemplate() {
-  const prompt = elements.chatInput.value.trim();
-  if (!prompt) {
-    setStatusLine("저장할 템플릿 내용이 없습니다.");
-    return;
-  }
-  const title = truncate(prompt.replace(/\s+/g, " "), 32);
-  const template = {
-    id: `custom-${Date.now()}`,
-    title,
-    prompt
-  };
-  state.settings.taskTemplates = [...(state.settings.taskTemplates || []), template].slice(-20);
-  await persistSettings();
-  renderTemplateSelect();
-  elements.templateSelect.value = template.id;
-  elements.templatePopover.open = false;
-  elements.chatInput.focus();
-  setStatusLine("템플릿 저장됨");
 }
 
 function pinGoalFromInput() {
@@ -1212,6 +1460,7 @@ async function resetSettings() {
   await persistSettings();
   applySettingsToForm();
   updateCustomVisibility();
+  renderTemplateSelect("");
   applySiteProfileForActiveTab();
   renderMcpToolBrowser([]);
   renderMcpAssetBrowsers();

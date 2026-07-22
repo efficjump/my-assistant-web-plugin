@@ -267,6 +267,16 @@ try {
       requestCount: 2,
       selectedActionCount: 1
     });
+    assert.match(panelContracts.template.createdTemplateId, /^custom-/);
+    assert.equal(panelContracts.template.savedCountAfterCreate, 1);
+    assert.equal(panelContracts.template.updatedInPlace, true);
+    assert.equal(panelContracts.template.deleteNeedsConfirmation, true);
+    assert.equal(panelContracts.template.customDeleted, true);
+    assert.equal(panelContracts.template.builtInCustomized, true);
+    assert.equal(panelContracts.template.builtInRestoreNeedsConfirmation, true);
+    assert.equal(panelContracts.template.builtInRestored, true);
+    assert.equal(panelContracts.template.maxLimitPreserved, true);
+    assert.equal(panelContracts.template.importedCurrentInput, true);
     assert.equal(panelContracts.template.preservedDraft, true);
     assert.equal(panelContracts.template.insertedPrompt, true);
     assert.equal(panelContracts.template.popoverClosedAfterInsert, true);
@@ -286,6 +296,10 @@ try {
       retainedAfterClear: "화면 상태를 확인하고 근거를 남기기",
       popoverClosedAfterPin: true
     });
+
+    if (process.argv.includes("--capture-docs")) {
+      await captureTemplateManagerDocs(cdp, panelSessionId);
+    }
 
     const verificationContracts = await exerciseAgentVerificationContracts({
       cdp,
@@ -1238,9 +1252,16 @@ async function exercisePanelContracts({ cdp, panelSessionId, tabId, context }) {
           const templatePanel = elements.templatePopover.querySelector(".composer-popover-panel");
           controls.templatePanel = measureControl(templatePanel);
           controls.templateSelect = measureControl(elements.templateSelect);
+          controls.templateTitleInput = measureControl(elements.templateTitleInput);
+          controls.templatePromptInput = measureControl(elements.templatePromptInput);
+          controls.newTemplateButton = measureControl(elements.newTemplateButton);
+          controls.importCurrentInputButton = measureControl(elements.importCurrentInputButton);
           controls.insertTemplateButton = measureControl(elements.insertTemplateButton);
           controls.saveTemplateButton = measureControl(elements.saveTemplateButton);
+          controls.deleteTemplateButton = measureControl(elements.deleteTemplateButton);
           containers.templatePanel = measureContainer(templatePanel);
+          containers.templateEditor = measureContainer(templatePanel.querySelector(".template-editor"));
+          containers.templateQuickActions = measureContainer(templatePanel.querySelector(".template-quick-actions"));
           containers.templateActions = measureContainer(templatePanel.querySelector(".template-actions"));
 
           layout.narrowStress = {
@@ -1326,13 +1347,84 @@ async function exercisePanelContracts({ cdp, panelSessionId, tabId, context }) {
     })()`);
 
     const functional = await evaluate(cdp, panelSessionId, `(async () => {
+        startNewTemplate();
+        elements.templateTitleInput.value = "릴리스 전 점검";
+        elements.templatePromptInput.value = "현재 화면에서 릴리스 전 확인할 항목을 정리해줘.";
+        handleTemplateDraftInput();
+        await saveTemplateEditor();
+        const createdTemplateId = elements.templateSelect.value;
+        const savedCountAfterCreate = getSavedTaskTemplates().length;
+
+        elements.templateTitleInput.value = "배포 전 점검";
+        elements.templatePromptInput.value = "현재 화면에서 배포 전 확인할 항목과 위험을 정리해줘.";
+        handleTemplateDraftInput();
+        await saveTemplateEditor();
+        const updatedTemplate = getSelectedTaskTemplate();
+        const savedCountAfterUpdate = getSavedTaskTemplates().length;
+
+        await deleteSelectedTemplate();
+        const deleteNeedsConfirmation = state.templateDeleteConfirmationId === createdTemplateId
+          && getTaskTemplates().some((item) => item.id === createdTemplateId);
+        await deleteSelectedTemplate();
+        const customDeleted = !getTaskTemplates().some((item) => item.id === createdTemplateId);
+
+        elements.templateSelect.value = "summarize-page";
+        renderTemplateEditor();
+        elements.templateTitleInput.value = "페이지 핵심 요약";
+        elements.templatePromptInput.value = "현재 보이는 페이지의 핵심만 간결하게 요약해줘.";
+        handleTemplateDraftInput();
+        await saveTemplateEditor();
+        const builtInCustomized = getSelectedTaskTemplate()?.customized === true;
+        await deleteSelectedTemplate();
+        const builtInRestoreNeedsConfirmation = state.templateDeleteConfirmationId === "summarize-page"
+          && getSelectedTaskTemplate()?.customized === true;
+        await deleteSelectedTemplate();
+        const restoredBuiltIn = getSelectedTaskTemplate();
+
+        state.settings.taskTemplates = Array.from({ length: MAX_TASK_TEMPLATES }, (_, index) => ({
+          id: "custom-limit-" + (index + 1),
+          title: "한도 검증 " + (index + 1),
+          prompt: "저장 한도 검증 문구 " + (index + 1)
+        }));
+        renderTemplateSelect("");
+        elements.templateTitleInput.value = "한도 초과 템플릿";
+        elements.templatePromptInput.value = "기존 템플릿을 지우지 않고 저장을 거부해야 합니다.";
+        handleTemplateDraftInput();
+        await saveTemplateEditor();
+        const maxLimitPreserved = getSavedTaskTemplates().length === MAX_TASK_TEMPLATES
+          && getSavedTaskTemplates()[0]?.id === "custom-limit-1"
+          && elements.templateStatus.textContent.includes("최대");
+        state.settings.taskTemplates = [];
+        renderTemplateSelect("");
+
+        elements.chatInput.value = "현재 입력을 템플릿 편집기로 가져오기";
+        startNewTemplate();
+        importCurrentInputToTemplateEditor();
+        const importedCurrentInput = elements.templatePromptInput.value === elements.chatInput.value
+          && Boolean(elements.templateTitleInput.value);
+
         elements.chatInput.value = "기존에 작성하던 요청";
         elements.chatInput.setSelectionRange(elements.chatInput.value.length, elements.chatInput.value.length);
         elements.templateSelect.value = "summarize-page";
-        const selectedTemplatePrompt = getTaskTemplates().find((item) => item.id === elements.templateSelect.value)?.prompt || "";
+        renderTemplateEditor();
+        const selectedTemplatePrompt = elements.templatePromptInput.value;
         elements.templatePopover.open = true;
         insertSelectedTemplate();
         const template = {
+          createdTemplateId,
+          savedCountAfterCreate,
+          updatedInPlace: updatedTemplate?.id === createdTemplateId
+            && updatedTemplate.title === "배포 전 점검"
+            && updatedTemplate.prompt.includes("위험")
+            && savedCountAfterUpdate === savedCountAfterCreate,
+          deleteNeedsConfirmation,
+          customDeleted,
+          builtInCustomized,
+          builtInRestoreNeedsConfirmation,
+          builtInRestored: restoredBuiltIn?.title === "페이지 요약"
+            && restoredBuiltIn?.customized === false,
+          maxLimitPreserved,
+          importedCurrentInput,
           preservedDraft: elements.chatInput.value.includes("기존에 작성하던 요청"),
           insertedPrompt: Boolean(selectedTemplatePrompt) && elements.chatInput.value.includes(selectedTemplatePrompt),
           popoverClosedAfterInsert: !elements.templatePopover.open
@@ -1742,6 +1834,46 @@ async function capturePanelScreenshot(cdp, panelSessionId, filename) {
     captureBeyondViewport: false,
   }, panelSessionId);
   await writeFile(path.join(root, "docs", "assets", filename), Buffer.from(data, "base64"));
+}
+
+async function captureTemplateManagerDocs(cdp, panelSessionId) {
+  await evaluate(cdp, panelSessionId, `(async () => {
+    globalThis.__templateCaptureSnapshot = {
+      taskTemplates: structuredClone(state.settings.taskTemplates || []),
+      selectedId: elements.templateSelect.value,
+      popoverOpen: elements.templatePopover.open,
+      chatInput: elements.chatInput.value,
+      statusText: elements.statusLine.textContent
+    };
+    state.settings.taskTemplates = [{
+      id: "custom-release-check",
+      title: "배포 전 점검",
+      prompt: "현재 화면에서 배포 전 확인할 항목과 위험을 정리해줘."
+    }];
+    elements.chatInput.value = "";
+    elements.statusLine.textContent = "선택한 템플릿 편집 중";
+    hideRestrictedPage();
+    closeUtilityMenu();
+    elements.goalPopover.open = false;
+    renderTemplateSelect("custom-release-check");
+    elements.templatePopover.open = true;
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    return true;
+  })()`);
+  try {
+    await capturePanelScreenshot(cdp, panelSessionId, "template-manager.png");
+  } finally {
+    await evaluate(cdp, panelSessionId, `(() => {
+      const snapshot = globalThis.__templateCaptureSnapshot;
+      state.settings.taskTemplates = snapshot.taskTemplates;
+      elements.chatInput.value = snapshot.chatInput;
+      elements.statusLine.textContent = snapshot.statusText;
+      renderTemplateSelect(snapshot.selectedId);
+      elements.templatePopover.open = snapshot.popoverOpen;
+      delete globalThis.__templateCaptureSnapshot;
+      return true;
+    })()`);
+  }
 }
 
 async function runLocalHarnessBridgeScenario({ cdp, companion, firstTargetId, panelSessionId }) {
