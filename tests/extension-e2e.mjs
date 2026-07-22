@@ -63,6 +63,7 @@ const extensionRoot = path.join(temporaryRoot, "extension");
 const profileRoot = path.join(temporaryRoot, "profile");
 let browserProcess;
 let server;
+let frameServer;
 let companion;
 let mcpClient;
 
@@ -104,6 +105,46 @@ try {
       target.type === "service_worker" && target.url === `chrome-extension://${extensionId}/background.js`
     ));
     const firstTabId = await queryTabId(cdp, panelSessionId, `${origin}/page-a`);
+
+    const panelTabContract = await evaluate(cdp, panelSessionId, `(async () => {
+      const panelTab = await chrome.tabs.getCurrent();
+      const targetTab = await chrome.tabs.get(${JSON.stringify(firstTabId)});
+      const url = new URL(location.href);
+      url.searchParams.set("targetTabId", String(targetTab.id));
+      url.searchParams.set("windowId", String(targetTab.windowId));
+      history.replaceState(null, "", url.toString());
+      const stored = await chrome.storage.local.get("settings");
+      await chrome.storage.local.set({
+        settings: { ...(stored.settings || {}), panelOpenMode: "tab" }
+      });
+      return { panelTabId: panelTab.id, panelUrl: url.toString(), originalSettings: stored.settings || {} };
+    })()`);
+    const tabPresentation = await poll(
+      async () => extensionMessage(cdp, panelSessionId, { type: "GET_PANEL_PRESENTATION" }),
+      (response) => response?.ok && response.data.openMode === "tab",
+      5_000
+    );
+    assert.equal(tabPresentation.data.tabSupported, true);
+    const reusedPanelTab = await extensionMessage(cdp, panelSessionId, {
+      type: "OPEN_PANEL_TAB",
+      targetTabId: firstTabId
+    });
+    assert.equal(reusedPanelTab.ok, true);
+    assert.equal(reusedPanelTab.data.id, panelTabContract.panelTabId);
+    const openPanelTabs = await evaluate(cdp, panelSessionId, `(async () => {
+      const tabs = await chrome.tabs.query({});
+      return tabs.filter((tab) => String(tab.url || tab.pendingUrl || "").startsWith(chrome.runtime.getURL("panel.html"))).length;
+    })()`);
+    assert.equal(openPanelTabs, 1, "tab mode should reuse one panel tab in the browser window");
+    await evaluate(cdp, panelSessionId, `chrome.storage.local.set({
+      settings: { ...${JSON.stringify(panelTabContract.originalSettings)}, panelOpenMode: "side-panel" }
+    })`);
+    const sidePresentation = await poll(
+      async () => extensionMessage(cdp, panelSessionId, { type: "GET_PANEL_PRESENTATION" }),
+      (response) => response?.ok && response.data.openMode === "side-panel",
+      5_000
+    );
+    assert.equal(sidePresentation.data.sidePanelSupported, true);
 
     const aiResponse = await extensionMessage(cdp, panelSessionId, {
       type: "CALL_AI",
@@ -179,6 +220,11 @@ try {
     assert.match(firstContext.data.documentId, /^[0-9a-z-]{8,}$/i);
     assert.equal(firstContext.data.observationScope.kind, "visual-viewport");
     assert.doesNotMatch(firstContext.data.visibleText, /Hidden DOM fact|Clipped action|Covered action|Offscreen viewport fact/);
+    assert.doesNotMatch(
+      firstContext.data.visibleText,
+      /Hidden cross-frame fact|Hidden cross-frame action|Covered cross-frame fact|Covered cross-frame action/
+    );
+    assert.match(firstContext.data.visibleText, /Cross frame ready/);
     assert.doesNotMatch(firstContext.data.documentTextExcerpt, /Hidden DOM fact|Offscreen viewport fact/);
     assert.match(firstContext.data.visibleText, /Display contents direct visible fact/);
     assert.equal(firstContext.data.interactiveElementStats.included, firstContext.data.interactiveElements.length);
@@ -195,6 +241,7 @@ try {
       firstContext.data.iframes.find((iframe) => iframe.title === "Metadata-only frame")?.contentAccess,
       "metadata-only"
     );
+    assert.ok(firstContext.data.automationCapabilities.frames.visuallyVerified >= 3);
     assert.equal(
       firstContext.data.interactiveElements.some((element) => /Covered action|Clipped action|Offscreen action/.test(element.label || "")),
       false
@@ -229,6 +276,11 @@ try {
       assert.equal(layout.externalPickerHidden, true, "a single external approval does not need a request picker");
       assert.equal(layout.settingsTabsSingleRow, true, `${viewportLabel} settings tabs should stay on one row`);
       assert.equal(layout.settingsTabsScrollable, true, `${viewportLabel} settings tabs should allow horizontal scrolling`);
+      assert.equal(layout.generalPanelNoHorizontalOverflow, true, `${viewportLabel} settings overview should not overflow horizontally`);
+      assert.equal(layout.settingsSummaryColumnCount, 1, `${viewportLabel} settings summary should use one readable column`);
+      assert.equal(layout.settingsGearVisible, true, `${viewportLabel} settings should retain the gear icon`);
+      assert.equal(layout.bridgePanelNoHorizontalOverflow, true, `${viewportLabel} Bridge panel should not overflow horizontally`);
+      assert.equal(layout.bridgeActionsNoHorizontalOverflow, true, `${viewportLabel} Bridge actions should wrap without horizontal overflow`);
       assert.equal(layout.narrowStress.topbarActionCount, 3, `${viewportLabel} should expose three primary topbar actions`);
       for (const [controlName, measurement] of Object.entries(layout.narrowStress.controls)) {
         assert.equal(
@@ -298,6 +350,8 @@ try {
     });
 
     if (process.argv.includes("--capture-docs")) {
+      await captureAgentPanelDocs(cdp, panelSessionId);
+      await captureSettingsOverviewDocs(cdp, panelSessionId);
       await captureTemplateManagerDocs(cdp, panelSessionId);
     }
 
@@ -316,6 +370,10 @@ try {
     assert.equal(verificationContracts.allVisualVerificationCallsReceivedScreenshot, true);
     assert.equal(verificationContracts.previousViewportEvidenceStatus, "rejected");
     assert.equal(verificationContracts.currentViewportEvidenceStatus, "verified");
+    assert.equal(verificationContracts.visualActionVerified, true);
+    assert.equal(verificationContracts.visualActionRebound, true);
+    assert.equal(verificationContracts.visualVerifierReceivedScreenshot, true);
+    assert.equal(verificationContracts.visualActionRejectedClosed, true);
 
     const transitionContracts = await exerciseTabTransitionContracts({ cdp, panelSessionId });
     assert.equal(transitionContracts.preservedRunningSession, true);
@@ -417,7 +475,7 @@ try {
       async () => extensionMessage(cdp, panelSessionId, {
         type: "COLLECT_PAGE_CONTEXT",
         targetTabId: firstTabId,
-        options: { maxTextChars: 8000, maxElements: 40, redactSensitiveData: true }
+        options: { maxTextChars: 12000, maxElements: 100, redactSensitiveData: true }
       }),
       (response) => response?.data?.interactiveElements?.some((element) => element.label === "Name"),
       5000
@@ -429,17 +487,124 @@ try {
     assert.equal(privateInput?.value, "[redacted]");
     const shadowInput = restoredContext.data.interactiveElements.find((element) => element.label === "Shadow Name");
     const frameInput = restoredContext.data.interactiveElements.find((element) => element.label === "Frame Name");
+    const crossFrameInput = restoredContext.data.interactiveElements.find((element) => element.label === "Cross Frame Name");
+    const crossFrameAction = restoredContext.data.interactiveElements.find((element) => element.label === "Cross Frame Action");
     const uploadInput = restoredContext.data.interactiveElements.find((element) => element.label === "Upload document");
     assert.match(shadowInput?.scope || "", /shadow/);
     assert.match(frameInput?.scope || "", /frame/);
+    assert.match(crossFrameInput?.ref || "", /^f\d+:e\d+$/);
+    assert.ok(crossFrameInput?.frameId > 0);
+    assert.equal(crossFrameInput?.rectSpace, "top-viewport");
     assert.ok(uploadInput?.ref);
+
+    const crossFrameResult = await extensionMessage(cdp, panelSessionId, {
+      type: "EXECUTE_PAGE_ACTIONS",
+      targetTabId: firstTabId,
+      actions: [
+        { id: "fill-cross-frame", type: "fill", ref: crossFrameInput.ref, value: "cross-bound", reason: "cross-origin frame E2E" },
+        { id: "click-cross-frame", type: "click", ref: crossFrameAction.ref, reason: "cross-origin action E2E" }
+      ]
+    });
+    assert.equal(crossFrameResult.ok, true);
+    assert.equal(crossFrameResult.data.results.every((result) => result.ok), true);
+    assert.equal(crossFrameResult.data.results[0].frameId, crossFrameInput.frameId);
+    const crossFrameContext = await extensionMessage(cdp, panelSessionId, {
+      type: "COLLECT_PAGE_CONTEXT",
+      targetTabId: firstTabId,
+      options: { maxTextChars: 12000, maxElements: 100, redactSensitiveData: true }
+    });
+    assert.match(crossFrameContext.data.visibleText, /Cross frame action complete/);
+    assert.equal(
+      crossFrameContext.data.interactiveElements.find((element) => element.label === "Cross Frame Name")?.value,
+      "cross-bound"
+    );
+
+    const scrollRegion = crossFrameContext.data.scrollRegions.find((region) => region.label === "Scrollable results");
+    assert.ok(scrollRegion?.ref);
+    assert.equal(
+      crossFrameContext.data.interactiveElements.some((element) => element.label === "Nested scroll action"),
+      false
+    );
+    const nestedScrollResult = await extensionMessage(cdp, panelSessionId, {
+      type: "EXECUTE_PAGE_ACTIONS",
+      targetTabId: firstTabId,
+      actions: [{
+        id: "scroll-nested-region",
+        type: "scroll",
+        ref: scrollRegion.ref,
+        direction: "down",
+        amount: 220,
+        reason: "reveal a clipped control inside its own scroll container"
+      }]
+    });
+    assert.equal(nestedScrollResult.data.results[0].ok, true);
+    const nestedContext = await poll(
+      async () => extensionMessage(cdp, panelSessionId, {
+        type: "COLLECT_PAGE_CONTEXT",
+        targetTabId: firstTabId,
+        options: { maxTextChars: 12000, maxElements: 100, redactSensitiveData: true }
+      }),
+      (response) => response?.data?.interactiveElements?.some((element) => element.label === "Nested scroll action"),
+      5000
+    );
+    assert.ok(nestedContext.data.scrollRegions.find((region) => region.ref === scrollRegion.ref)?.scrollTop > 0);
+
+    const visualSurface = nestedContext.data.visualSurfaces.find((surface) => surface.label === "Visual command surface");
+    assert.ok(visualSurface?.ref);
+    const visualBypassResult = await extensionMessage(cdp, panelSessionId, {
+      type: "EXECUTE_PAGE_ACTIONS",
+      targetTabId: firstTabId,
+      actions: [{
+        id: "visual-bypass",
+        type: "click",
+        ref: visualSurface.ref,
+        reason: "verify that a normal click cannot bypass visual safeguards"
+      }]
+    });
+    assert.equal(visualBypassResult.data.results[0].ok, false);
+    assert.equal(visualBypassResult.data.results[0].code, "visual_action_required");
+    const visualSurfaceContext = await extensionMessage(cdp, panelSessionId, {
+      type: "COLLECT_PAGE_CONTEXT",
+      targetTabId: firstTabId,
+      options: { maxTextChars: 12000, maxElements: 100, redactSensitiveData: true }
+    });
+    const currentVisualSurface = visualSurfaceContext.data.visualSurfaces.find(
+      (surface) => surface.label === "Visual command surface"
+    );
+    const visualActionResult = await extensionMessage(cdp, panelSessionId, {
+      type: "EXECUTE_PAGE_ACTIONS",
+      targetTabId: firstTabId,
+      actions: [{
+        id: "visual-apply",
+        type: "visual_click",
+        ref: currentVisualSurface.ref,
+        xNormalized: 750,
+        yNormalized: 500,
+        targetDescription: "green Apply area",
+        reason: "visual surface E2E"
+      }]
+    });
+    assert.equal(visualActionResult.data.results[0].ok, true);
+    const visualContext = await extensionMessage(cdp, panelSessionId, {
+      type: "COLLECT_PAGE_CONTEXT",
+      targetTabId: firstTabId,
+      options: { maxTextChars: 12000, maxElements: 100, redactSensitiveData: true }
+    });
+    assert.match(visualContext.data.visibleText, /Visual apply complete/);
+    if (process.argv.includes("--capture-docs")) {
+      await captureWebCompatibilityDocs(cdp, panelSessionId, visualContext.data);
+    }
+    const currentShadowInput = visualContext.data.interactiveElements.find((element) => element.label === "Shadow Name");
+    const currentFrameInput = visualContext.data.interactiveElements.find((element) => element.label === "Frame Name");
+    const currentUploadInput = visualContext.data.interactiveElements.find((element) => element.label === "Upload document");
+    const currentPageNameInput = visualContext.data.interactiveElements.find((element) => element.label === "Name");
 
     const deepActionResult = await extensionMessage(cdp, panelSessionId, {
       type: "EXECUTE_PAGE_ACTIONS",
       targetTabId: firstTabId,
       actions: [
-        { id: "fill-shadow", type: "fill", ref: shadowInput.ref, value: "shadow-value", reason: "Shadow DOM E2E" },
-        { id: "fill-frame", type: "fill", ref: frameInput.ref, value: "frame-value", reason: "iframe E2E" }
+        { id: "fill-shadow", type: "fill", ref: currentShadowInput.ref, value: "shadow-value", reason: "Shadow DOM E2E" },
+        { id: "fill-frame", type: "fill", ref: currentFrameInput.ref, value: "frame-value", reason: "iframe E2E" }
       ]
     });
     assert.equal(deepActionResult.ok, true);
@@ -468,7 +633,7 @@ try {
       actions: [{
         id: "upload",
         type: "upload",
-        ref: uploadInput.ref,
+        ref: currentUploadInput.ref,
         files: [{
           name: "agent-e2e.txt",
           type: "text/plain",
@@ -484,7 +649,7 @@ try {
     const actionResult = await extensionMessage(cdp, panelSessionId, {
       type: "EXECUTE_PAGE_ACTIONS",
       targetTabId: firstTabId,
-      actions: [{ id: "fill-first", type: "fill", ref: input.ref, value: "bound-tab", reason: "E2E tab binding" }]
+      actions: [{ id: "fill-first", type: "fill", ref: currentPageNameInput.ref, value: "bound-tab", reason: "E2E tab binding" }]
     });
     assert.equal(actionResult.ok, true);
     assert.equal(actionResult.data.results[0].ok, true);
@@ -493,6 +658,18 @@ try {
     await cdp.send("Target.activateTarget", { targetId: secondTargetId });
     const secondTabId = await queryTabId(cdp, panelSessionId, `${origin}/page-b`);
     assert.notEqual(firstTabId, secondTabId);
+    const secondPanelTab = await extensionMessage(cdp, panelSessionId, {
+      type: "OPEN_PANEL_TAB",
+      targetTabId: secondTabId
+    });
+    assert.equal(secondPanelTab.ok, true);
+    assert.notEqual(secondPanelTab.data.id, panelTabContract.panelTabId);
+    const targetSpecificPanelCount = await evaluate(cdp, panelSessionId, `(async () => {
+      const tabs = await chrome.tabs.query({});
+      return tabs.filter((tab) => String(tab.url || tab.pendingUrl || "").startsWith(chrome.runtime.getURL("panel.html"))).length;
+    })()`);
+    assert.equal(targetSpecificPanelCount, 2, "a different target should not reload an existing agent workspace");
+    await evaluate(cdp, panelSessionId, `chrome.tabs.remove(${JSON.stringify(secondPanelTab.data.id)})`);
 
     const boundResult = await extensionMessage(cdp, panelSessionId, {
       type: "EXECUTE_PAGE_ACTIONS",
@@ -556,54 +733,82 @@ try {
       toolCallTimeoutMs: 15_000,
     });
 
-    await evaluate(cdp, panelSessionId, `(async () => {
-      const stored = await chrome.storage.local.get("settings");
-      await chrome.storage.local.set({
-        settings: {
-          ...(stored.settings || {}),
-          bridgeEnabled: true,
-          bridgeEndpoint: ${JSON.stringify(companion.endpoints.extension)},
-          bridgeRequireApproval: true,
-          policyGuardEnabled: false,
-          stopOnSensitiveInput: true
-        }
-      });
-      return true;
-    })()`);
-
-    const configuredBridge = await extensionMessage(cdp, panelSessionId, {
-      type: "CONFIGURE_BRIDGE",
-      settings: {
-        bridgeEnabled: true,
-        bridgeEndpoint: companion.endpoints.extension,
-        bridgeRequireApproval: true
-      }
-    });
-    assert.equal(configuredBridge.ok, true);
-    await poll(async () => extensionMessage(cdp, panelSessionId, { type: "GET_BRIDGE_STATUS" }), (
-      response
-    ) => response?.ok && response.data.phase === "pairing_required", 10_000);
-
-    const pairedBridge = await extensionMessage(cdp, panelSessionId, {
-      type: "PAIR_BRIDGE",
-      pairingCode: companion.pairingCode
-    });
-    assert.equal(pairedBridge.ok, true);
-    const connectedBridge = await poll(
-      async () => extensionMessage(cdp, panelSessionId, { type: "GET_BRIDGE_STATUS" }),
-      (response) => response?.ok && response.data.connected && companion.extensionConnected,
-      10_000
+    const parsedExtensionSetup = await evaluate(
+      cdp,
+      panelSessionId,
+      `parseBridgeSetupValue(${JSON.stringify(companion.extensionSetup)})`
     );
-    assert.equal(connectedBridge.data.paired, true);
-    assert.equal(companion.pairingCode, null, "the one-time pairing code must be consumed");
+    assert.equal(parsedExtensionSetup.endpoint, companion.endpoints.extension);
+    assert.equal(parsedExtensionSetup.pairingCode, companion.pairingCode);
 
-    const attachedBridge = await extensionMessage(cdp, panelSessionId, {
-      type: "ATTACH_BRIDGE_TAB",
-      targetTabId: firstTabId
-    });
-    assert.equal(attachedBridge.ok, true);
-    assert.equal(attachedBridge.data.runtime.armed, true);
-    assert.equal(attachedBridge.data.runtime.sharedTab.tabId, firstTabId);
+    const bridgeConnectPoint = await evaluate(cdp, panelSessionId, `(async () => {
+      await loadSettings();
+      state.settings = {
+        ...state.settings,
+        bridgeEnabled: false,
+        bridgeEndpoint: "",
+        bridgeRequireApproval: true,
+        policyGuardEnabled: false,
+        stopOnSensitiveInput: true
+      };
+      applySettingsToForm();
+      state.activeTab = {
+        id: ${JSON.stringify(firstTabId)},
+        title: "First page",
+        url: ${JSON.stringify(`${origin}/page-a`)}
+      };
+      elements.inputs.bridgeEndpoint.value = ${JSON.stringify(companion.extensionSetup)};
+      openSettings();
+      activateSettingsTab("bridge");
+      renderBridgeStatus();
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      return {
+        disabled: elements.bridgeConnectButton.disabled
+      };
+    })()`);
+    assert.equal(bridgeConnectPoint.disabled, false);
+    await cdp.send("Runtime.evaluate", {
+      expression: "elements.bridgeConnectButton.click(); true",
+      awaitPromise: true,
+      returnByValue: true,
+      userGesture: true
+    }, panelSessionId);
+    let connectedBridge;
+    try {
+      connectedBridge = await poll(
+        async () => extensionMessage(cdp, panelSessionId, { type: "GET_BRIDGE_STATUS" }),
+        (response) => response?.ok
+          && response.data.connected
+          && response.data.runtime.armed
+          && companion.extensionConnected,
+        15_000
+      );
+    } catch (error) {
+      const diagnostic = await evaluate(cdp, panelSessionId, `({
+        busy: state.busy,
+        bridgeStatus: state.bridgeStatus,
+        settingsStatus: elements.settingsStatus.textContent,
+        endpoint: elements.inputs.bridgeEndpoint.value,
+        activeTab: state.activeTab,
+        permissionLogs: state.evaluationLogs.filter((entry) => String(entry.kind || "").includes("permission")).slice(-3)
+      })`);
+      throw new Error(`${error.message} Bridge UI diagnostic: ${JSON.stringify(diagnostic)}`);
+    }
+    const oneClickBridge = await evaluate(cdp, panelSessionId, `({
+        status: state.bridgeStatus,
+        storedEndpoint: state.settings.bridgeEndpoint,
+        inputValue: elements.inputs.bridgeEndpoint.value,
+        settingsStatus: elements.settingsStatus.textContent
+      })`);
+    assert.equal(connectedBridge.data.connected, true, oneClickBridge.settingsStatus);
+    assert.equal(connectedBridge.data.paired, true);
+    assert.equal(connectedBridge.data.runtime.armed, true);
+    assert.equal(connectedBridge.data.runtime.sharedTab.tabId, firstTabId);
+    assert.equal(oneClickBridge.storedEndpoint, companion.endpoints.extension);
+    assert.equal(oneClickBridge.inputValue, companion.endpoints.extension);
+    assert.doesNotMatch(oneClickBridge.inputValue, /#pair=/);
+    assert.equal(companion.extensionConnected, true);
+    assert.equal(companion.pairingCode, null, "the one-time pairing code must be consumed");
 
     if (process.argv.includes("--capture-docs")) {
       await evaluate(cdp, panelSessionId, `(async () => {
@@ -632,35 +837,22 @@ try {
     });
     await mcpClient.connect(mcpTransport);
 
-    const bridgeStatus = toolData(await mcpClient.callTool({
-      name: "browser_status",
-      arguments: {}
-    }));
-    assert.equal(bridgeStatus.armed, true);
-
     const bridgeGoal = "Inspect the shared page and enter the approved test value in the Name field.";
-    const session = toolData(await mcpClient.callTool({
-      name: "browser_session_start",
+    const begunTask = toolData(await mcpClient.callTool({
+      name: "browser_begin",
       arguments: { goal: bridgeGoal }
     }));
-    assert.match(session.session_id, /^session-/);
-
-    const firstObservation = toolData(await mcpClient.callTool({
-      name: "browser_observe",
-      arguments: { session_id: session.session_id }
-    }));
-    assert.match(firstObservation.observation_id, /^observation-/);
-    const bridgeNameInput = firstObservation.context.interactiveElements.find(
+    assert.equal(begunTask.status, "ready");
+    assert.equal(Object.hasOwn(begunTask, "session_id"), false);
+    assert.equal(Object.hasOwn(begunTask, "observation_id"), false);
+    const bridgeNameInput = begunTask.page.interactiveElements.find(
       (element) => element.label === "Name"
     );
     assert.ok(bridgeNameInput?.ref, "the MCP observation must expose a runtime-bound Name ref");
 
     const readOnlyOperation = toolData(await mcpClient.callTool({
-      name: "browser_execute",
+      name: "browser_act",
       arguments: {
-        session_id: session.session_id,
-        observation_id: firstObservation.observation_id,
-        idempotency_key: "real-chrome-extract-1",
         actions: [{
           id: "extract-visible-page",
           type: "extract",
@@ -669,23 +861,21 @@ try {
       }
     }));
     assert.equal(readOnlyOperation.status, "completed");
-    assert.match(readOnlyOperation.result.results[0].result.text, /First page/);
+    assert.match(readOnlyOperation.operation.result.results[0].result.text, /First page/);
 
-    const secondObservation = toolData(await mcpClient.callTool({
-      name: "browser_observe",
-      arguments: { session_id: session.session_id }
+    const continuedTask = toolData(await mcpClient.callTool({
+      name: "browser_continue",
+      arguments: {}
     }));
-    const currentNameInput = secondObservation.context.interactiveElements.find(
+    assert.equal(continuedTask.status, "ready");
+    const currentNameInput = continuedTask.page.interactiveElements.find(
       (element) => element.label === "Name"
     );
     assert.ok(currentNameInput?.ref);
 
     const approvalOperation = toolData(await mcpClient.callTool({
-      name: "browser_execute",
+      name: "browser_act",
       arguments: {
-        session_id: session.session_id,
-        observation_id: secondObservation.observation_id,
-        idempotency_key: "real-chrome-fill-1",
         actions: [{
           id: "fill-name-after-approval",
           type: "fill",
@@ -695,19 +885,16 @@ try {
         }]
       }
     }));
-    assert.equal(approvalOperation.status, "waiting_approval");
-    assert.equal(approvalOperation.approval.required, true);
+    assert.equal(approvalOperation.status, "approval_required");
+    assert.equal(approvalOperation.operation.status, "waiting_approval");
+    assert.equal(approvalOperation.operation.approval.required, true);
 
     const pendingApprovals = await extensionMessage(cdp, panelSessionId, {
       type: "LIST_EXTERNAL_APPROVALS"
     });
     assert.equal(pendingApprovals.ok, true);
-    assert.equal(
-      pendingApprovals.data.operations.some(
-        (operation) => operation.operation_id === approvalOperation.operation_id
-      ),
-      true
-    );
+    assert.equal(pendingApprovals.data.operations.length, 1);
+    const pendingOperationId = pendingApprovals.data.operations[0].operation_id;
 
     if (process.argv.includes("--capture-docs")) {
       await evaluate(cdp, panelSessionId, `(async () => {
@@ -736,25 +923,23 @@ try {
 
     const approvedOperation = await extensionMessage(cdp, panelSessionId, {
       type: "APPROVE_EXTERNAL_OPERATION",
-      operationId: approvalOperation.operation_id
+      operationId: pendingOperationId
     });
     assert.equal(approvedOperation.ok, true);
     assert.equal(approvedOperation.data.operation.status, "completed");
 
-    const completedOperation = toolData(await mcpClient.callTool({
-      name: "browser_operation_get",
-      arguments: {
-        session_id: session.session_id,
-        operation_id: approvalOperation.operation_id
-      }
+    const completedTask = toolData(await mcpClient.callTool({
+      name: "browser_continue",
+      arguments: {}
     }));
-    assert.equal(completedOperation.status, "completed");
-    assert.ok(completedOperation.evidence?.id);
+    assert.equal(completedTask.status, "ready");
+    assert.equal(completedTask.last_operation.status, "completed");
+    assert.ok(completedTask.last_operation.evidence?.id);
     assert.equal(await readInputValue(cdp, firstTargetId), "bridge-approved");
 
     const closedSession = toolData(await mcpClient.callTool({
-      name: "browser_session_close",
-      arguments: { session_id: session.session_id }
+      name: "browser_end",
+      arguments: {}
     }));
     assert.equal(closedSession.closed, true);
 
@@ -783,7 +968,7 @@ try {
     await mcpClient.close();
     mcpClient = null;
 
-    process.stdout.write("Real Chrome extension E2E passed: bounded panel approvals, tab/session isolation, grounded answers, deep DOM interactions, files, tabs, worker restart, and the authenticated MCP Bridge approval flow.\n");
+    process.stdout.write("Real Chrome extension E2E passed: grounded multi-frame observation, hidden-frame exclusion, nested scrolling, visual surfaces, bounded approvals, files, tabs, worker restart, and the authenticated MCP Bridge flow.\n");
   } finally {
     cdp.close();
   }
@@ -798,6 +983,7 @@ try {
     ]);
   }
   await new Promise((resolve) => server?.close(resolve) || resolve());
+  await new Promise((resolve) => frameServer?.close(resolve) || resolve());
   await rm(temporaryRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 }
 
@@ -856,6 +1042,35 @@ async function resolveChromePath() {
 }
 
 async function startFixtureServer() {
+  frameServer = createServer((request, response) => {
+    response.setHeader("content-type", "text/html; charset=utf-8");
+    if (request.url?.startsWith("/hidden-cross-frame")) {
+      response.end(`<!doctype html><html><body><p>Hidden cross-frame fact</p><button>Hidden cross-frame action</button></body></html>`);
+      return;
+    }
+    if (request.url?.startsWith("/covered-cross-frame")) {
+      response.end(`<!doctype html><html><body><p>Covered cross-frame fact</p><button>Covered cross-frame action</button></body></html>`);
+      return;
+    }
+    response.end(`<!doctype html><html><body>
+      <label for="cross-frame-name">Cross Frame Name</label>
+      <input id="cross-frame-name">
+      <button id="cross-frame-action" type="button">Cross Frame Action</button>
+      <div id="cross-frame-status" role="status">Cross frame ready</div>
+      <script>
+        document.querySelector('#cross-frame-action').addEventListener('click', () => {
+          document.querySelector('#cross-frame-status').textContent = 'Cross frame action complete';
+        });
+      </script>
+    </body></html>`);
+  });
+  await new Promise((resolve, reject) => {
+    frameServer.once("error", reject);
+    frameServer.listen(0, "127.0.0.1", resolve);
+  });
+  const frameAddress = frameServer.address();
+  const frameOrigin = `http://127.0.0.1:${frameAddress.port}`;
+
   server = createServer((request, response) => {
     if (request.url?.startsWith("/mock-empty-ai")) {
       response.setHeader("content-type", "application/json; charset=utf-8");
@@ -906,7 +1121,7 @@ async function startFixtureServer() {
       #pointer-action { position: absolute; left: 0; top: 50px; cursor: pointer; padding: 6px; border: 1px solid #333; }
       #clipped-shell { position: absolute; left: 180px; top: 0; width: 130px; height: 34px; overflow: hidden; }
       #clipped-action { position: absolute; left: 0; top: 60px; width: 120px; height: 30px; }
-      iframe { width: 230px; height: 70px; }
+      iframe { width: 180px; height: 70px; }
       #candidate-probes { position: fixed; left: 570px; top: 8px; z-index: 1; display: grid; grid-template-columns: repeat(6, 32px); gap: 2px; }
       #candidate-probes button { box-sizing: border-box; width: 32px; height: 14px; min-width: 0; padding: 0; overflow: hidden; font-size: 7px; }
       #visual-first-candidate { position: fixed; left: 540px; top: 1px; z-index: 2; width: 24px; height: 14px; padding: 0; font-size: 0; }
@@ -914,6 +1129,14 @@ async function startFixtureServer() {
       #display-contents-copy { display: contents; }
       #svg-action { display: block; width: 130px; height: 32px; margin-top: 6px; cursor: pointer; }
       #delegated-action { cursor: pointer; margin-top: 6px; }
+      #nested-scroll { width: 260px; height: 76px; overflow: auto; border: 1px solid #94a3b8; }
+      #nested-scroll-content { height: 280px; padding-top: 210px; box-sizing: border-box; }
+      #visual-canvas { display: block; width: 240px; height: 80px; margin-top: 8px; }
+      #advanced-structure-lab { position: fixed; right: 8px; bottom: 8px; z-index: 4; width: 270px; padding: 4px; background: white; }
+      #hidden-cross-frame { display: none; }
+      #covered-frame-shell { position: fixed; left: 300px; bottom: 8px; z-index: 3; width: 180px; height: 70px; }
+      #covered-frame-shell iframe { position: absolute; inset: 0; margin: 0; }
+      #covered-frame-overlay { position: absolute; inset: 0 auto 0 0; z-index: 1; width: 70px; background: white; }
       #offscreen-section { margin-top: 1300px; min-height: 280px; }
     </style></head><body>
       <h1>${second ? "Second" : "First"} page</h1>
@@ -947,7 +1170,22 @@ async function startFixtureServer() {
       <div role="status">Ready</div>
       <div id="shadow-host"></div>
       <iframe title="Same-origin frame" src="/frame"></iframe>
+      <iframe title="Cross-origin frame" src="${frameOrigin}/cross-frame"></iframe>
+      <iframe id="hidden-cross-frame" title="Hidden cross-origin frame" src="${frameOrigin}/hidden-cross-frame"></iframe>
+      <div id="covered-frame-shell">
+        <iframe title="Covered cross-origin frame" src="${frameOrigin}/covered-cross-frame"></iframe>
+        <div id="covered-frame-overlay">Visible frame cover</div>
+      </div>
       <iframe title="Metadata-only frame" src="data:text/html,%3Cbody%3EOpaque%20frame%3C%2Fbody%3E"></iframe>
+      <div id="advanced-structure-lab">
+        <div id="nested-scroll" role="region" aria-label="Scrollable results">
+          <div id="nested-scroll-content">
+            <button id="nested-scroll-action" type="button">Nested scroll action</button>
+          </div>
+        </div>
+        <canvas id="visual-canvas" width="240" height="80" aria-label="Visual command surface"></canvas>
+        <div id="visual-status" role="status">Visual surface idle</div>
+      </div>
       <label for="upload">Upload document</label>
       <input id="upload" type="file" accept="text/plain">
       <button id="async" type="button">Start async</button>
@@ -975,6 +1213,21 @@ async function startFixtureServer() {
         });
         document.querySelector('#delegated-action').addEventListener('click', (event) => {
           document.querySelector('#delegated-status').textContent = 'Delegated target ' + event.target.id;
+        });
+        const visualCanvas = document.querySelector('#visual-canvas');
+        const visualContext = visualCanvas.getContext('2d');
+        visualContext.fillStyle = '#2563eb';
+        visualContext.fillRect(0, 0, 120, 80);
+        visualContext.fillStyle = '#16a34a';
+        visualContext.fillRect(120, 0, 120, 80);
+        visualContext.fillStyle = '#ffffff';
+        visualContext.font = '16px sans-serif';
+        visualContext.fillText('Inspect', 32, 46);
+        visualContext.fillText('Apply', 158, 46);
+        visualCanvas.addEventListener('click', (event) => {
+          document.querySelector('#visual-status').textContent = event.offsetX >= 120
+            ? 'Visual apply complete'
+            : 'Visual inspect complete';
         });
       </script>
     </body></html>`);
@@ -1289,6 +1542,24 @@ async function exercisePanelContracts({ cdp, panelSessionId, tabId, context }) {
         const tabsStyle = getComputedStyle(document.querySelector(".settings-tabs"));
         layout.settingsTabsSingleRow = rowTops.length > 0 && Math.max(...rowTops) - Math.min(...rowTops) <= 1;
         layout.settingsTabsScrollable = tabsStyle.overflowX === "auto" || tabsStyle.overflowX === "scroll";
+        const previousSettingsTab = elements.settingsTabs.find((tab) => tab.classList.contains("active"))?.dataset.settingsTab || "general";
+        activateSettingsTab("general");
+        document.querySelector(".settings-body")?.scrollTo({ top: 0 });
+        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        const generalPanel = document.getElementById("generalPanel");
+        const settingsGear = document.querySelector(".settings-heading-icon");
+        const summaryGridStyle = getComputedStyle(document.querySelector(".settings-summary-grid"));
+        layout.generalPanelNoHorizontalOverflow = generalPanel.scrollWidth <= generalPanel.clientWidth + 1;
+        layout.settingsSummaryColumnCount = summaryGridStyle.gridTemplateColumns.split(" ").filter(Boolean).length;
+        layout.settingsGearVisible = settingsGear.getBoundingClientRect().width > 0;
+        activateSettingsTab("bridge");
+        document.querySelector(".settings-body")?.scrollTo({ top: 0 });
+        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        const bridgePanel = document.getElementById("bridgePanel");
+        const bridgeActions = bridgePanel.querySelector(".bridge-actions");
+        layout.bridgePanelNoHorizontalOverflow = bridgePanel.scrollWidth <= bridgePanel.clientWidth + 1;
+        layout.bridgeActionsNoHorizontalOverflow = bridgeActions.scrollWidth <= bridgeActions.clientWidth + 1;
+        activateSettingsTab(previousSettingsTab);
         elements.settingsModal.hidden = settingsWasHidden;
         document.body.classList.toggle("settings-open", settingsClassWasPresent);
         return layout;
@@ -1689,13 +1960,87 @@ async function exerciseAgentVerificationContracts({ cdp, panelSessionId, tabId, 
         coherentScreenshot
       );
 
+      const visualContext = structuredClone(currentContext);
+      visualContext.visualObservation = {
+        id: "visual-current-runtime-binding",
+        screenshotBound: true,
+        coordinateSystem: "surface-relative-0-1000"
+      };
+      visualContext.visualSurfaces = [{
+        ref: "v1",
+        kind: "canvas",
+        tag: "canvas",
+        label: "Visual command surface",
+        selector: "#visual-canvas",
+        rect: { x: 20, y: 120, width: 240, height: 80 },
+        actionability: "visual-coordinate-only"
+      }];
+      const visualDecision = {
+        step: 3,
+        actions: [{
+          id: "visual-contract-action",
+          type: "visual_click",
+          ref: "v1",
+          visualObservationId: "visual-planner-binding",
+          xNormalized: 750,
+          yNormalized: 500,
+          targetDescription: "green Apply area",
+          reason: "visual verifier contract"
+        }]
+      };
+      let visualVerifierReceivedScreenshot = false;
+      requestAiDecision = async (activeSession, request) => {
+        visualVerifierReceivedScreenshot = request.screenshotDataUrl === coherentScreenshot;
+        const visualEvidence = activeSession.evidence.findLast((item) => item.source === "visual_observation");
+        return {
+          text: JSON.stringify({
+            version: "1.0",
+            status: "verified",
+            message: "화면 좌표 대상을 확인했습니다.",
+            evidenceIds: [visualEvidence.id],
+            missingEvidence: [],
+            confidence: 0.97
+          }),
+          audit: null
+        };
+      };
+      const visualVerified = await verifyVisualActionsBeforeExecution(visualDecision, {
+        context: visualContext,
+        screenshotDataUrl: coherentScreenshot
+      });
+      const visualActionRebound = visualDecision.actions[0].visualObservationId === visualContext.visualObservation.id;
+
+      const rejectedDecision = structuredClone(visualDecision);
+      requestAiDecision = async (activeSession) => {
+        const visualEvidence = activeSession.evidence.findLast((item) => item.source === "visual_observation");
+        return {
+          text: JSON.stringify({
+            version: "1.0",
+            status: "rejected",
+            message: "대상이 모호합니다.",
+            evidenceIds: [visualEvidence.id],
+            missingEvidence: ["명확한 화면 대상"],
+            confidence: 0.2
+          }),
+          audit: null
+        };
+      };
+      const visualRejected = await verifyVisualActionsBeforeExecution(rejectedDecision, {
+        context: visualContext,
+        screenshotDataUrl: coherentScreenshot
+      });
+
       return {
         repairedStatus: repairedDecision.status,
         completionVerified: repairedDecision.verifier?.status === "verified",
         purposes,
         allVisualVerificationCallsReceivedScreenshot: screenshotChecks.length >= 4 && screenshotChecks.every(Boolean),
         previousViewportEvidenceStatus: previousViewportEvidence.status,
-        currentViewportEvidenceStatus: currentViewportEvidence.status
+        currentViewportEvidenceStatus: currentViewportEvidence.status,
+        visualActionVerified: visualVerified.valid,
+        visualActionRebound,
+        visualVerifierReceivedScreenshot,
+        visualActionRejectedClosed: !visualRejected.valid
       };
     } finally {
       requestAiDecision = original.requestAiDecision;
@@ -1836,6 +2181,45 @@ async function capturePanelScreenshot(cdp, panelSessionId, filename) {
   await writeFile(path.join(root, "docs", "assets", filename), Buffer.from(data, "base64"));
 }
 
+async function captureWebCompatibilityDocs(cdp, panelSessionId, context) {
+  await evaluate(cdp, panelSessionId, `(async () => {
+    const original = {
+      activeTab: state.activeTab ? structuredClone(state.activeTab) : null,
+      lastContext: state.lastContext ? structuredClone(state.lastContext) : null,
+      contextModalHidden: elements.contextModal.hidden,
+      status: elements.contextStatus.textContent
+    };
+    globalThis.__compatibilityCaptureSnapshot = original;
+    const sanitized = JSON.parse(JSON.stringify(${JSON.stringify(context)}).replace(
+      /http:\\/\\/127\\.0\\.0\\.1:\\d+/g,
+      "https://fixture.invalid"
+    ));
+    sanitized.title = "Web compatibility fixture";
+    sanitized.url = "https://fixture.invalid/dashboard";
+    state.activeTab = { id: 1, title: sanitized.title, url: sanitized.url };
+    state.lastContext = sanitized;
+    closeSettings();
+    hideRestrictedPage();
+    openContext();
+    renderContextPanel(sanitized);
+    elements.contextStatus.textContent = "실제 브라우저 검증 컨텍스트";
+    document.querySelector(".context-body")?.scrollTo({ top: 0 });
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    return true;
+  })()`);
+  await capturePanelScreenshot(cdp, panelSessionId, "web-compatibility.png");
+  await evaluate(cdp, panelSessionId, `(() => {
+    const original = globalThis.__compatibilityCaptureSnapshot;
+    state.activeTab = original.activeTab;
+    state.lastContext = original.lastContext;
+    elements.contextModal.hidden = original.contextModalHidden;
+    elements.contextStatus.textContent = original.status;
+    document.body.classList.remove("settings-open");
+    delete globalThis.__compatibilityCaptureSnapshot;
+    return true;
+  })()`);
+}
+
 async function captureTemplateManagerDocs(cdp, panelSessionId) {
   await evaluate(cdp, panelSessionId, `(async () => {
     globalThis.__templateCaptureSnapshot = {
@@ -1876,6 +2260,131 @@ async function captureTemplateManagerDocs(cdp, panelSessionId) {
   }
 }
 
+async function captureAgentPanelDocs(cdp, panelSessionId) {
+  await evaluate(cdp, panelSessionId, `(async () => {
+    globalThis.__agentPanelCaptureSnapshot = {
+      settings: structuredClone(state.settings),
+      runtimeSettings: structuredClone(state.runtimeSettings),
+      activeTab: state.activeTab ? structuredClone(state.activeTab) : null,
+      conversation: structuredClone(state.conversation),
+      externalApprovals: structuredClone(state.externalApprovals),
+      selectedExternalOperationId: state.selectedExternalOperationId,
+      statusText: elements.statusLine.textContent,
+      settingsHidden: elements.settingsModal.hidden,
+      contextHidden: elements.contextModal.hidden,
+      exportHidden: elements.exportModal.hidden
+    };
+    state.settings = {
+      ...state.settings,
+      agentMode: "approve",
+      mcpEnabled: false,
+      bridgeEnabled: false
+    };
+    state.runtimeSettings = { ...state.settings };
+    applyActiveTabSummary({ id: 1, title: "Example dashboard", url: "https://fixture.invalid/dashboard" });
+    state.conversation = [
+      { role: "user", text: "현재 화면에서 확인해야 할 항목을 정리해줘." },
+      { role: "assistant", text: "현재 화면의 보이는 내용과 조작 가능한 요소를 기준으로 확인할 준비가 되었습니다." }
+    ];
+    elements.messageList.replaceChildren();
+    for (const message of state.conversation) {
+      appendChatMessage(message.role, message.text, { record: false });
+    }
+    elements.settingsModal.hidden = true;
+    elements.contextModal.hidden = true;
+    elements.exportModal.hidden = true;
+    document.body.classList.remove("settings-open");
+    closeTransientMenus();
+    hideApprovalPanel();
+    state.externalApprovals = [];
+    renderExternalApprovalPanel();
+    hideRestrictedPage();
+    updateStatusBadges();
+    setStatusLine("요청을 기다리는 중");
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    return true;
+  })()`);
+  try {
+    await capturePanelScreenshot(cdp, panelSessionId, "agent-panel.png");
+  } finally {
+    await evaluate(cdp, panelSessionId, `(() => {
+      const snapshot = globalThis.__agentPanelCaptureSnapshot;
+      state.settings = snapshot.settings;
+      state.runtimeSettings = snapshot.runtimeSettings;
+      state.activeTab = snapshot.activeTab;
+      if (snapshot.activeTab) applyActiveTabSummary(snapshot.activeTab);
+      state.conversation = snapshot.conversation;
+      state.externalApprovals = snapshot.externalApprovals;
+      state.selectedExternalOperationId = snapshot.selectedExternalOperationId;
+      elements.messageList.replaceChildren();
+      for (const message of state.conversation) {
+        appendChatMessage(message.role, message.text, { tone: message.tone || "", record: false });
+      }
+      elements.settingsModal.hidden = snapshot.settingsHidden;
+      elements.contextModal.hidden = snapshot.contextHidden;
+      elements.exportModal.hidden = snapshot.exportHidden;
+      document.body.classList.toggle("settings-open", !snapshot.settingsHidden || !snapshot.contextHidden || !snapshot.exportHidden);
+      setStatusLine(snapshot.statusText);
+      updateStatusBadges();
+      renderExternalApprovalPanel();
+      delete globalThis.__agentPanelCaptureSnapshot;
+      return true;
+    })()`);
+  }
+}
+
+async function captureSettingsOverviewDocs(cdp, panelSessionId) {
+  await evaluate(cdp, panelSessionId, `(async () => {
+    globalThis.__settingsCaptureSnapshot = {
+      settings: structuredClone(state.settings),
+      runtimeSettings: structuredClone(state.runtimeSettings),
+      panelPresentation: structuredClone(state.panelPresentation),
+      modalHidden: elements.settingsModal.hidden,
+      activeTab: elements.settingsTabs.find((tab) => tab.classList.contains("active"))?.dataset.settingsTab || "general",
+      status: elements.settingsStatus.textContent,
+      statusTone: elements.settingsStatus.dataset.tone || "info"
+    };
+    state.settings = {
+      ...state.settings,
+      panelOpenMode: "side-panel",
+      apiProfile: "custom-json",
+      model: "local-instruct-model",
+      agentMode: "approve",
+      includeScreenshot: true,
+      mcpEnabled: false,
+      bridgeEnabled: false,
+      bridgeRequireApproval: true
+    };
+    state.runtimeSettings = { ...state.settings };
+    applySettingsToForm();
+    openSettings();
+    activateSettingsTab("general");
+    setSettingsStatus("모든 변경 내용이 저장되었습니다.");
+    renderSettingsOverview();
+    document.querySelector(".settings-body")?.scrollTo({ top: 0 });
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    return true;
+  })()`);
+  try {
+    await capturePanelScreenshot(cdp, panelSessionId, "settings-overview.png");
+  } finally {
+    await evaluate(cdp, panelSessionId, `(() => {
+      const snapshot = globalThis.__settingsCaptureSnapshot;
+      state.settings = snapshot.settings;
+      state.runtimeSettings = snapshot.runtimeSettings;
+      state.panelPresentation = snapshot.panelPresentation;
+      applySettingsToForm();
+      activateSettingsTab(snapshot.activeTab);
+      elements.settingsModal.hidden = snapshot.modalHidden;
+      document.body.classList.toggle("settings-open", !snapshot.modalHidden);
+      setSettingsStatus(snapshot.status, snapshot.statusTone);
+      renderSettingsOverview();
+      delete globalThis.__settingsCaptureSnapshot;
+      return true;
+    })()`);
+  }
+}
+
 async function runLocalHarnessBridgeScenario({ cdp, companion, firstTargetId, panelSessionId }) {
   const automationValue = `local-harness-${randomUUID().slice(0, 8)}`;
   const mcpServerName = "my_assistant_web";
@@ -1896,20 +2405,18 @@ async function runLocalHarnessBridgeScenario({ cdp, companion, firstTargetId, pa
 
   const toolPrefix = `mcp__${mcpServerName}__`;
   const allowedTools = [
-    "browser_status",
-    "browser_session_start",
-    "browser_observe",
-    "browser_execute",
-    "browser_operation_get",
-    "browser_session_close",
+    "browser_begin",
+    "browser_act",
+    "browser_continue",
+    "browser_end",
   ].map((name) => `${toolPrefix}${name}`);
   const prompt = [
     "사용자는 MCP 도구를 지원하는 로컬 CLI 채팅만 사용하고 있습니다.",
     "my_assistant_web MCP 도구로 공유된 탭의 현재 보이는 화면만 관찰한 뒤 Name 입력란에 아래 테스트 값을 입력하세요.",
     `테스트 값: ${automationValue}`,
-    "browser_status, browser_session_start, browser_observe 순서로 시작하고, 관찰에서 받은 최신 ref만 사용하세요.",
-    "상태 변경 작업이 waiting_approval이면 새 작업을 만들지 말고 같은 operation_id를 browser_operation_get으로 조회하세요.",
-    "완료 뒤 다시 관찰하고 browser_session_close로 세션을 닫으세요.",
+    "browser_begin으로 시작하고, 반환된 page에서 받은 최신 ref만 browser_act에 사용하세요.",
+    "상태 변경 작업이 approval_required이면 새 작업을 만들지 말고 browser_continue로 기존 작업을 이어가세요.",
+    "완료 뒤 browser_continue의 새 page로 결과를 확인하고 browser_end로 작업을 닫으세요.",
     "모든 단계가 끝나기 전에는 진행 설명만 출력해서 턴을 끝내지 말고, 필요한 다음 MCP 도구 호출을 계속 반환하세요.",
     "최종 답변에는 실제 관찰에서 보였던 제목과 상태, 입력한 테스트 값만 간단히 적고 관찰되지 않은 페이지 내용은 추측하지 마세요.",
   ].join("\n");
@@ -1917,8 +2424,8 @@ async function runLocalHarnessBridgeScenario({ cdp, companion, firstTargetId, pa
     "For an explicit tool-driven task, an intermediate text-only answer ends the CLI run and is therefore a failure.",
     "While the objective is incomplete and a next tool call is possible, emit the next valid tool_use without progress narration.",
     "After every tool result, follow its next instruction and continue autonomously.",
-    "Repair correctable schema errors with the existing session and returned IDs; do not restart a live session.",
-    "Return user-facing text only after the objective is verified and the browser session is closed.",
+    "The guided browser tools manage transaction identifiers internally; never invent or request them.",
+    "Return user-facing text only after the objective is verified and browser_end has released the task.",
   ].join(" ");
   const harnessCommand = String(process.env.LOCAL_HARNESS_BIN || "").trim();
   assert.ok(
@@ -2013,24 +2520,27 @@ async function runLocalHarnessBridgeScenario({ cdp, companion, firstTargetId, pa
       `The local CLI harness did not call ${toolName}.\n${harnessTraceSummary}`,
     );
   }
-  const observeToolIds = new Set(
+  const snapshotToolIds = new Set(
     toolUses
-      .filter((toolUse) => toolUse.name === `${toolPrefix}browser_observe`)
+      .filter((toolUse) => [
+        `${toolPrefix}browser_begin`,
+        `${toolPrefix}browser_continue`,
+      ].includes(toolUse.name))
       .map((toolUse) => toolUse.id),
   );
-  const observeResults = events
+  const snapshotResults = events
     .filter((event) => (
       event.type === "user"
       && event.message?.content?.some(
-        (item) => item.type === "tool_result" && observeToolIds.has(item.tool_use_id),
+        (item) => item.type === "tool_result" && snapshotToolIds.has(item.tool_use_id),
       )
     ))
     .map((event) => event.tool_use_result?.structuredContent)
-    .filter(Boolean);
-  assert.ok(observeResults.length, "The local CLI harness did not receive a structured browser observation.");
-  for (const observation of observeResults) {
+    .filter((result) => result?.page);
+  assert.ok(snapshotResults.length, "The local CLI harness did not receive a guided browser page snapshot.");
+  for (const snapshot of snapshotResults) {
     assert.equal(
-      Object.hasOwn(observation.context || {}, "browser"),
+      Object.hasOwn(snapshot.page || {}, "browser"),
       false,
       "External browser observations must not expose unrelated tab inventory or browser IDs.",
     );

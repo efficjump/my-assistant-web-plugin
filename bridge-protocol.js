@@ -7,8 +7,10 @@
     throw new Error("WebExecutionContract must be loaded before bridge-protocol.js.");
   }
 
-  const protocolVersion = "1.0";
+  const protocolVersion = "2.0";
   const instructions = `This MCP server controls only the browser tab explicitly shared by the user in the extension.
+Call browser_begin once with the user's complete browser goal. It starts or resumes the caller's short-lived session and returns the current redacted page snapshot. Use only refs from that snapshot. Call browser_act with the next bounded action or action group; session, observation, and idempotency identifiers are managed internally. browser_act accepts proposals, not trusted commands: the extension independently validates policy and safety, may require an in-extension approval, and re-observes immediately before execution. After every proposal, call browser_continue. If approval is required, ask the user to review the extension and call browser_continue again after their decision; never submit a duplicate proposal. Repeat act and continue until the visible result satisfies the goal, then call browser_end before the final answer. Use browser_screenshot only when visible pixels are necessary. Never request, expose, or infer credentials and sensitive field values.`;
+  const advancedInstructions = `This MCP server is using the advanced identifier-based browser workflow.
 Start with browser_status and browser_session_start, then call browser_observe before proposing actions. The session owns the canonical goal supplied at start, so later execution proposals cannot replace or paraphrase it. Use only element refs from the latest observation. Treat an acquired session as one multi-step transaction: while the user's objective remains incomplete, continue with the next required tool call instead of ending a turn with only a progress announcement. Stop only when the objective is complete, the user must perform an approval or other direct action, or a concrete blocker prevents progress. browser_execute accepts proposals, not trusted commands: the extension independently validates policy and safety, may require an in-extension approval, re-observes immediately before execution, and returns an operation ID. Poll browser_operation_get with that same ID after an approval; never create a duplicate proposal to bypass the approval gate. Close the session after completion or a terminal blocker. Never request, expose, or infer credentials and sensitive field values.`;
 
   const identifierSchema = {
@@ -32,6 +34,61 @@ Start with browser_status and browser_session_start, then call browser_observe b
   }
 
   function buildToolDefinitions() {
+    const actionSchema = Contract.getExternalActionSchema();
+    return [
+      {
+        name: "browser_begin",
+        title: "Begin browser task",
+        description: "Start or safely resume the caller's browser task and return the current redacted page snapshot. No status or observation call is needed first.",
+        inputSchema: objectSchema({
+          goal: {
+            type: "string",
+            minLength: 1,
+            maxLength: 4000,
+            description: "The complete user objective retained by the extension policy gate for the whole browser task."
+          }
+        }, ["goal"]),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
+      },
+      {
+        name: "browser_act",
+        title: "Propose browser actions",
+        description: "Propose the next actions using refs from the snapshot most recently returned by browser_begin or browser_continue. Session, observation, and retry identifiers are managed internally.",
+        inputSchema: objectSchema({
+          actions: {
+            type: "array",
+            minItems: 1,
+            maxItems: 8,
+            items: actionSchema
+          }
+        }, ["actions"]),
+        annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true }
+      },
+      {
+        name: "browser_continue",
+        title: "Continue browser task",
+        description: "Return the current proposal status or, after completion, rejection, or staleness, refresh the redacted page snapshot for the next decision. Call this after every browser_act and after the user handles an approval.",
+        inputSchema: objectSchema(),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
+      },
+      {
+        name: "browser_screenshot",
+        title: "Capture shared tab",
+        description: "Capture the visible pixels of the active user-shared tab. The image can contain on-screen private data, so use it only when the task requires visual evidence.",
+        inputSchema: objectSchema(),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
+      },
+      {
+        name: "browser_end",
+        title: "End browser task",
+        description: "Release the caller's short-lived browser lease after the goal is complete or a terminal blocker is reached.",
+        inputSchema: objectSchema(),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false }
+      }
+    ];
+  }
+
+  function buildAdvancedToolDefinitions() {
     const sessionId = cloneJson(identifierSchema);
     const operationId = cloneJson(identifierSchema);
     const observationId = cloneJson(identifierSchema);
@@ -122,23 +179,43 @@ Start with browser_status and browser_session_start, then call browser_observe b
     return value;
   }
 
-  function getToolDefinitions() {
-    return cloneJson(buildToolDefinitions());
+  function getToolDefinitions(options = {}) {
+    return cloneJson(options.advanced ? buildAdvancedToolDefinitions() : buildToolDefinitions());
   }
 
-  function validateToolArguments(toolName, args) {
-    const tool = buildToolDefinitions().find((definition) => definition.name === toolName);
-    if (!tool) {
+  function getInstructions(options = {}) {
+    return options.advanced ? advancedInstructions : instructions;
+  }
+
+  function validateToolArguments(toolName, args, options = {}) {
+    const availableTools = options.advanced === true
+      ? buildAdvancedToolDefinitions()
+      : options.advanced === false
+        ? buildToolDefinitions()
+        : [...buildToolDefinitions(), ...buildAdvancedToolDefinitions()];
+    const tools = availableTools
+      .filter((definition) => definition.name === toolName);
+    if (!tools.length) {
       return { valid: false, errors: [`Unknown bridge tool: ${toolName || "missing"}`] };
     }
-    const errors = Contract.validateJsonAgainstSchema(args, tool.inputSchema, `${toolName} arguments`);
-    return { valid: errors.length === 0, errors };
+    const validationErrors = tools.map((tool) =>
+      Contract.validateJsonAgainstSchema(args, tool.inputSchema, `${toolName} arguments`)
+    );
+    if (validationErrors.some((errors) => errors.length === 0)) {
+      return { valid: true, errors: [] };
+    }
+    const errors = validationErrors.sort((left, right) => left.length - right.length)[0];
+    return { valid: false, errors };
   }
 
   const MCP_TOOLS = deepFreeze(buildToolDefinitions());
+  const ADVANCED_MCP_TOOLS = deepFreeze(buildAdvancedToolDefinitions());
   const api = Object.freeze({
+    ADVANCED_MCP_TOOLS,
     MCP_TOOLS,
     getToolDefinitions,
+    getInstructions,
+    advancedInstructions,
     instructions,
     protocolVersion,
     validateToolArguments

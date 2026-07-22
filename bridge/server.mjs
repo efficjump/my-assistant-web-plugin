@@ -8,6 +8,7 @@ import path from "node:path";
 import process from "node:process";
 import { Server as McpServer } from "@modelcontextprotocol/sdk/server/index.js";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
   CallToolRequestSchema,
@@ -122,6 +123,38 @@ function generatePairingCode() {
   return randomBytes(9).toString("base64url").toUpperCase();
 }
 
+export function createExtensionSetupValue(endpoint, pairingCode) {
+  const url = new URL(endpoint);
+  if (!["ws:", "wss:"].includes(url.protocol) || url.search || url.hash) {
+    throw new Error("Extension setup requires a plain WebSocket endpoint.");
+  }
+  const code = typeof pairingCode === "string" ? pairingCode.trim() : "";
+  if (code) {
+    url.hash = new URLSearchParams({ pair: code }).toString();
+  }
+  return url.href;
+}
+
+export function createStdioClientConfig(options = {}) {
+  const serverName = typeof options.serverName === "string" && options.serverName.trim()
+    ? options.serverName.trim()
+    : "my-assistant-web";
+  const command = path.resolve(options.command || process.execPath);
+  const serverPath = path.resolve(options.serverPath || fileURLToPath(import.meta.url));
+  const args = [serverPath, "--stdio"];
+  if (options.advancedTools) {
+    args.push("--advanced-tools");
+  }
+  return {
+    mcpServers: {
+      [serverName]: {
+        command,
+        args,
+      },
+    },
+  };
+}
+
 function normalizeOriginHeader(originHeader) {
   if (typeof originHeader !== "string" || !originHeader.trim()) {
     return null;
@@ -146,7 +179,7 @@ function normalizeOriginHeader(originHeader) {
   }
 }
 
-function loadSharedProtocol(protocolOverride) {
+function loadSharedProtocol(protocolOverride, options = {}) {
   let protocol = protocolOverride;
   if (!protocol) {
     try {
@@ -162,7 +195,7 @@ function loadSharedProtocol(protocolOverride) {
 
   const definitions =
     typeof protocol.getToolDefinitions === "function"
-      ? protocol.getToolDefinitions()
+      ? protocol.getToolDefinitions({ advanced: Boolean(options.advancedTools) })
       : protocol.MCP_TOOLS;
   if (!Array.isArray(definitions) || definitions.length === 0) {
     throw new Error("Shared bridge protocol did not provide any MCP tool definitions.");
@@ -207,9 +240,14 @@ function loadSharedProtocol(protocolOverride) {
     tools,
     toolNames: seenNames,
     protocolVersion: protocol.protocolVersion.trim(),
-    instructions:
-      typeof protocol.instructions === "string" ? protocol.instructions.trim() : "",
-    validateToolArguments: protocol.validateToolArguments,
+    instructions: (
+      typeof protocol.getInstructions === "function"
+        ? protocol.getInstructions({ advanced: Boolean(options.advancedTools) })
+        : protocol.instructions
+    )?.trim?.() || "",
+    validateToolArguments: (toolName, args) => protocol.validateToolArguments(toolName, args, {
+      advanced: Boolean(options.advancedTools),
+    }),
   };
 }
 
@@ -313,12 +351,15 @@ export async function createCompanionServer(options = {}) {
     throw new Error(`Companion refuses to bind to a non-loopback host: ${host}`);
   }
   const normalizedHost = normalizeHostname(host);
-  const port = parsePositiveInteger(
-    options.port ?? process.env.MY_ASSISTANT_BRIDGE_PORT ?? 0,
+  const { state, statePath } = await loadCompanionState(options);
+  const configuredPort = options.port ?? process.env.MY_ASSISTANT_BRIDGE_PORT;
+  const hasConfiguredPort = configuredPort !== undefined && String(configuredPort).trim() !== "";
+  const requestedPort = parsePositiveInteger(
+    hasConfiguredPort ? configuredPort : (state.preferredPort ?? 0),
     "Companion port",
     { allowZero: true },
   );
-  if (port > 65535) {
+  if (requestedPort > 65535) {
     throw new Error("Companion port must be between 0 and 65535.");
   }
   const pairingTtlMs = parsePositiveInteger(
@@ -337,8 +378,9 @@ export async function createCompanionServer(options = {}) {
     options.maxWebSocketPayloadBytes ?? DEFAULT_MAX_WEBSOCKET_PAYLOAD_BYTES,
     "WebSocket maximum payload",
   );
-  const protocol = loadSharedProtocol(options.protocol);
-  const { state, statePath } = await loadCompanionState(options);
+  const protocol = loadSharedProtocol(options.protocol, {
+    advancedTools: Boolean(options.advancedTools),
+  });
   const logger = options.logger || console;
   const allowedHttpOrigins = new Set(options.allowedHttpOrigins || []);
   const allowedExtensionOrigins = options.allowedExtensionOrigins
@@ -352,6 +394,17 @@ export async function createCompanionServer(options = {}) {
   let authenticatedExtension = null;
   const activeMcpResources = new Set();
   const pendingExtensionCalls = new Map();
+
+  function getExtensionEndpoint() {
+    return listeningPort
+      ? `ws://${formatUrlHost(normalizedHost)}:${listeningPort}/extension`
+      : "";
+  }
+
+  function getExtensionSetupValue() {
+    const endpoint = getExtensionEndpoint();
+    return endpoint ? createExtensionSetupValue(endpoint, pairingCode) : "";
+  }
 
   const app = createMcpExpressApp({
     host: normalizedHost,
@@ -409,8 +462,11 @@ export async function createCompanionServer(options = {}) {
   async function callExtension(toolName, toolArguments, client) {
     const connection = authenticatedExtension;
     if (!connection || connection.socket.readyState !== WebSocket.OPEN) {
+      const setupValue = getExtensionSetupValue();
       throw new Error(
-        "The browser extension is not connected. Pair or reconnect it before calling browser tools.",
+        setupValue
+          ? `The browser extension is not connected. Paste this value into the Bridge settings, connect and share the intended tab, then retry.\nExtension setup: ${setupValue}`
+          : "The browser extension is not connected. Reconnect it before calling browser tools.",
       );
     }
     const id = randomUUID();
@@ -471,6 +527,31 @@ export async function createCompanionServer(options = {}) {
       }
     });
     return server;
+  }
+
+  async function connectMcpTransport(transport) {
+    if (closing) {
+      throw new Error("Companion is shutting down.");
+    }
+    if (!transport || typeof transport.start !== "function") {
+      throw new Error("A valid MCP server transport is required.");
+    }
+    const server = createMcpServer();
+    const resource = { server, transport, closed: false };
+    activeMcpResources.add(resource);
+    const close = async () => {
+      if (resource.closed) return;
+      resource.closed = true;
+      activeMcpResources.delete(resource);
+      await Promise.allSettled([transport.close(), server.close()]);
+    };
+    try {
+      await server.connect(transport);
+    } catch (error) {
+      await close();
+      throw error;
+    }
+    return { server, transport, close };
   }
 
   app.post("/mcp", async (req, res) => {
@@ -785,13 +866,35 @@ export async function createCompanionServer(options = {}) {
     });
   });
 
-  await listen(httpServer, port, normalizedHost);
+  try {
+    await listen(httpServer, requestedPort, normalizedHost);
+  } catch (error) {
+    const canSelectAnotherPort = (
+      !hasConfiguredPort
+      && requestedPort !== 0
+      && error?.code === "EADDRINUSE"
+    );
+    if (!canSelectAnotherPort) {
+      throw error;
+    }
+    logger.warn?.(`Remembered companion port ${requestedPort} is unavailable; selecting a new loopback port.`);
+    await listen(httpServer, 0, normalizedHost);
+  }
   const address = httpServer.address();
   if (!address || typeof address === "string") {
     await closeHttpServer(httpServer);
     throw new Error("Companion did not receive a TCP listening address.");
   }
   listeningPort = address.port;
+  if (state.preferredPort !== listeningPort) {
+    state.preferredPort = listeningPort;
+    try {
+      await writeCompanionState(statePath, state);
+    } catch (error) {
+      await closeHttpServer(httpServer);
+      throw error;
+    }
+  }
   const endpointHost = formatUrlHost(normalizedHost);
 
   async function rotatePairingCode() {
@@ -856,10 +959,14 @@ export async function createCompanionServer(options = {}) {
     brokerId: state.brokerId,
     mcpToken: state.mcpToken,
     protocolVersion: protocol.protocolVersion,
+    advancedTools: Boolean(options.advancedTools),
     tools: protocol.tools,
     endpoints: {
       mcp: `http://${endpointHost}:${listeningPort}/mcp`,
-      extension: `ws://${endpointHost}:${listeningPort}/extension`,
+      extension: getExtensionEndpoint(),
+    },
+    get extensionSetup() {
+      return getExtensionSetupValue();
     },
     get pairingCode() {
       return pairingCode;
@@ -872,6 +979,7 @@ export async function createCompanionServer(options = {}) {
     },
     rotatePairingCode,
     revokeExtensionCredential,
+    connectMcpTransport,
     close,
   };
 }
@@ -880,8 +988,23 @@ function parseCliArguments(argv) {
   const options = {};
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
+    if (argument === "--") {
+      continue;
+    }
     if (argument === "--json") {
       options.json = true;
+      continue;
+    }
+    if (argument === "--stdio") {
+      options.stdio = true;
+      continue;
+    }
+    if (argument === "--print-config") {
+      options.printConfig = true;
+      continue;
+    }
+    if (argument === "--advanced-tools") {
+      options.advancedTools = true;
       continue;
     }
     const value = argv[index + 1];
@@ -910,26 +1033,50 @@ function parseCliArguments(argv) {
 
 async function runCli() {
   const cliOptions = parseCliArguments(process.argv.slice(2));
+  if (cliOptions.printConfig) {
+    process.stdout.write(`${JSON.stringify(createStdioClientConfig({
+      advancedTools: cliOptions.advancedTools,
+    }), null, 2)}\n`);
+    return;
+  }
+  if (cliOptions.stdio && cliOptions.json) {
+    throw new Error("--stdio reserves stdout for MCP messages and cannot be combined with --json.");
+  }
   const server = await createCompanionServer(cliOptions);
   const startup = {
     mcpEndpoint: server.endpoints.mcp,
     extensionEndpoint: server.endpoints.extension,
+    extensionSetup: server.extensionSetup,
     mcpBearerToken: server.mcpToken,
     pairingCode: server.pairingCode,
     pairingExpiresAt: server.pairingExpiresAt,
     statePath: server.statePath,
+    transport: cliOptions.stdio ? "stdio" : "streamable-http",
+    toolMode: server.advancedTools ? "advanced" : "guided",
   };
-  if (cliOptions.json) {
+  if (cliOptions.stdio) {
+    await server.connectMcpTransport(new StdioServerTransport());
+    process.stderr.write(
+      [
+        "Browser bridge MCP is ready over stdio.",
+        `Extension setup: ${startup.extensionSetup}`,
+        "Paste that single value into Settings → Bridge, then connect and share the current tab.",
+        `Tool mode: ${startup.toolMode}`,
+      ].join("\n") + "\n",
+    );
+  } else if (cliOptions.json) {
     process.stdout.write(`${JSON.stringify(startup)}\n`);
   } else {
     process.stdout.write(
       [
+        "Browser bridge is ready.",
+        `Extension setup: ${startup.extensionSetup}`,
         `MCP endpoint: ${startup.mcpEndpoint}`,
-        `Extension endpoint: ${startup.extensionEndpoint}`,
         `MCP bearer token: ${startup.mcpBearerToken}`,
-        `One-time pairing code: ${startup.pairingCode}`,
         `Pairing code expires: ${startup.pairingExpiresAt}`,
         `State file: ${startup.statePath}`,
+        `Tool mode: ${startup.toolMode}`,
+        "For the simplest MCP client setup, use the JSON from --print-config instead of configuring the HTTP endpoint and token manually.",
       ].join("\n") + "\n",
     );
   }
@@ -950,6 +1097,10 @@ async function runCli() {
     await shutdown();
     process.exit(0);
   });
+  if (cliOptions.stdio) {
+    process.stdin.once("end", shutdown);
+    process.stdin.once("close", shutdown);
+  }
 }
 
 const isCli = process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url;

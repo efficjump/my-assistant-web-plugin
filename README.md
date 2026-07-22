@@ -4,7 +4,7 @@ A Manifest V3 browser extension that observes the active page, plans the next ac
 
 ![Agent side panel](docs/assets/agent-panel.png)
 
-Version `0.4.1` targets Chromium-based browsers version 116 or later. This repository contains a source-loaded development build rather than a store package.
+Version `0.7.0` targets Chromium-based browsers version 116 or later. This repository contains a source-loaded development build rather than a store package.
 
 ## Why this project exists
 
@@ -27,8 +27,10 @@ Completion is not accepted from model prose alone. The runtime issues evidence i
 ## Capabilities
 
 - Observes the URL and only the text, controls, forms, tables, and live regions that are visually exposed in the current viewport
-- Traverses open Shadow DOM and same-origin frames
-- Supports `click`, `fill`, `select`, `focus`, `hover`, `submit`, `press`, `scroll`, `navigate`, `wait`, `wait_for`, `extract`, and `upload`
+- Traverses open Shadow DOM and visually verified same-origin or permission-granted cross-origin frames, while keeping every child-frame ref bound to its document
+- Discovers visible nested scroll regions and scrolls the intended container before observing newly revealed controls
+- Supports `click`, screenshot-bound `visual_click`, `fill`, `select`, `focus`, `hover`, `submit`, `press`, `scroll`, `navigate`, `wait`, `wait_for`, `extract`, and `upload`
+- Uses visual coordinates only inside an observed canvas or application surface, requires approval, and asks an independent LLM verifier to confirm the same target against a fresh screenshot before execution
 - Recognizes semantic controls and visible custom pointer controls, then sends a pointer/mouse sequence before click activation
 - Supports `tab_open`, `tab_focus`, `tab_adopt`, `tab_close`, `download`, and `download_wait`
 - Waits for element state, text, URL, title, live-region, and DOM-stability conditions
@@ -75,9 +77,23 @@ When `Response path` is empty, the extension dynamically inspects common respons
 3. Enable developer mode.
 4. Choose **Load unpacked**.
 5. Select the repository root.
-6. Select the extension action to open the side panel.
+6. Select the extension action. The default workspace is the side panel; **Settings → 일반** can switch the action to a reusable full tab.
 
-In the **AI** settings tab, configure the API format, endpoint, model, and authentication header. Authentication values are session-only by default and are persisted only when the user explicitly enables persistent storage.
+In the **AI 연결** settings tab, configure the API format, endpoint, model, and authentication header. Authentication values are session-only by default and are persisted only when the user explicitly enables persistent storage.
+
+## Settings and workspace placement
+
+The settings dialog starts with a live overview of the model, automation mode, external integrations, and workspace placement. Fields continue to save automatically, and the header reports completed saves or validation errors without requiring a separate global save button.
+
+![Settings overview and workspace placement](docs/assets/settings-overview.png)
+
+The browser action is not limited to a right-side panel:
+
+- **Side panel** keeps the agent visible next to the page and is the default for ongoing observation and approvals.
+- **Independent tab** provides more width for long conversations and configuration. A matching agent tab is reused for the same target in that browser window, while another target gets an independent workspace so an active run is not reloaded.
+- Chrome controls whether its side panel appears on the left or right. The extension reads and displays the current side when that browser API is available, but it does not override the user's browser appearance preference.
+
+A toolbar popup is technically possible, but Chrome closes it as soon as focus moves outside the popup. That lifecycle is unsuitable for persistent chat, approval, and automation state, so this project deliberately offers the two durable workspaces instead.
 
 ## Using the panel controls
 
@@ -110,16 +126,18 @@ This is the extension's outbound MCP client. To let an MCP-capable local develop
 
 ## External developer-tool bridge
 
-The companion exposes a bearer-authenticated Streamable HTTP MCP endpoint on loopback and relays validated requests to the extension over a separately authenticated WebSocket. It chooses an available port at startup unless a port is supplied, so copy the endpoints from the current startup output instead of assuming a fixed address.
+The recommended bridge path is a standard local `stdio` MCP server. The development tool starts the companion itself, so its MCP configuration does not need a separately copied URL or bearer token. Generate a client-neutral JSON entry with the actual runtime and server paths detected on the current machine:
 
 ```bash
 pnpm install
-node bridge/server.mjs
+pnpm run bridge:config
 ```
 
-The command prints an MCP endpoint and bearer token for the development tool, plus an extension endpoint and short-lived one-time code for pairing the browser extension. These four values have different purposes and must not be interchanged.
+Merge the printed server entry into the development tool's documented MCP configuration and restart that tool. On first use, the companion prints one short-lived `Extension setup` value. Paste that value into **Settings → Bridge** and select **연결하고 현재 탭 공유**. The extension strips the one-time code before saving the endpoint, and the companion remembers its selected loopback port so later launches normally reconnect without configuration changes while the browser-side credential remains available.
 
-In the side panel, open **Settings → Bridge**, paste the printed extension endpoint and pairing code, select **페어링 (Pair)**, then select **현재 탭 연결 (Connect current tab)** while the intended page is active. An MCP client can then start a short-lived session, observe that tab, and propose actions. Actions that need approval appear in the extension, where the user can review and approve or reject them. The extension observes the page again and validates target preconditions immediately before an approved effect.
+The default MCP surface is intentionally guided: `browser_begin` returns the first redacted snapshot, `browser_act` submits actions without caller-managed session or observation IDs, `browser_continue` handles approval polling and refreshed observations, and `browser_end` releases the tab. Existing identifier-based tools remain available with `--advanced-tools`. Actions that need approval still appear in the extension, which re-observes the page and validates target preconditions immediately before an approved effect.
+
+Clients that support only Streamable HTTP can run `pnpm run bridge` and use the printed endpoint and bearer token. This remains the advanced fallback, not the default setup.
 
 | Pair and share one tab | Review a state-changing proposal |
 | --- | --- |
@@ -128,6 +146,7 @@ In the side panel, open **Settings → Bridge**, paste the printed extension end
 Both screenshots are generated by `pnpm run capture:docs` against a temporary browser profile and a local fixture. They contain no user session, private page, persistent credential, or machine-specific path.
 
 See [Local MCP companion](docs/bridge.md) for complete startup options, portable MCP client configuration patterns, the tool workflow, security properties, and troubleshooting.
+See [Web structure compatibility](docs/web-compatibility.md) for frame, Shadow DOM, nested-scroll, visual-surface, permission, and browser-policy boundaries.
 
 ## Permissions
 
@@ -138,9 +157,11 @@ See [Local MCP companion](docs/bridge.md) for complete startup options, portable
 | `sidePanel` | Required | Displays the agent interface |
 | `storage` | Required | Stores settings, conversations, and traces |
 | `tabs` | Required | Pins the target tab and runs explicit tab tools |
+| `webNavigation` | Required | Discovers frame identities so observations and actions stay bound to the correct document |
 | `downloads` | Optional | Starts an approved download and checks its completion state |
 | `identity` | Optional | Runs MCP OAuth PKCE authorization |
 | Current site origin | Optional | Observes and interacts with the site selected by the user |
+| Visible embedded-site origin | Optional | Observes a visually exposed cross-origin frame only after that origin is granted |
 | Configured endpoint origin | Optional | Calls an AI or MCP endpoint configured by the user |
 
 The production manifest does not require `<all_urls>`. Site and endpoint origins are requested only when a connection test or task needs them.
@@ -149,12 +170,14 @@ The production manifest does not require `<all_urls>`. Site and endpoint origins
 
 - Page text, DOM labels, MCP results, resources, and prompts are treated as untrusted data.
 - Offscreen, clipped, fully occluded, fully transparent, and hidden DOM content is excluded from model-visible page observations until it is revealed and observed again.
+- Child-frame content is merged only when one fully exposed iframe boundary maps unambiguously to one browser frame; clipped, covered, hidden, or ambiguous frames remain an explicit capability gap.
 - The model can use only element references and tools present in the current observation.
 - Each run is pinned to an exact tab and document identity.
 - External development tools can access only the tab explicitly shared in the Bridge panel, and detaching it closes their active sessions.
 - The local companion binds only to loopback, requires independent MCP and extension credentials, and never puts either credential in a URL.
 - URL, document identity, and target preconditions are checked again immediately before an approved effect.
 - Submission, external navigation, upload, tab changes, downloads, and destructive MCP tools require approval even in automatic mode.
+- A visual-coordinate action always requires a fresh screenshot, explicit approval, stable geometry, and an independent verifier result; a changed or ambiguous target fails closed.
 - Passwords, tokens, card data, verification codes, and sensitive URL parameters are blocked or masked by policy.
 - Structured observations are redacted, but a Bridge screenshot contains the visible pixels of the shared tab and can include private on-screen data; request it only when the task needs visual evidence.
 - Upload contents are handed off only after the user selects a file and are not persisted in conversations, traces, or settings.
@@ -169,8 +192,8 @@ Exported traces and audit logs may still contain page-derived information. Revie
 
 ## Limitations
 
-- Browser-internal pages, policy-restricted pages, closed Shadow DOM, and cross-origin frame contents cannot be inspected or controlled. Cross-origin frames are reported as metadata-only so the agent can explain the boundary instead of pretending to have read them.
-- Canvas-only controls, browser UI requiring a trusted user gesture, and controls hidden behind page-specific anti-automation behavior may still require direct user interaction.
+- Browser-internal pages, policy-restricted pages, and closed Shadow DOM internals remain unavailable. A cross-origin frame is available only when it is visibly and unambiguously mapped and the user has granted its origin.
+- Canvas and application surfaces can use guarded visual targeting when the configured model accepts screenshots, but ambiguous targets, CAPTCHAs, trusted-event checks, and page-specific anti-automation behavior still require direct user interaction.
 - The extension does not provide arbitrary local-file access or native shell execution.
 - External control requires the local companion process to remain running, an authenticated extension connection, and an explicitly shared tab.
 - Browser UI that requires a real user gesture, including some permission, popup, or payment flows, may require direct user interaction.
@@ -185,7 +208,7 @@ pnpm run check
 pnpm test
 pnpm run test:bridge
 pnpm run test:e2e
-# Optional: requires a compatible local CLI already routed to a vLLM endpoint.
+# Optional: requires a compatible local CLI already routed to an OpenAI-compatible local endpoint.
 LOCAL_HARNESS_BIN="<COMPATIBLE_CLI>" pnpm run test:e2e:local-harness
 # Regenerates the privacy-safe documentation screenshots from a temporary profile.
 pnpm run capture:docs
@@ -197,11 +220,11 @@ Run the local panel harness with:
 pnpm run serve:test
 ```
 
-The command reports the temporary development address. The E2E suite exercises the Manifest V3 service worker, content injection, document replacement, viewport-scoped deep DOM observation, occlusion and clipping filters, custom pointer clicks, scrolling, live-region waiting, file handoff, tab lifecycle, worker restart, and empty-response protection. The opt-in local-harness scenario additionally launches a compatible CLI, loads a temporary secret-protected MCP configuration, confirms that every assistant turn reports the local `default` model alias, and requires the model to complete the full status → session → observation → approved action → verification → close workflow against a temporary browser profile.
+The command reports the temporary development address. The E2E suite exercises the Manifest V3 service worker, document replacement, viewport-scoped deep DOM observation, visible cross-origin frame routing, hidden-frame exclusion, nested scroll regions, guarded visual-surface clicks, occlusion and clipping filters, file handoff, tab lifecycle, worker restart, and empty-response protection. The opt-in local-harness scenario additionally launches a compatible CLI, loads a temporary secret-protected MCP configuration, confirms that every assistant turn reports the local `default` model alias, and requires the model to complete the guided begin → act → approval/continue → verification → end workflow against a temporary browser profile.
 
 ## Public-release audit
 
-The repository was re-audited on 2026-07-21 before publication.
+The repository was re-audited on 2026-07-22 before publication.
 
 - No third-party product is used as the project identity, name, or logo.
 - No third-party logos, fonts, minified bundles, or vendored source are included.

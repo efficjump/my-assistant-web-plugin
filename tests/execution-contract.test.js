@@ -100,6 +100,31 @@ test("preconditions fingerprint sensitive values without retaining the plaintext
   ).valid, false);
 });
 
+test("preconditions keep a target bound to its observed child frame and top-viewport geometry", () => {
+  const context = observedContext({
+    ref: "f7:e1",
+    scope: "frame-7/top",
+    frameId: 7,
+    parentFrameId: 0,
+    frameDocumentId: "frame-document-7",
+    frameUrl: "https://embed.example.test/form",
+    rectSpace: "top-viewport",
+    rect: { x: 120, y: 240, width: 220, height: 32 }
+  });
+  const actions = [fillAction({ ref: "f7:e1" })];
+  const preconditions = Contract.buildActionPreconditions(actions, context);
+
+  assert.equal(Contract.validateActionPreconditions(preconditions, context).valid, true);
+  assert.equal(Contract.validateActionPreconditions(preconditions, observedContext({
+    ...context.interactiveElements[0],
+    frameDocumentId: "replacement-frame-document"
+  })).valid, false);
+  assert.equal(Contract.validateActionPreconditions(preconditions, observedContext({
+    ...context.interactiveElements[0],
+    rect: { x: 120, y: 280, width: 220, height: 32 }
+  })).valid, false);
+});
+
 test("effect digests are deterministic and bind the material action content", () => {
   const left = [{
     type: "fill",

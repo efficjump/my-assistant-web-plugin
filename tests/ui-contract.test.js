@@ -179,6 +179,71 @@ test("compact settings tabs stay on one horizontally scrollable row", () => {
   );
 });
 
+test("settings use a recognizable gear and start with an overview", () => {
+  const html = fs.readFileSync(path.join(root, "panel.html"), "utf8");
+  const script = fs.readFileSync(path.join(root, "panel.js"), "utf8");
+  const settingsButton = readOpeningTag(html, "button", "openSettingsButton");
+  const settingsStart = html.search(/<section\b[^>]*\bid=["']settingsModal["']/i);
+  const settingsEnd = html.indexOf("</section>", settingsStart);
+  const settingsMarkup = settingsStart >= 0 && settingsEnd > settingsStart
+    ? html.slice(settingsStart, settingsEnd)
+    : "";
+
+  assert.match(settingsButton, /aria-label=["']설정["']/);
+  assert.match(html, /class=["']settings-gear-icon["']/);
+  assert.match(html, /class=["']settings-heading-icon["']/);
+  assert.match(settingsMarkup, /id=["']generalTab["']/);
+  assert.match(settingsMarkup, /id=["']generalPanel["']/);
+  for (const id of [
+    "settingsAiSummary",
+    "settingsAgentSummary",
+    "settingsIntegrationSummary",
+    "sidePanelPlacementTitle"
+  ]) {
+    assert.equal(hasElementId(settingsMarkup, id), true, `${id} should be visible from the settings overview`);
+  }
+  assert.match(script, /function renderSettingsOverview\(\)/);
+  assert.match(script, /handleSettingsTabKeydown/);
+});
+
+test("the toolbar action can persistently choose a side panel or reusable full tab", () => {
+  const html = fs.readFileSync(path.join(root, "panel.html"), "utf8");
+  const panel = fs.readFileSync(path.join(root, "panel.js"), "utf8");
+  const background = fs.readFileSync(path.join(root, "background.js"), "utf8");
+
+  assert.match(readOpeningTag(html, "select", "panelOpenModeInput"), /aria-describedby=["']panelOpenModeHelp["']/);
+  assert.match(html, /value=["']side-panel["']/);
+  assert.match(html, /value=["']tab["']/);
+  assert.match(panel, /panelOpenMode:\s*"side-panel"/);
+  assert.match(panel, /type:\s*"OPEN_PANEL_TAB"/);
+  assert.match(background, /function normalizePanelOpenMode/);
+  assert.match(background, /function openPanelInTab/);
+  assert.match(background, /readPanelTargetTabId\(tab\) === Number\(targetTab\?\.id\)/);
+  assert.match(background, /chrome\.tabs\.update\(existing\.id, \{ active: true \}\)/);
+  assert.match(background, /openPanelOnActionClick:\s*normalizePanelOpenMode\(openMode\) === PANEL_OPEN_MODE_SIDE_PANEL/);
+  assert.match(background, /chrome\.storage\?\.onChanged\?\.addListener/);
+});
+
+test("bridge setup uses one transient value and one connect-and-share action", () => {
+  const html = fs.readFileSync(path.join(root, "panel.html"), "utf8");
+  const script = fs.readFileSync(path.join(root, "panel.js"), "utf8");
+  const bridgeStart = html.search(/<section\b[^>]*\bid=["']bridgePanel["']/i);
+  const bridgeEnd = html.indexOf("</section>", bridgeStart);
+  const bridgeMarkup = bridgeStart >= 0 && bridgeEnd > bridgeStart
+    ? html.slice(bridgeStart, bridgeEnd)
+    : "";
+
+  assert.match(bridgeMarkup, /Extension setup/);
+  assert.match(bridgeMarkup, /연결하고 현재 탭 공유/);
+  assert.match(readOpeningTag(bridgeMarkup, "input", "bridgeEndpointInput"), /data-transient=["']true["']/i);
+  assert.equal(hasElementId(bridgeMarkup, "bridgePairingCodeInput"), false);
+  assert.equal(hasElementId(bridgeMarkup, "bridgePairButton"), false);
+  assert.match(script, /function parseBridgeSetupValue/);
+  assert.match(script, /url\.hash\s*=\s*""/);
+  assert.match(script, /await waitForBridgeConnection\(\)/);
+  assert.match(script, /await attachActiveTabToBridge\(\)/);
+});
+
 test("tab changes are deferred without losing or clearing a running session", () => {
   const script = fs.readFileSync(path.join(root, "panel.js"), "utf8");
   assert.match(script, /activeTabTransitionPending/);

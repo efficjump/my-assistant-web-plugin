@@ -234,6 +234,71 @@ test("a session requires explicit tab arming and holds a single expiring lease",
   );
 });
 
+test("guided MCP tools manage session, observation, retry, and operation identifiers internally", async () => {
+  const driver = new FakeDriver({
+    observations: [
+      pageContext({ domRevision: 1 }),
+      pageContext({ domRevision: 2 }),
+      pageContext({ domRevision: 3, visibleText: "Settings saved" }),
+      pageContext({ domRevision: 4, visibleText: "Settings saved" })
+    ]
+  });
+  const { runtime } = await createRuntime({ driver });
+  const client = { name: "Guided MCP client", version: "1.0.0" };
+  await runtime.armTab(defaultTab());
+
+  const begun = await runtime.dispatch("browser_begin", { goal: GOAL }, client);
+  assert.equal(begun.status, "ready");
+  assert.equal(begun.goal, GOAL);
+  assert.equal(begun.page.interactiveElements[0].ref, "e1");
+  assert.equal(Object.hasOwn(begun, "session_id"), false);
+  assert.equal(Object.hasOwn(begun, "observation_id"), false);
+
+  const resumed = await runtime.dispatch("browser_begin", { goal: GOAL }, client);
+  assert.equal(resumed.status, "ready");
+  assert.equal(driver.observeCalls.length, 1, "resuming the same goal should reuse its current snapshot");
+  await assert.rejects(
+    runtime.dispatch("browser_continue", {}, { name: "Different MCP client" }),
+    /belongs to another MCP client/
+  );
+
+  const screenshot = await runtime.dispatch("browser_screenshot", {}, client);
+  assert.match(screenshot.data_url, /^data:image\/png/);
+
+  const proposed = await runtime.dispatch("browser_act", { actions: [clickAction()] }, client);
+  assert.equal(proposed.status, "approval_required");
+  assert.equal(Object.hasOwn(proposed.operation, "session_id"), false);
+  assert.equal(Object.hasOwn(proposed.operation, "operation_id"), false);
+
+  const retried = await runtime.dispatch("browser_act", { actions: [clickAction()] }, client);
+  assert.deepEqual(retried, proposed, "a retry must return the current proposal instead of duplicating it");
+  assert.equal(runtime.listPendingOperations().length, 1);
+
+  const pendingId = runtime.getStatus().pendingOperationIds[0];
+  await runtime.approveOperation(pendingId);
+  const continued = await runtime.dispatch("browser_continue", {}, client);
+  assert.equal(continued.status, "ready");
+  assert.match(continued.page.visibleText, /Settings saved/);
+  assert.equal(driver.pageExecutions.length, 1);
+
+  const secondProposed = await runtime.dispatch("browser_act", { actions: [clickAction()] }, client);
+  assert.equal(secondProposed.status, "approval_required");
+  const secondContinued = await runtime.dispatch("browser_continue", {}, client);
+  assert.equal(
+    secondContinued.status,
+    "approval_required",
+    "the most recently inserted operation must win when timestamps are equal"
+  );
+  assert.equal(runtime.listPendingOperations().length, 1);
+
+  const ended = await runtime.dispatch("browser_end", {}, client);
+  assert.deepEqual(ended.closed, true);
+  assert.equal(ended.status, "closed");
+  assert.equal(runtime.getStatus().sessionActive, false);
+  const endedAgain = await runtime.dispatch("browser_end", {}, client);
+  assert.equal(endedAgain.status, "idle");
+});
+
 test("browser status returns a state-derived next step for MCP clients", async () => {
   const { runtime } = await createRuntime();
   const disconnected = await runtime.dispatch("browser_status", {});
@@ -462,7 +527,8 @@ test("sensitive fill is blocked and plaintext is not retained in runtime state",
 });
 
 test("external approval and policy fields are rejected by the schema and action normalizer", async () => {
-  const executeTool = Protocol.getToolDefinitions().find((tool) => tool.name === "browser_execute");
+  const executeTool = Protocol.getToolDefinitions({ advanced: true })
+    .find((tool) => tool.name === "browser_execute");
   for (const field of ["approval", "approved", "needsUserApproval", "policy", "preconditions", "safety"] ) {
     assert.equal(Object.hasOwn(executeTool.inputSchema.properties, field), false);
   }

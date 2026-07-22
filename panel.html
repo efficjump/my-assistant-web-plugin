@@ -25,9 +25,9 @@
             </svg>
           </button>
           <button class="icon-button" id="openSettingsButton" type="button" title="설정" aria-label="설정">
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z" />
-              <path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06A1.7 1.7 0 0 0 15 19.37a1.7 1.7 0 0 0-1 .58l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 11.5 15a1.7 1.7 0 0 0-.58-1l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 15 11.5a1.7 1.7 0 0 0 1-.58l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.7 1.7 0 0 0 19.4 15Z" />
+            <svg class="settings-gear-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.09a2 2 0 0 1 1 1.73v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.38a2 2 0 0 0-.73-2.73l-.15-.09a2 2 0 0 1-1-1.74v-.51a2 2 0 0 1 1-1.73l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2Z" />
+              <circle cx="12" cy="12" r="3" />
             </svg>
           </button>
           <details class="utility-menu" id="utilityMenu">
@@ -213,9 +213,18 @@
     <section class="settings-overlay" id="settingsModal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle" hidden>
       <div class="settings-sheet">
         <header class="settings-header">
-          <div>
-            <h2 id="settingsTitle">설정</h2>
-            <p id="settingsStatus" aria-live="polite"></p>
+          <div class="settings-heading">
+            <span class="settings-heading-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24">
+                <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.09a2 2 0 0 1 1 1.73v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.38a2 2 0 0 0-.73-2.73l-.15-.09a2 2 0 0 1-1-1.74v-.51a2 2 0 0 1 1-1.73l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2Z" />
+                <circle cx="12" cy="12" r="3" />
+              </svg>
+            </span>
+            <div>
+              <h2 id="settingsTitle">설정</h2>
+              <p class="settings-description">표시 방식, AI 연결, 자동화와 외부 도구를 관리합니다. 변경 내용은 자동 저장됩니다.</p>
+              <p id="settingsStatus" aria-live="polite"></p>
+            </div>
           </div>
           <button class="icon-button" id="closeSettingsButton" type="button" title="닫기" aria-label="닫기">
             <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -226,17 +235,98 @@
         </header>
 
         <nav class="settings-tabs" aria-label="설정" role="tablist">
-          <button class="settings-tab active" id="apiTab" type="button" role="tab" aria-controls="apiPanel" aria-selected="true" data-settings-tab="api">AI</button>
-          <button class="settings-tab" id="agentTab" type="button" role="tab" aria-controls="agentPanel" aria-selected="false" data-settings-tab="agent">Agent</button>
+          <button class="settings-tab active" id="generalTab" type="button" role="tab" aria-controls="generalPanel" aria-selected="true" data-settings-tab="general">일반</button>
+          <button class="settings-tab" id="apiTab" type="button" role="tab" aria-controls="apiPanel" aria-selected="false" data-settings-tab="api">AI 연결</button>
+          <button class="settings-tab" id="agentTab" type="button" role="tab" aria-controls="agentPanel" aria-selected="false" data-settings-tab="agent">자동화</button>
           <button class="settings-tab" id="siteTab" type="button" role="tab" aria-controls="sitePanel" aria-selected="false" data-settings-tab="site">사이트별</button>
           <button class="settings-tab" id="mcpTab" type="button" role="tab" aria-controls="mcpPanel" aria-selected="false" data-settings-tab="mcp">MCP</button>
-          <button class="settings-tab" id="bridgeTab" type="button" role="tab" aria-controls="bridgePanel" aria-selected="false" data-settings-tab="bridge">Bridge</button>
+          <button class="settings-tab" id="bridgeTab" type="button" role="tab" aria-controls="bridgePanel" aria-selected="false" data-settings-tab="bridge">개발 도구</button>
           <button class="settings-tab" id="advancedTab" type="button" role="tab" aria-controls="advancedPanel" aria-selected="false" data-settings-tab="advanced">고급</button>
         </nav>
 
         <div class="settings-body">
-          <section class="settings-panel active" id="apiPanel" role="tabpanel" aria-labelledby="apiTab" data-settings-panel="api">
+          <section class="settings-panel active" id="generalPanel" role="tabpanel" aria-labelledby="generalTab" data-settings-panel="general">
+            <header class="settings-panel-heading">
+              <h3>사용 환경</h3>
+              <p>확장 프로그램을 어디에 표시할지 선택하고 현재 구성을 한눈에 확인합니다.</p>
+            </header>
+
+            <div class="settings-card display-preference-card">
+              <div class="settings-card-heading">
+                <span class="settings-card-icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24">
+                    <rect x="3" y="4" width="18" height="16" rx="2" />
+                    <path d="M15 4v16" />
+                  </svg>
+                </span>
+                <div>
+                  <strong>열기 방식</strong>
+                  <p>툴바의 확장 아이콘을 눌렀을 때 사용할 작업 공간입니다.</p>
+                </div>
+              </div>
+              <label class="field full" for="panelOpenModeInput">
+                <span>기본 표시 위치</span>
+                <select id="panelOpenModeInput" aria-describedby="panelOpenModeHelp">
+                  <option value="side-panel">사이드 패널</option>
+                  <option value="tab">독립 탭</option>
+                </select>
+                <small class="field-help" id="panelOpenModeHelp"></small>
+              </label>
+              <div class="button-row inline-actions">
+                <button class="secondary-button" id="openPreferredSurfaceButton" type="button">선택한 방식으로 열기</button>
+              </div>
+            </div>
+
+            <div class="settings-callout" aria-labelledby="sidePanelPlacementTitle">
+              <span class="settings-callout-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24">
+                  <path d="M8 4H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h3" />
+                  <path d="M16 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3" />
+                  <path d="m10 9-3 3 3 3" />
+                  <path d="m14 9 3 3-3 3" />
+                </svg>
+              </span>
+              <div>
+                <strong id="sidePanelPlacementTitle">사이드 패널 위치 확인 중</strong>
+                <p id="sidePanelPlacementDescription">좌우 위치는 확장 프로그램이 아니라 브라우저의 모양 설정을 따릅니다.</p>
+              </div>
+            </div>
+
+            <section class="settings-summary-section" aria-labelledby="settingsSummaryTitle">
+              <header>
+                <h4 id="settingsSummaryTitle">현재 구성</h4>
+                <p>세부 설정을 바꾸면 이 요약에도 바로 반영됩니다.</p>
+              </header>
+              <div class="settings-summary-grid">
+                <article class="settings-summary-item">
+                  <span>AI 연결</span>
+                  <strong id="settingsAiSummary">모델 확인 중</strong>
+                  <small id="settingsAiDetail"></small>
+                </article>
+                <article class="settings-summary-item">
+                  <span>자동화</span>
+                  <strong id="settingsAgentSummary">동작 방식 확인 중</strong>
+                  <small id="settingsAgentDetail"></small>
+                </article>
+                <article class="settings-summary-item">
+                  <span>외부 도구</span>
+                  <strong id="settingsIntegrationSummary">연결 상태 확인 중</strong>
+                  <small id="settingsIntegrationDetail"></small>
+                </article>
+              </div>
+            </section>
+          </section>
+
+          <section class="settings-panel" id="apiPanel" role="tabpanel" aria-labelledby="apiTab" data-settings-panel="api">
+            <header class="settings-panel-heading">
+              <h3>AI 연결</h3>
+              <p>사용할 API 형식과 모델, 인증 및 응답 옵션을 설정합니다.</p>
+            </header>
             <div class="settings-grid">
+              <div class="settings-group-heading full">
+                <strong>연결</strong>
+                <p>서버가 제공하는 API 형식에 맞춰 endpoint와 모델을 입력합니다.</p>
+              </div>
               <label class="field">
                 <span>API 형식</span>
                 <select id="apiProfileInput">
@@ -267,6 +357,16 @@
                 <input id="authHeaderValueInput" type="password" autocomplete="off" placeholder="Bearer ...">
               </label>
 
+              <label class="toggle-field">
+                <input id="persistSecretsInput" type="checkbox">
+                <span>인증 값을 이 브라우저에 영구 저장 (공용 기기에서는 사용 금지)</span>
+              </label>
+
+              <div class="settings-group-heading full">
+                <strong>응답</strong>
+                <p>모델 응답의 형식과 생성 범위를 조절합니다.</p>
+              </div>
+
               <label class="field">
                 <span>Response path</span>
                 <input id="responsePathInput" type="text" autocomplete="off" placeholder="choices.0.message.content">
@@ -287,10 +387,10 @@
                 <span>구조화 출력 사용</span>
               </label>
 
-              <label class="toggle-field">
-                <input id="persistSecretsInput" type="checkbox">
-                <span>인증 값을 이 브라우저에 영구 저장 (공용 기기에서는 사용 금지)</span>
-              </label>
+              <div class="settings-group-heading full">
+                <strong>공급자 도구</strong>
+                <p>현재 API 형식에서 지원할 때만 요청에 포함됩니다.</p>
+              </div>
 
               <label class="toggle-field">
                 <input id="openAiWebSearchEnabledInput" type="checkbox">
@@ -314,7 +414,15 @@
           </section>
 
           <section class="settings-panel" id="agentPanel" role="tabpanel" aria-labelledby="agentTab" data-settings-panel="agent">
+            <header class="settings-panel-heading">
+              <h3>자동화</h3>
+              <p>에이전트의 실행 범위와 화면 관찰, 안전 장치를 조절합니다.</p>
+            </header>
             <div class="settings-grid">
+              <div class="settings-group-heading full">
+                <strong>실행</strong>
+                <p>한 요청에서 반복할 판단과 페이지 작업의 상한을 정합니다.</p>
+              </div>
               <label class="field">
                 <span>동작 모드</span>
                 <select id="agentModeInput">
@@ -348,6 +456,11 @@
                 <input id="maxApiRetriesInput" type="number" min="0" max="5" step="1">
               </label>
 
+              <div class="settings-group-heading full">
+                <strong>화면 관찰</strong>
+                <p>AI가 한 번에 확인할 수 있는 페이지 정보의 범위를 정합니다.</p>
+              </div>
+
               <label class="field">
                 <span>화면 텍스트 한도</span>
                 <input id="maxTextCharsInput" type="number" min="4000" max="50000" step="1000">
@@ -362,6 +475,11 @@
                 <input id="includeScreenshotInput" type="checkbox">
                 <span>AI 판단과 승인 미리보기에 스크린샷 사용</span>
               </label>
+
+              <div class="settings-group-heading full">
+                <strong>안전</strong>
+                <p>민감정보와 상태 변경 작업에 적용할 보호 장치입니다.</p>
+              </div>
 
               <label class="toggle-field">
                 <input id="stopOnSensitiveInputInput" type="checkbox">
@@ -427,6 +545,10 @@
           </section>
 
           <section class="settings-panel" id="mcpPanel" role="tabpanel" aria-labelledby="mcpTab" data-settings-panel="mcp">
+            <header class="settings-panel-heading">
+              <h3>MCP 연결</h3>
+              <p>원격 MCP 서버의 도구, 리소스와 프롬프트를 에이전트에 연결합니다.</p>
+            </header>
             <div class="settings-grid">
               <label class="toggle-field">
                 <input id="mcpEnabledInput" type="checkbox">
@@ -546,16 +668,17 @@
           </section>
 
           <section class="settings-panel" id="bridgePanel" role="tabpanel" aria-labelledby="bridgeTab" data-settings-panel="bridge">
+            <header class="settings-panel-heading">
+              <h3>개발 도구 연결</h3>
+              <p>로컬 MCP 개발 도구에 사용자가 선택한 웹 탭만 명시적으로 공유합니다.</p>
+            </header>
             <div class="settings-grid">
               <div class="bridge-intro full">
-                <strong>개발 도구 연결</strong>
-                <p>로컬 브리지를 통해 외부 개발 도구가 현재 브라우저 탭을 관찰하고, 승인된 작업을 실행할 수 있습니다.</p>
+                <strong>MCP 개발 도구 연결</strong>
+                <p>브리지를 MCP 개발 도구에 등록한 뒤, 실행 로그의 <b>Extension setup</b> 값 하나를 아래에 붙여넣으세요. 연결과 현재 탭 공유를 한 번에 진행합니다.</p>
               </div>
 
-              <label class="toggle-field">
-                <input id="bridgeEnabledInput" type="checkbox">
-                <span>Bridge 사용</span>
-              </label>
+              <input id="bridgeEnabledInput" type="checkbox" hidden aria-hidden="true">
 
               <label class="toggle-field">
                 <input id="bridgeRequireApprovalInput" type="checkbox">
@@ -563,24 +686,14 @@
               </label>
 
               <label class="field full">
-                <span>Bridge endpoint</span>
-                <input id="bridgeEndpointInput" type="url" autocomplete="off" placeholder="로컬 브리지 실행 후 표시되는 WebSocket endpoint" aria-describedby="bridgeEndpointHelp">
-                <small class="field-help" id="bridgeEndpointHelp">고정 주소를 가정하지 않습니다. 브리지가 출력한 endpoint를 입력해 주세요.</small>
+                <span>Extension setup</span>
+                <input id="bridgeEndpointInput" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" data-transient="true" placeholder="ws://127.0.0.1:…/extension#pair=…" aria-describedby="bridgeEndpointHelp">
+                <small class="field-help" id="bridgeEndpointHelp">endpoint와 일회용 코드를 함께 처리합니다. 코드는 연결 직후 입력창과 저장 설정에서 제거됩니다.</small>
               </label>
 
               <div class="button-row full inline-actions bridge-actions">
-                <button class="secondary-button" id="bridgeConnectButton" type="button">연결</button>
+                <button class="primary-button" id="bridgeConnectButton" type="button">연결하고 현재 탭 공유</button>
                 <button class="secondary-button" id="bridgeDisconnectButton" type="button" disabled>연결 해제</button>
-              </div>
-
-              <label class="field full">
-                <span>일회용 페어링 코드</span>
-                <input id="bridgePairingCodeInput" type="text" autocomplete="one-time-code" autocapitalize="off" spellcheck="false" data-transient="true" placeholder="브리지가 표시한 페어링 코드" aria-describedby="bridgePairingHelp">
-                <small class="field-help" id="bridgePairingHelp">코드는 연결 과정에서만 사용하며 설정에 저장하지 않습니다.</small>
-              </label>
-
-              <div class="button-row full inline-actions bridge-actions">
-                <button class="primary-button" id="bridgePairButton" type="button">페어링</button>
                 <button class="secondary-button" id="bridgeRevokeButton" type="button" disabled>연결 권한 폐기</button>
               </div>
 
@@ -589,7 +702,7 @@
                   <strong id="bridgeConnectionStatus">연결 안 됨</strong>
                   <span class="status-badge muted" id="bridgeSessionStatus">세션 없음</span>
                 </div>
-                <p id="bridgeStatusDetail" role="status" aria-live="polite">Bridge endpoint를 입력하고 연결하거나 페어링해 주세요.</p>
+                <p id="bridgeStatusDetail" role="status" aria-live="polite">Extension setup 값을 붙여넣고 현재 탭을 공유해 주세요.</p>
               </div>
 
               <div class="tool-browser full bridge-tab-card">
@@ -598,14 +711,18 @@
                   <p id="bridgeAttachedTabStatus" role="status" aria-live="polite">연결된 탭이 없습니다.</p>
                 </div>
                 <div class="button-row inline-actions bridge-actions">
-                  <button class="secondary-button" id="bridgeAttachTabButton" type="button" disabled>현재 탭 연결</button>
-                  <button class="secondary-button" id="bridgeDetachTabButton" type="button" disabled>탭 연결 해제</button>
+                  <button class="secondary-button" id="bridgeAttachTabButton" type="button" disabled>현재 탭으로 변경</button>
+                  <button class="secondary-button" id="bridgeDetachTabButton" type="button" disabled>공유 중지</button>
                 </div>
               </div>
             </div>
           </section>
 
           <section class="settings-panel" id="advancedPanel" role="tabpanel" aria-labelledby="advancedTab" data-settings-panel="advanced">
+            <header class="settings-panel-heading">
+              <h3>고급 설정</h3>
+              <p>사용자 정의 요청 형식과 시스템 지침을 직접 조정합니다.</p>
+            </header>
             <div class="settings-grid">
               <label class="field full">
                 <span>Extra headers JSON</span>

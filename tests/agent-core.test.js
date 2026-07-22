@@ -107,6 +107,56 @@ test("decision contract distinguishes the visual viewport from hidden DOM metada
   assert.match(contract, /offscreen, clipped, occluded, or hidden DOM/i);
 });
 
+test("visual actions are bound to one current screenshot and an observed visual surface", () => {
+  const visualContext = {
+    ...context,
+    visualObservation: { id: "visual-observation-1", screenshotBound: true },
+    visualSurfaces: [{
+      ref: "v1",
+      kind: "canvas",
+      tag: "canvas",
+      label: "Visual command surface",
+      selector: "#visual-canvas",
+      rect: { x: 20, y: 120, width: 240, height: 80 },
+      actionability: "visual-coordinate-only"
+    }]
+  };
+  const decision = Core.normalizeDecision(baseDecision({
+    actions: [{
+      id: "visual-action",
+      type: "visual_click",
+      ref: "v1",
+      visualObservationId: "visual-observation-1",
+      xNormalized: 750,
+      yNormalized: 500,
+      targetDescription: "green Apply area",
+      reason: "The canvas has no equivalent DOM control"
+    }]
+  }), { maxEffects: 3 });
+
+  assert.equal(Core.validateDecision(decision, { context: visualContext }).valid, true);
+  const staleDecision = Core.normalizeDecision({
+    ...baseDecision(),
+    actions: [{ ...decision.actions[0], visualObservationId: "visual-observation-old" }]
+  }, { maxEffects: 3 });
+  assert.equal(Core.validateDecision(staleDecision, { context: visualContext }).valid, false);
+  assert.equal(Core.validateDecision(decision, {
+    context: { ...visualContext, visualObservation: null }
+  }).valid, false);
+  assert.equal(Core.validateDecision(decision, {
+    context: { ...visualContext, visualSurfaces: [] }
+  }).valid, false);
+  const bypass = Core.normalizeDecision(baseDecision({
+    actions: [{
+      id: "visual-bypass",
+      type: "click",
+      ref: "v1",
+      reason: "Attempt to bypass screenshot binding"
+    }]
+  }), { maxEffects: 3 });
+  assert.equal(Core.validateDecision(bypass, { context: visualContext }).valid, false);
+});
+
 test("rejects a syntactically valid but blank user-facing decision", () => {
   const decision = Core.normalizeDecision({
     version: "1.0",

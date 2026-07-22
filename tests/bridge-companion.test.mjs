@@ -4,10 +4,16 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { WebSocket } from "ws";
-import { createCompanionServer } from "../bridge/server.mjs";
+import {
+  createCompanionServer,
+  createExtensionSetupValue,
+  createStdioClientConfig,
+} from "../bridge/server.mjs";
 
 const EXTENSION_ORIGIN = "chrome-extension://test-extension";
 const TEST_TIMEOUT_MS = 5_000;
@@ -18,6 +24,99 @@ const silentLogger = Object.freeze({
   info() {},
   log() {},
   warn() {},
+});
+
+test("companion creates a single extension setup value and a dynamic stdio client entry", () => {
+  const endpoint = "ws://127.0.0.1:45678/extension";
+  const setup = new URL(createExtensionSetupValue(endpoint, "PAIR_CODE_123"));
+  assert.equal(`${setup.protocol}//${setup.host}${setup.pathname}`, endpoint);
+  assert.equal(new URLSearchParams(setup.hash.slice(1)).get("pair"), "PAIR_CODE_123");
+
+  const config = createStdioClientConfig({
+    command: path.resolve("runtime-node"),
+    serverPath: path.resolve("bridge-entry.mjs"),
+  });
+  assert.deepEqual(config, {
+    mcpServers: {
+      "my-assistant-web": {
+        command: path.resolve("runtime-node"),
+        args: [path.resolve("bridge-entry.mjs"), "--stdio"],
+      },
+    },
+  });
+});
+
+test("companion reuses its remembered loopback port when no port is configured", async (t) => {
+  const temporaryDirectory = await mkdtemp(
+    path.join(os.tmpdir(), "my-assistant-bridge-port-test-"),
+  );
+  const statePath = path.join(temporaryDirectory, "companion-state.json");
+  let first;
+  let second;
+  t.after(async () => {
+    await Promise.allSettled([first?.close(), second?.close()]);
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  });
+
+  first = await createCompanionServer({ port: 0, statePath, logger: silentLogger });
+  const rememberedPort = first.port;
+  await first.close();
+  first = null;
+
+  second = await createCompanionServer({ statePath, logger: silentLogger });
+  assert.equal(second.port, rememberedPort);
+  assert.equal(new URL(second.extensionSetup).port, String(rememberedPort));
+});
+
+test("stdio mode exposes guided tools and reports one extension setup value", async (t) => {
+  const temporaryDirectory = await mkdtemp(
+    path.join(os.tmpdir(), "my-assistant-bridge-stdio-test-"),
+  );
+  const statePath = path.join(temporaryDirectory, "companion-state.json");
+  const serverPath = fileURLToPath(new URL("../bridge/server.mjs", import.meta.url));
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [serverPath, "--stdio", "--port", "0", "--state", statePath],
+    stderr: "pipe",
+  });
+  let stderr = "";
+  transport.stderr?.on("data", (chunk) => {
+    stderr += chunk.toString("utf8");
+  });
+  const client = new Client(
+    { name: "bridge-stdio-integration-test", version: "1.0.0" },
+    { capabilities: {} },
+  );
+  t.after(async () => {
+    await client.close().catch(() => {});
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  });
+
+  await client.connect(transport);
+  const listedTools = await client.listTools();
+  assert.deepEqual(listedTools.tools.map((tool) => tool.name).sort(), [
+    "browser_act",
+    "browser_begin",
+    "browser_continue",
+    "browser_end",
+    "browser_screenshot",
+  ]);
+
+  const advancedOnlyInput = await client.callTool({
+    name: "browser_screenshot",
+    arguments: { session_id: "session-not-exposed" },
+  });
+  assert.equal(advancedOnlyInput.isError, true);
+  assert.match(advancedOnlyInput.content[0].text, /invalid browser_screenshot input/i);
+
+  const result = await client.callTool({
+    name: "browser_begin",
+    arguments: { goal: "Inspect the shared test page" },
+  });
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /Extension setup: ws:\/\/127\.0\.0\.1:\d+\/extension#pair=/i);
+  assert.match(stderr, /Browser bridge MCP is ready over stdio/i);
+  assert.match(stderr, /Extension setup: ws:\/\/127\.0\.0\.1:\d+\/extension#pair=/i);
 });
 
 function createMessageMailbox(endpoint) {
@@ -157,6 +256,10 @@ test("companion pairs the extension and relays authenticated MCP tool calls", as
 
   assert.notEqual(companion.port, 0, "port 0 must resolve to an ephemeral listening port");
   assert.ok(companion.pairingCode, "a fresh companion must expose a pairing code");
+  const extensionSetup = new URL(companion.extensionSetup);
+  assert.equal(`${extensionSetup.protocol}//${extensionSetup.host}${extensionSetup.pathname}`, companion.endpoints.extension);
+  assert.equal(new URLSearchParams(extensionSetup.hash.slice(1)).get("pair"), companion.pairingCode);
+  assert.doesNotMatch(companion.extensionSetup, new RegExp(companion.mcpToken));
 
   const unauthorizedResponse = await fetch(companion.endpoints.mcp, {
     method: "POST",
@@ -230,14 +333,17 @@ test("companion pairs the extension and relays authenticated MCP tool calls", as
     listedTools.tools.map(({ name }) => name),
     companion.tools.map(({ name }) => name),
   );
-  assert.ok(listedTools.tools.some(({ name }) => name === "browser_status"));
+  assert.ok(listedTools.tools.some(({ name }) => name === "browser_begin"));
 
   const relayedRequestPromise = authenticatedConnection.nextMessage();
-  const toolCallPromise = client.callTool({ name: "browser_status", arguments: {} });
+  const toolCallPromise = client.callTool({
+    name: "browser_begin",
+    arguments: { goal: "Inspect the shared integration page" },
+  });
   const relayedRequest = await relayedRequestPromise;
   assert.equal(relayedRequest.type, "request");
-  assert.equal(relayedRequest.toolName, "browser_status");
-  assert.deepEqual(relayedRequest.args, {});
+  assert.equal(relayedRequest.toolName, "browser_begin");
+  assert.deepEqual(relayedRequest.args, { goal: "Inspect the shared integration page" });
   assert.equal(typeof relayedRequest.client?.name, "string");
   assert.equal(typeof relayedRequest.client?.version, "string");
 
@@ -259,11 +365,11 @@ test("companion pairs the extension and relays authenticated MCP tool calls", as
   assert.deepEqual(JSON.parse(toolResult.content[0].text), extensionResult);
 
   const forgedToolResult = await client.callTool({
-    name: "browser_status",
-    arguments: { approval: true },
+    name: "browser_begin",
+    arguments: { goal: "Inspect the page", approval: true },
   });
   assert.equal(forgedToolResult.isError, true);
-  assert.match(forgedToolResult.content[0].text, /invalid browser_status input/i);
+  assert.match(forgedToolResult.content[0].text, /invalid browser_begin input/i);
   await authenticatedConnection.expectNoMessage();
 
   const revokedMessagePromise = authenticatedConnection.nextMessage();

@@ -180,6 +180,14 @@
           throw new Error(`Invalid ${toolName || "bridge tool"} input: ${inputValidation.errors.join(" ")}`);
         }
         switch (toolName) {
+          case "browser_begin":
+            return this.#guidedBegin(args, client);
+          case "browser_act":
+            return this.#guidedAct(args, client);
+          case "browser_continue":
+            return this.#guidedContinue(client);
+          case "browser_end":
+            return this.#guidedEnd(client);
           case "browser_status":
             return this.#getClientStatus();
           case "browser_session_start":
@@ -187,7 +195,9 @@
           case "browser_observe":
             return this.#observe(args);
           case "browser_screenshot":
-            return this.#screenshot(args);
+            return Object.hasOwn(args, "session_id")
+              ? this.#screenshot(args)
+              : this.#guidedScreenshot(client);
           case "browser_execute":
             return this.#proposeExecution(args);
           case "browser_operation_get":
@@ -198,6 +208,169 @@
             throw new Error(`Unsupported bridge tool: ${toolName || "missing"}`);
         }
       });
+    }
+
+    async #guidedBegin(args, client) {
+      const goal = boundedString(args.goal, 4000, "goal");
+      const activeSession = this.#findGuidedSession(client, { required: false });
+      if (activeSession) {
+        if (activeSession.goal !== goal) {
+          throw new Error("This client already has an active browser task with a different goal. Call browser_end before starting another task.");
+        }
+        return this.#guidedContinue(client, { resumed: true });
+      }
+
+      const started = await this.#startSession({ goal }, client);
+      const session = this.#requireSession(started.session_id);
+      const observation = await this.#observe({ session_id: session.id });
+      return this.#guidedReadyResponse(session, observation, { resumed: false });
+    }
+
+    async #guidedAct(args, client) {
+      const session = this.#findGuidedSession(client);
+      const latestOperation = this.#latestSessionOperation(session);
+      if (latestOperation && ["waiting_approval", "approved", "ready", "executing"].includes(latestOperation.status)) {
+        return this.#guidedOperationResponse(latestOperation);
+      }
+      if (!session.observation || !session.latestObservationId) {
+        return {
+          status: "continue_required",
+          next: "Call browser_continue to refresh the page snapshot before proposing another action."
+        };
+      }
+
+      const effectDigest = Contract.effectDigest(args.actions);
+      const idempotencyKey = `guided:${session.latestObservationId}:${effectDigest}`.slice(0, 160);
+      const operation = await this.#proposeExecution({
+        session_id: session.id,
+        observation_id: session.latestObservationId,
+        idempotency_key: idempotencyKey,
+        actions: args.actions
+      });
+      return this.#guidedOperationResponse(this.#requireOperation(operation.operation_id));
+    }
+
+    async #guidedContinue(client, options = {}) {
+      const session = this.#findGuidedSession(client);
+      const latestOperation = this.#latestSessionOperation(session);
+      if (latestOperation && ["waiting_approval", "approved", "ready", "executing"].includes(latestOperation.status)) {
+        return this.#guidedOperationResponse(latestOperation, options);
+      }
+
+      const operationTimestamp = latestOperation
+        ? Number(latestOperation.completedAt || latestOperation.createdAt || 0)
+        : 0;
+      if (
+        session.observation
+        && session.latestObservationId
+        && Number(session.observation.observedAt || 0) >= operationTimestamp
+      ) {
+        return this.#guidedReadyResponse(session, {
+          observed_at: new Date(session.observation.observedAt).toISOString(),
+          context: sanitizeObservationForClient(session.observation.context)
+        }, {
+          resumed: Boolean(options.resumed),
+          latestOperation
+        });
+      }
+
+      const observation = await this.#observe({ session_id: session.id });
+      return this.#guidedReadyResponse(session, observation, {
+        resumed: Boolean(options.resumed),
+        latestOperation
+      });
+    }
+
+    async #guidedScreenshot(client) {
+      const session = this.#findGuidedSession(client);
+      return this.#screenshot({ session_id: session.id });
+    }
+
+    async #guidedEnd(client) {
+      const session = this.#findGuidedSession(client, { required: false });
+      if (!session) {
+        return {
+          closed: true,
+          status: "idle",
+          next: "No browser lease is active. Return the concise evidence-based final answer now."
+        };
+      }
+      const result = await this.#closeSession({ session_id: session.id });
+      return {
+        closed: result.closed,
+        status: "closed",
+        next: result.next
+      };
+    }
+
+    #findGuidedSession(client, options = {}) {
+      const activeSessions = Object.values(this.state.sessions)
+        .filter((session) => session.status === "active");
+      if (!activeSessions.length) {
+        if (options.required === false) return null;
+        throw new Error("No browser task is active. Call browser_begin with the user's complete goal.");
+      }
+      if (activeSessions.length > 1) {
+        throw new Error("Multiple browser sessions are active. Use the advanced workflow to resolve them safely.");
+      }
+      const session = activeSessions[0];
+      const callerName = boundedOptionalString(client?.name || client?.clientName, 160);
+      if (session.clientName && callerName && session.clientName !== callerName) {
+        throw new Error("The active browser task belongs to another MCP client. Ask the user to release it first.");
+      }
+      return this.#requireSession(session.id);
+    }
+
+    #latestSessionOperation(session) {
+      return Object.values(this.state.operations)
+        .filter((operation) => operation.sessionId === session.id)
+        .reduce((latest, operation) => {
+          if (!latest) return operation;
+          return Number(operation.createdAt || 0) >= Number(latest.createdAt || 0)
+            ? operation
+            : latest;
+        }, null);
+    }
+
+    #guidedReadyResponse(session, observation, options = {}) {
+      return {
+        status: "ready",
+        goal: session.goal,
+        shared_tab: this.state.armedTab ? summarizeSharedTab(this.state.armedTab) : null,
+        observed_at: observation.observed_at,
+        page: cloneJson(observation.context),
+        ...(options.latestOperation
+          ? { last_operation: this.#guidedPublicOperation(options.latestOperation) }
+          : {}),
+        next: options.resumed
+          ? "The existing browser task is ready. Continue from this snapshot with browser_act, or call browser_end if the visible goal is already satisfied."
+          : "Use only refs from this snapshot. Call browser_act with the next necessary actions, or browser_end if the visible goal is already satisfied."
+      };
+    }
+
+    #guidedOperationResponse(operation) {
+      const status = operation.status === "waiting_approval"
+        ? "approval_required"
+        : operation.status;
+      let next = "Call browser_continue now to obtain the next page snapshot.";
+      if (operation.status === "waiting_approval") {
+        next = "Ask the user to approve or reject the proposal in the extension, then call browser_continue again. Do not submit the proposal again.";
+      } else if (["approved", "ready", "executing"].includes(operation.status)) {
+        next = "Call browser_continue again to read the completed result. Do not submit another proposal.";
+      }
+      return {
+        status,
+        operation: this.#guidedPublicOperation(operation),
+        next
+      };
+    }
+
+    #guidedPublicOperation(operation) {
+      const result = this.#publicOperation(operation);
+      delete result.session_id;
+      delete result.operation_id;
+      delete result.next;
+      return result;
     }
 
     async #startSession(args, client) {

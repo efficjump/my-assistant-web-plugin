@@ -9,6 +9,8 @@ if (typeof importScripts === "function") {
 
 const CONTENT_SCRIPT_FILE = "content.js";
 const PANEL_PATH = "panel.html";
+const PANEL_OPEN_MODE_SIDE_PANEL = "side-panel";
+const PANEL_OPEN_MODE_TAB = "tab";
 const DEFAULT_MCP_PROTOCOL_VERSION = "2025-11-25";
 const BRIDGE_CREDENTIAL_STORAGE_KEY = "bridgeCredentialsV1";
 const SETTINGS_SECRET_STORAGE_KEY = "settingsSecrets";
@@ -37,28 +39,27 @@ let bridgeConnectionState = {
 
 void restrictExtensionStorageAccess();
 void initializeExternalControlBridge();
+void syncPanelActionBehavior();
 
 chrome.runtime.onInstalled.addListener(() => {
   void restrictExtensionStorageAccess();
-  if (chrome.sidePanel?.setPanelBehavior) {
-    chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
-  }
+  void syncPanelActionBehavior();
 });
 
 chrome.action.onClicked.addListener(async (tab) => {
-  if (chrome.sidePanel?.open && tab.windowId !== undefined) {
+  const settings = await chrome.storage.local.get("settings");
+  const openMode = normalizePanelOpenMode(settings.settings?.panelOpenMode);
+  if (openMode === PANEL_OPEN_MODE_SIDE_PANEL && chrome.sidePanel?.open && tab.windowId !== undefined) {
     await chrome.sidePanel.open({ windowId: tab.windowId });
     return;
   }
+  await openPanelInTab(await resolveActionTargetTab(tab));
+});
 
-  const url = new URL(chrome.runtime.getURL(PANEL_PATH));
-  if (tab.id !== undefined) {
-    url.searchParams.set("targetTabId", String(tab.id));
+chrome.storage?.onChanged?.addListener((changes, areaName) => {
+  if (areaName === "local" && changes.settings) {
+    void syncPanelActionBehavior(changes.settings.newValue?.panelOpenMode);
   }
-  if (tab.windowId !== undefined) {
-    url.searchParams.set("windowId", String(tab.windowId));
-  }
-  await chrome.tabs.create({ url: url.toString() });
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -72,25 +73,24 @@ async function handleMessage(message, sender) {
   switch (message?.type) {
     case "GET_ACTIVE_TAB":
       return getTargetTab(message.targetTabId);
+    case "GET_PANEL_PRESENTATION":
+      assertTrustedExtensionSender(sender);
+      return getPanelPresentation();
+    case "OPEN_PANEL_TAB":
+      assertTrustedExtensionSender(sender);
+      return openPanelInTab(await getTargetTab(message.targetTabId));
+    case "GET_FRAME_ORIGINS":
+      return getFrameOriginAccess(message.targetTabId);
     case "COLLECT_PAGE_CONTEXT":
-      return sendToContentScript(message.targetTabId, {
-        type: "COLLECT_PAGE_CONTEXT",
-        options: message.options || {}
-      });
+      return collectPageContextFromFrames(message.targetTabId, message.options || {});
     case "EXECUTE_PAGE_ACTIONS":
       assertTrustedExtensionSender(sender);
       await assertInternalExecutionLeaseAvailable();
-      return sendToContentScript(message.targetTabId, {
-        type: "EXECUTE_PAGE_ACTIONS",
-        actions: message.actions || []
-      });
+      return executePageActionsInFrames(message.targetTabId, message.actions || []);
     case "UNDO_PAGE_ACTIONS":
       assertTrustedExtensionSender(sender);
       await assertInternalExecutionLeaseAvailable();
-      return sendToContentScript(message.targetTabId, {
-        type: "UNDO_PAGE_ACTIONS",
-        undoActions: message.undoActions || []
-      });
+      return executeUndoActionsInFrames(message.targetTabId, message.undoActions || []);
     case "START_ELEMENT_PICKER":
       return sendToContentScript(message.targetTabId, {
         type: "START_ELEMENT_PICKER"
@@ -191,8 +191,201 @@ async function assertInternalExecutionLeaseAvailable() {
 async function sendToContentScript(targetTabId, payload) {
   const tab = await getTargetTab(targetTabId);
   assertInjectableTab(tab);
-  await ensureContentScript(tab.id);
-  return sendTabMessage(tab.id, payload);
+  await ensureContentScript(tab.id, 0);
+  return sendTabMessage(tab.id, payload, { frameId: 0 });
+}
+
+async function collectPageContextFromFrames(targetTabId, options = {}) {
+  const tab = await getTargetTab(targetTabId);
+  assertInjectableTab(tab);
+  const frameRecords = await getFrameRecords(tab.id, tab.url || "");
+  const attempts = await Promise.all(frameRecords.map(async (frame) => {
+    try {
+      await ensureContentScript(tab.id, frame.frameId);
+      const context = await sendTabMessage(tab.id, {
+        type: "COLLECT_PAGE_CONTEXT",
+        options: { ...options, includeChildFrames: frameRecords.length === 1 }
+      }, { frameId: frame.frameId });
+      return { frame, context, error: null };
+    } catch (error) {
+      return { frame, context: null, error };
+    }
+  }));
+  await Promise.all(attempts.map(async (attempt) => {
+    if (attempt.context) return;
+    const origin = getOriginPermissionPattern(attempt.frame.url);
+    attempt.originGranted = origin
+      ? await chrome.permissions.contains({ origins: [origin] }).catch(() => false)
+      : false;
+  }));
+  const topAttempt = attempts.find((attempt) => attempt.frame.frameId === 0);
+  if (!topAttempt?.context) {
+    throw topAttempt?.error || new Error("The top page frame could not be observed.");
+  }
+  return mergeFrameContexts(attempts, options);
+}
+
+async function executePageActionsInFrames(targetTabId, actions) {
+  if (!Array.isArray(actions)) {
+    throw new Error("Actions must be an array.");
+  }
+  const tab = await getTargetTab(targetTabId);
+  assertInjectableTab(tab);
+  const results = [];
+  for (const [index, action] of actions.entries()) {
+    const routed = routeFrameAction(action);
+    try {
+      await ensureContentScript(tab.id, routed.frameId);
+    } catch (error) {
+      throw createFrameControlError(routed.frameId, error);
+    }
+    const response = await sendTabMessage(tab.id, {
+      type: "EXECUTE_PAGE_ACTIONS",
+      actions: [routed.action]
+    }, { frameId: routed.frameId });
+    const result = response?.results?.[0] || {
+      ok: false,
+      action: routed.action,
+      error: "The target frame returned no action result."
+    };
+    results.push(decorateFrameActionResult(result, {
+      frameId: routed.frameId,
+      originalAction: action,
+      index
+    }));
+    if (!result.ok || result.result?.mayNavigate || ["navigate", "submit"].includes(action?.type)) {
+      break;
+    }
+  }
+  return { results };
+}
+
+async function executeUndoActionsInFrames(targetTabId, undoActions) {
+  if (!Array.isArray(undoActions)) {
+    throw new Error("Undo actions must be an array.");
+  }
+  const tab = await getTargetTab(targetTabId);
+  assertInjectableTab(tab);
+  const results = [];
+  for (const [index, undo] of undoActions.slice().reverse().entries()) {
+    const frameId = Number.isInteger(Number(undo?.frameId)) ? Number(undo.frameId) : 0;
+    const localUndo = { ...undo };
+    delete localUndo.frameId;
+    delete localUndo.targetTabId;
+    try {
+      await ensureContentScript(tab.id, frameId);
+      const response = await sendTabMessage(tab.id, {
+        type: "UNDO_PAGE_ACTIONS",
+        undoActions: [localUndo]
+      }, { frameId });
+      const result = response?.results?.[0] || { ok: false, error: "The target frame returned no undo result." };
+      results.push({ ...result, index, frameId });
+      if (!result.ok) break;
+    } catch (error) {
+      results.push({
+        index,
+        frameId,
+        ok: false,
+        type: localUndo.type || "undo",
+        error: error.message || String(error),
+        code: error.code || "frame_unavailable"
+      });
+      break;
+    }
+  }
+  return { results };
+}
+
+function normalizePanelOpenMode(value) {
+  return value === PANEL_OPEN_MODE_TAB ? PANEL_OPEN_MODE_TAB : PANEL_OPEN_MODE_SIDE_PANEL;
+}
+
+async function syncPanelActionBehavior(modeOverride) {
+  if (!chrome.sidePanel?.setPanelBehavior) {
+    return;
+  }
+  let openMode = modeOverride;
+  if (openMode === undefined) {
+    const stored = await chrome.storage.local.get("settings");
+    openMode = stored.settings?.panelOpenMode;
+  }
+  await chrome.sidePanel.setPanelBehavior({
+    openPanelOnActionClick: normalizePanelOpenMode(openMode) === PANEL_OPEN_MODE_SIDE_PANEL
+  }).catch(() => {});
+}
+
+async function getPanelPresentation() {
+  const stored = await chrome.storage.local.get("settings");
+  let side = "";
+  if (chrome.sidePanel?.getLayout) {
+    side = (await chrome.sidePanel.getLayout().catch(() => null))?.side || "";
+  }
+  return {
+    openMode: normalizePanelOpenMode(stored.settings?.panelOpenMode),
+    sidePanelSupported: Boolean(chrome.sidePanel?.open),
+    side,
+    tabSupported: Boolean(chrome.tabs?.create)
+  };
+}
+
+function buildPanelUrl(targetTab) {
+  const url = new URL(chrome.runtime.getURL(PANEL_PATH));
+  if (targetTab?.id !== undefined) {
+    url.searchParams.set("targetTabId", String(targetTab.id));
+  }
+  if (targetTab?.windowId !== undefined) {
+    url.searchParams.set("windowId", String(targetTab.windowId));
+  }
+  return url.toString();
+}
+
+function isPanelTab(tab) {
+  try {
+    const url = new URL(tab?.url || tab?.pendingUrl || "");
+    const panelUrl = new URL(chrome.runtime.getURL(PANEL_PATH));
+    return url.origin === panelUrl.origin && url.pathname === panelUrl.pathname;
+  } catch {
+    return false;
+  }
+}
+
+async function resolveActionTargetTab(tab) {
+  if (!isPanelTab(tab)) {
+    return tab;
+  }
+  try {
+    const targetTabId = new URL(tab.url || tab.pendingUrl || "").searchParams.get("targetTabId");
+    return targetTabId ? await getTargetTab(targetTabId) : tab;
+  } catch {
+    return tab;
+  }
+}
+
+async function openPanelInTab(targetTab) {
+  const panelUrl = buildPanelUrl(targetTab);
+  const allTabs = await chrome.tabs.query({});
+  const existing = allTabs.find((tab) => (
+    isPanelTab(tab)
+    && tab.windowId === targetTab?.windowId
+    && readPanelTargetTabId(tab) === Number(targetTab?.id)
+  ));
+  if (!existing?.id) {
+    return chrome.tabs.create({
+      url: panelUrl,
+      ...(targetTab?.windowId === undefined ? {} : { windowId: targetTab.windowId })
+    });
+  }
+  return chrome.tabs.update(existing.id, { active: true });
+}
+
+function readPanelTargetTabId(tab) {
+  try {
+    const value = new URL(tab?.url || tab?.pendingUrl || "").searchParams.get("targetTabId");
+    const targetTabId = Number(value);
+    return Number.isInteger(targetTabId) ? targetTabId : null;
+  } catch {
+    return null;
+  }
 }
 
 async function getTargetTab(targetTabId) {
@@ -239,10 +432,7 @@ async function initializeExternalControlBridge() {
       getTab: (tabId) => getTargetTab(tabId),
       observe: collectExternalObservation,
       screenshot: (tabId) => captureVisibleTab(tabId),
-      executePage: (tabId, actions) => sendToContentScript(tabId, {
-        type: "EXECUTE_PAGE_ACTIONS",
-        actions
-      }),
+      executePage: (tabId, actions) => executePageActionsInFrames(tabId, actions),
       executeBrowser: (tabId, actions) => executeExternalBrowserActions(tabId, actions)
     },
     evaluatePolicy: evaluateExternalActionPolicy,
@@ -266,13 +456,10 @@ async function initializeExternalControlBridge() {
 async function collectExternalObservation(tabId) {
   const settings = await loadBackgroundSettings();
   const [context, browser] = await Promise.all([
-    sendToContentScript(tabId, {
-      type: "COLLECT_PAGE_CONTEXT",
-      options: {
+    collectPageContextFromFrames(tabId, {
         maxTextChars: clampNumber(settings.maxTextChars, 2000, 100000, 16000),
         maxElements: clampNumber(settings.maxElements, 20, 500, 80),
         redactSensitiveData: true
-      }
     }),
     getBrowserContext(tabId).catch(() => ({ tabs: [], downloads: [] }))
   ]);
@@ -923,20 +1110,21 @@ function assertInjectableTab(tab) {
   }
 }
 
-async function ensureContentScript(tabId) {
+async function ensureContentScript(tabId, frameId = 0) {
   try {
-    await sendTabMessage(tabId, { type: "PING" });
+    await sendTabMessage(tabId, { type: "PING" }, { frameId });
   } catch {
     await chrome.scripting.executeScript({
-      target: { tabId },
+      target: { tabId, frameIds: [frameId] },
       files: [CONTENT_SCRIPT_FILE]
     });
+    await sendTabMessage(tabId, { type: "PING" }, { frameId });
   }
 }
 
-function sendTabMessage(tabId, payload) {
+function sendTabMessage(tabId, payload, target = {}) {
   return new Promise((resolve, reject) => {
-    chrome.tabs.sendMessage(tabId, payload, (response) => {
+    chrome.tabs.sendMessage(tabId, payload, target, (response) => {
       const runtimeError = chrome.runtime.lastError;
       if (runtimeError) {
         reject(new Error(runtimeError.message));
@@ -949,6 +1137,515 @@ function sendTabMessage(tabId, payload) {
       resolve(response?.data);
     });
   });
+}
+
+async function getFrameRecords(tabId, fallbackUrl = "") {
+  let frames = [];
+  try {
+    frames = await chrome.webNavigation.getAllFrames({ tabId }) || [];
+  } catch {
+    frames = [];
+  }
+  if (!frames.some((frame) => Number(frame.frameId) === 0)) {
+    frames.unshift({ frameId: 0, parentFrameId: -1, url: fallbackUrl || "" });
+  }
+  return frames
+    .map((frame) => ({
+      frameId: Number(frame.frameId),
+      parentFrameId: Number.isInteger(Number(frame.parentFrameId)) ? Number(frame.parentFrameId) : -1,
+      url: String(frame.url || "")
+    }))
+    .filter((frame) => Number.isInteger(frame.frameId) && frame.frameId >= 0)
+    .sort((left, right) => left.frameId - right.frameId);
+}
+
+async function getFrameOriginAccess(targetTabId) {
+  const tab = await getTargetTab(targetTabId);
+  assertInjectableTab(tab);
+  const frames = await getFrameRecords(tab.id, tab.url || "");
+  const attempts = await Promise.all(frames.map(async (frame) => {
+    try {
+      await ensureContentScript(tab.id, frame.frameId);
+      const context = await sendTabMessage(tab.id, {
+        type: "COLLECT_PAGE_CONTEXT",
+        options: {
+          includeChildFrames: false,
+          maxTextChars: 4000,
+          maxElements: 20,
+          redactSensitiveData: true
+        }
+      }, { frameId: frame.frameId });
+      return { frame, context, error: null };
+    } catch (error) {
+      return { frame, context: null, error };
+    }
+  }));
+  const contextByFrameId = new Map(
+    attempts.filter((attempt) => attempt.context).map((attempt) => [attempt.frame.frameId, attempt.context])
+  );
+  const { frameBindings } = resolveVisuallyVerifiedFrames(attempts, contextByFrameId);
+  const topPattern = getOriginPermissionPattern(tab.url || "");
+  const patterns = Array.from(new Set(attempts
+    .filter((attempt) => frameBindings.has(attempt.frame.frameId))
+    .map((attempt) => getOriginPermissionPattern(attempt.frame.url))
+    .filter((pattern) => pattern && pattern !== topPattern)));
+  const access = await Promise.all(patterns.map(async (pattern) => ({
+    pattern,
+    granted: await chrome.permissions.contains({ origins: [pattern] }).catch(() => false)
+  })));
+  return {
+    frameCount: frames.length,
+    visibleFrameCount: frameBindings.size,
+    origins: access.map((entry) => entry.pattern),
+    missingOrigins: access.filter((entry) => !entry.granted).map((entry) => entry.pattern),
+    unverifiedFrameCount: Math.max(0, frames.length - 1 - frameBindings.size)
+  };
+}
+
+function getOriginPermissionPattern(value) {
+  try {
+    const url = new URL(String(value || ""));
+    if (!["http:", "https:"].includes(url.protocol)) return "";
+    return `${url.protocol}//${url.hostname}/*`;
+  } catch {
+    return "";
+  }
+}
+
+function routeFrameAction(action) {
+  const source = action && typeof action === "object" ? { ...action } : {};
+  const refRoute = parseFrameScopedRef(source.ref);
+  const conditionRoute = parseConditionFrameRoute(source.conditionJson);
+  const frameId = refRoute?.frameId ?? conditionRoute?.frameId ?? 0;
+  if (refRoute && conditionRoute && refRoute.frameId !== conditionRoute.frameId) {
+    throw new Error("One action cannot target refs from different frames.");
+  }
+  if (refRoute) {
+    source.ref = refRoute.localRef;
+  }
+  if (conditionRoute) {
+    source.conditionJson = JSON.stringify(conditionRoute.condition);
+  }
+  return { frameId, action: source };
+}
+
+function parseFrameScopedRef(value) {
+  const match = String(value || "").match(/^f(\d+):(.+)$/u);
+  if (!match) return null;
+  const frameId = Number(match[1]);
+  return Number.isInteger(frameId) && frameId >= 0
+    ? { frameId, localRef: match[2] }
+    : null;
+}
+
+function parseConditionFrameRoute(conditionJson) {
+  if (typeof conditionJson !== "string" || !conditionJson.trim()) return null;
+  let condition;
+  try {
+    condition = JSON.parse(conditionJson);
+  } catch {
+    return null;
+  }
+  const routes = [];
+  const visit = (value) => {
+    if (!value || typeof value !== "object") return;
+    if (Array.isArray(value)) {
+      value.forEach(visit);
+      return;
+    }
+    if (typeof value.ref === "string") {
+      const route = parseFrameScopedRef(value.ref);
+      if (route) {
+        routes.push(route);
+        value.ref = route.localRef;
+      }
+    }
+    Object.values(value).forEach(visit);
+  };
+  visit(condition);
+  if (!routes.length) return null;
+  if (routes.some((route) => route.frameId !== routes[0].frameId)) {
+    throw new Error("One wait condition cannot target refs from different frames.");
+  }
+  return { frameId: routes[0].frameId, condition };
+}
+
+function decorateFrameActionResult(result, options) {
+  const frameId = Number(options.frameId) || 0;
+  const decorated = {
+    ...result,
+    index: options.index,
+    frameId,
+    action: { ...(result.action || {}), ...(options.originalAction || {}) }
+  };
+  if (result.undo && typeof result.undo === "object") {
+    decorated.undo = { ...result.undo, frameId };
+  }
+  return decorated;
+}
+
+function createFrameControlError(frameId, cause) {
+  const error = new Error(
+    `Frame ${frameId} is not available for control. Grant its site origin, reload the page, and re-observe before retrying. ${cause?.message || ""}`.trim()
+  );
+  error.name = "FrameAccessError";
+  error.code = "frame_access_required";
+  error.details = { frameId };
+  return error;
+}
+
+function mergeFrameContexts(attempts, options = {}) {
+  const observed = attempts
+    .filter((attempt) => attempt.context)
+    .sort((left, right) => left.frame.frameId - right.frame.frameId);
+  const contextByFrameId = new Map(observed.map((attempt) => [attempt.frame.frameId, attempt.context]));
+  const { visibleFrameIds, frameBindings } = resolveVisuallyVerifiedFrames(attempts, contextByFrameId);
+  const frameGeometry = buildFrameGeometry(visibleFrameIds, frameBindings, contextByFrameId, attempts);
+  const visibleAttempts = observed.filter((attempt) => visibleFrameIds.has(attempt.frame.frameId));
+  const topAttempt = observed.find((attempt) => attempt.frame.frameId === 0);
+  const topContext = topAttempt.context;
+  const { frameBoundaries: _internalFrameBoundaries, ...publicTopContext } = topContext;
+  const maxTextChars = clampNumber(options.maxTextChars, 4000, 100000, 16000);
+  const maxElements = clampNumber(options.maxElements, 20, 500, 80);
+
+  const decorate = (attempt, item) => decorateFrameContextItem(
+    item,
+    attempt.frame,
+    attempt.context,
+    frameGeometry.get(attempt.frame.frameId)
+  );
+  const mergeItems = (key, limit) => visibleAttempts
+    .flatMap((attempt) => (attempt.context[key] || []).map((item) => decorate(attempt, item)))
+    .sort(compareMergedContextItems)
+    .slice(0, limit);
+  const interactiveCandidates = visibleAttempts
+    .flatMap((attempt) => (attempt.context.interactiveElements || []).map((item) => decorate(attempt, item)))
+    .sort(compareMergedContextItems);
+  const interactiveElements = interactiveCandidates.slice(0, maxElements);
+  const scrollRegions = mergeItems("scrollRegions", Math.max(6, Math.min(48, Math.ceil(maxElements / 2))));
+  const visualSurfaces = mergeItems("visualSurfaces", Math.max(4, Math.min(32, Math.ceil(maxElements / 3))));
+  const visibleText = truncateByCodeUnits(
+    visibleAttempts
+      .map((attempt) => String(attempt.context.visibleText || "").trim())
+      .filter(Boolean)
+      .join("\n"),
+    maxTextChars
+  );
+  const frameRevisions = observed.map((attempt) => ({
+    frameId: attempt.frame.frameId,
+    parentFrameId: attempt.frame.parentFrameId,
+    documentId: visibleFrameIds.has(attempt.frame.frameId) ? attempt.context.documentId || "" : "",
+    domRevision: visibleFrameIds.has(attempt.frame.frameId)
+      ? attempt.context.pageState?.domRevision ?? null
+      : null,
+    viewport: visibleFrameIds.has(attempt.frame.frameId)
+      ? {
+          width: attempt.context.viewport?.width ?? null,
+          height: attempt.context.viewport?.height ?? null,
+          scrollX: attempt.context.viewport?.scrollX ?? null,
+          scrollY: attempt.context.viewport?.scrollY ?? null
+        }
+      : null,
+    url: visibleFrameIds.has(attempt.frame.frameId)
+      ? summarizeFrameUrl(attempt.context.url || attempt.frame.url)
+      : "",
+    visuallyVerified: visibleFrameIds.has(attempt.frame.frameId)
+  }));
+  const inaccessibleFrames = attempts
+    .filter((attempt) => !attempt.context && frameBindings.has(attempt.frame.frameId))
+    .map((attempt) => ({
+      frameId: attempt.frame.frameId,
+      parentFrameId: attempt.frame.parentFrameId,
+      url: summarizeFrameUrl(attempt.frame.url),
+      origin: getOriginPermissionPattern(attempt.frame.url),
+      code: getOriginPermissionPattern(attempt.frame.url)
+        ? attempt.originGranted
+          ? "frame_injection_unavailable"
+          : "frame_access_required"
+        : "unsupported_frame_scheme"
+    }));
+  const permissionBlockedFrames = inaccessibleFrames.filter((frame) => frame.code === "frame_access_required");
+  const injectionBlockedFrames = inaccessibleFrames.filter((frame) => frame.code !== "frame_access_required");
+  const unverifiedFrameCount = attempts.filter(
+    (attempt) => attempt.frame.frameId !== 0 && !frameBindings.has(attempt.frame.frameId)
+  ).length;
+  const gaps = [];
+  if (permissionBlockedFrames.length) {
+    gaps.push({
+      code: "frame_access_required",
+      count: permissionBlockedFrames.length,
+      frames: permissionBlockedFrames,
+      next: "Grant only the listed embedded-frame origins, reload, and re-observe."
+    });
+  }
+  if (injectionBlockedFrames.length) {
+    gaps.push({
+      code: "frame_injection_unavailable",
+      count: injectionBlockedFrames.length,
+      frames: injectionBlockedFrames,
+      next: "Treat these embedded documents as unavailable; browser or document policy prevented content-script access."
+    });
+  }
+  if (unverifiedFrameCount) {
+    gaps.push({
+      code: "frame_visibility_unverified",
+      count: unverifiedFrameCount,
+      next: "Do not describe or control these frame contents until their outer-frame visibility can be verified."
+    });
+  }
+  if (visualSurfaces.length) {
+    gaps.push({
+      code: "visual_surface",
+      count: visualSurfaces.length,
+      refs: visualSurfaces.map((surface) => surface.ref),
+      next: "When a visible target has no DOM ref, use the latest screenshot and one surface-relative visual_click."
+    });
+  }
+
+  return {
+    ...publicTopContext,
+    visibleText,
+    documentTextExcerpt: visibleText,
+    selection: visibleAttempts.map((attempt) => attempt.context.selection || "").find(Boolean) || "",
+    pageState: {
+      ...(topContext.pageState || {}),
+      frameRevisions
+    },
+    headings: mergeItems("headings", 48),
+    landmarks: mergeItems("landmarks", 48),
+    forms: mergeItems("forms", 24),
+    tables: mergeItems("tables", 20),
+    iframes: mergeItems("iframes", 36),
+    liveRegions: mergeItems("liveRegions", 40),
+    domScopes: mergeItems("domScopes", 80),
+    interactiveElements,
+    interactiveElementStats: {
+      total: visibleAttempts.reduce(
+        (sum, attempt) => sum + Number(attempt.context.interactiveElementStats?.total || 0),
+        0
+      ),
+      included: interactiveElements.length,
+      truncated: interactiveCandidates.length > interactiveElements.length
+        || visibleAttempts.some((attempt) => attempt.context.interactiveElementStats?.truncated)
+    },
+    scrollRegions,
+    visualSurfaces,
+    frameContexts: observed.map((attempt) => {
+      const visuallyVerified = visibleFrameIds.has(attempt.frame.frameId);
+      return {
+        frameId: attempt.frame.frameId,
+        parentFrameId: attempt.frame.parentFrameId,
+        documentId: visuallyVerified ? attempt.context.documentId || "" : "",
+        url: visuallyVerified ? summarizeFrameUrl(attempt.context.url || attempt.frame.url) : "",
+        title: visuallyVerified ? attempt.context.title || "" : "",
+        visuallyVerified,
+        interactiveElementCount: visuallyVerified ? attempt.context.interactiveElements?.length || 0 : 0,
+        scrollRegionCount: visuallyVerified ? attempt.context.scrollRegions?.length || 0 : 0,
+        visualSurfaceCount: visuallyVerified ? attempt.context.visualSurfaces?.length || 0 : 0
+      };
+    }),
+    automationCapabilities: {
+      mode: "multi-frame-dom",
+      frames: {
+        discovered: attempts.length,
+        observed: observed.length,
+        visuallyVerified: visibleFrameIds.size,
+        inaccessible: inaccessibleFrames,
+        unverifiedCount: unverifiedFrameCount
+      },
+      scrollRegionCount: scrollRegions.length,
+      visualSurfaceCount: visualSurfaces.length,
+      visualTargeting: {
+        eligibleSurfaceCount: visualSurfaces.length,
+        screenshotRequired: true,
+        availableInObservation: false
+      },
+      gaps
+    }
+  };
+}
+
+function resolveVisuallyVerifiedFrames(attempts, contextByFrameId) {
+  const visibleFrameIds = new Set([0]);
+  const frameBindings = new Map();
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const parentFrameId of Array.from(visibleFrameIds)) {
+      const parentContext = contextByFrameId.get(parentFrameId);
+      if (!parentContext) continue;
+      const childAttempts = attempts.filter((attempt) => (
+        attempt.frame.parentFrameId === parentFrameId
+        && !frameBindings.has(attempt.frame.frameId)
+      ));
+      const boundaries = parentContext.frameBoundaries || [];
+      const childGroups = groupByComparableFrameUrl(childAttempts, (attempt) => (
+        attempt.context?.url || attempt.frame.url
+      ));
+      const boundaryGroups = groupByComparableFrameUrl(boundaries, (boundary) => boundary.src);
+      for (const [urlKey, children] of childGroups) {
+        const matches = boundaryGroups.get(urlKey) || [];
+        if (
+          children.length !== 1
+          || matches.length !== 1
+          || matches[0].visuallyExposed !== true
+          || matches[0].fullyExposed !== true
+          || !matches[0].contentRect
+        ) {
+          continue;
+        }
+        const child = children[0];
+        frameBindings.set(child.frame.frameId, matches[0]);
+        if (child.context) {
+          visibleFrameIds.add(child.frame.frameId);
+        }
+        changed = true;
+      }
+    }
+  }
+  return { visibleFrameIds, frameBindings };
+}
+
+function groupByComparableFrameUrl(items, readUrl) {
+  const groups = new Map();
+  for (const item of items || []) {
+    const key = comparableFrameUrl(readUrl(item));
+    if (!key) continue;
+    const group = groups.get(key) || [];
+    group.push(item);
+    groups.set(key, group);
+  }
+  return groups;
+}
+
+function comparableFrameUrl(value) {
+  const input = String(value || "").trim();
+  if (!input) return "";
+  try {
+    const url = new URL(input);
+    if (["http:", "https:"].includes(url.protocol)) {
+      return `${url.protocol}//${url.host}${url.pathname}`;
+    }
+    if (url.protocol === "about:") return `${url.protocol}${url.pathname}`;
+    return `${url.protocol}${url.pathname}`;
+  } catch {
+    return input.split(/[?#]/u)[0];
+  }
+}
+
+function buildFrameGeometry(visibleFrameIds, frameBindings, contextByFrameId, attempts) {
+  const geometry = new Map([[0, { offsetX: 0, offsetY: 0, scaleX: 1, scaleY: 1 }]]);
+  const frameById = new Map((attempts || []).map((attempt) => [attempt.frame.frameId, attempt.frame]));
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const frameId of visibleFrameIds) {
+      if (frameId === 0 || geometry.has(frameId)) continue;
+      const context = contextByFrameId.get(frameId);
+      const binding = frameBindings.get(frameId);
+      const frameRecord = frameById.get(frameId);
+      const parentGeometry = geometry.get(frameRecord?.parentFrameId);
+      if (!context || !binding?.contentRect || !parentGeometry) continue;
+      const viewportWidth = Number(context.viewport?.width || binding.childViewport?.width);
+      const viewportHeight = Number(context.viewport?.height || binding.childViewport?.height);
+      if (!(viewportWidth > 0) || !(viewportHeight > 0)) continue;
+      geometry.set(frameId, {
+        offsetX: parentGeometry.offsetX + Number(binding.contentRect.x || 0) * parentGeometry.scaleX,
+        offsetY: parentGeometry.offsetY + Number(binding.contentRect.y || 0) * parentGeometry.scaleY,
+        scaleX: parentGeometry.scaleX * Number(binding.contentRect.width || 0) / viewportWidth,
+        scaleY: parentGeometry.scaleY * Number(binding.contentRect.height || 0) / viewportHeight
+      });
+      changed = true;
+    }
+  }
+  return geometry;
+}
+
+function decorateFrameContextItem(item, frame, context, geometry) {
+  const source = item && typeof item === "object" ? structuredClone(item) : {};
+  const frameId = Number(frame.frameId) || 0;
+  if (frameId !== 0 && source.ref) {
+    source.ref = `f${frameId}:${source.ref}`;
+  }
+  if (frameId !== 0 && source.scope) {
+    source.scope = `frame-${frameId}/${source.scope}`;
+  }
+  source.frameId = frameId;
+  source.parentFrameId = Number(frame.parentFrameId);
+  source.frameDocumentId = context.documentId || "";
+  source.frameUrl = summarizeFrameUrl(context.url || frame.url);
+  if (frameId !== 0 && source.rect) {
+    if (geometry) {
+      source.frameLocalRect = source.rect;
+      source.rect = transformFrameRect(source.rect, geometry);
+      source.rectSpace = "top-viewport";
+    } else {
+      source.rectSpace = "frame-viewport";
+    }
+  }
+  if (frameId !== 0 && source.hitPoint) {
+    if (geometry) {
+      source.frameLocalHitPoint = source.hitPoint;
+      source.hitPoint = transformFramePoint(source.hitPoint, geometry);
+      source.hitPointSpace = "top-viewport";
+    } else {
+      source.hitPointSpace = "frame-viewport";
+    }
+  }
+  return source;
+}
+
+function transformFrameRect(rect, geometry) {
+  return {
+    x: Math.round(geometry.offsetX + Number(rect.x || 0) * geometry.scaleX),
+    y: Math.round(geometry.offsetY + Number(rect.y || 0) * geometry.scaleY),
+    width: Math.round(Number(rect.width || 0) * geometry.scaleX),
+    height: Math.round(Number(rect.height || 0) * geometry.scaleY)
+  };
+}
+
+function transformFramePoint(point, geometry) {
+  return {
+    x: Math.round(geometry.offsetX + Number(point.x || 0) * geometry.scaleX),
+    y: Math.round(geometry.offsetY + Number(point.y || 0) * geometry.scaleY)
+  };
+}
+
+function compareMergedContextItems(left, right) {
+  const leftHasRect = Number.isFinite(Number(left?.rect?.y)) && Number.isFinite(Number(left?.rect?.x));
+  const rightHasRect = Number.isFinite(Number(right?.rect?.y)) && Number.isFinite(Number(right?.rect?.x));
+  if (leftHasRect && rightHasRect) {
+    const vertical = Number(left.rect.y) - Number(right.rect.y);
+    if (Math.abs(vertical) > 1) return vertical;
+    const horizontal = Number(left.rect.x) - Number(right.rect.x);
+    if (Math.abs(horizontal) > 1) return horizontal;
+  } else if (leftHasRect !== rightHasRect) {
+    return leftHasRect ? -1 : 1;
+  }
+  const frameDifference = Number(left?.frameId || 0) - Number(right?.frameId || 0);
+  if (frameDifference) return frameDifference;
+  return 0;
+}
+
+function summarizeFrameUrl(value) {
+  try {
+    const url = new URL(String(value || ""));
+    if (!["http:", "https:", "about:"].includes(url.protocol)) {
+      return url.protocol;
+    }
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    url.hash = "";
+    return url.href;
+  } catch {
+    return String(value || "").split(/[?#]/u)[0];
+  }
+}
+
+function truncateByCodeUnits(value, maxLength) {
+  const text = String(value || "");
+  return text.length <= maxLength ? text : text.slice(0, maxLength);
 }
 
 async function captureVisibleTab(targetTabId) {
@@ -2849,6 +3546,8 @@ function serializeError(error) {
   return {
     name: error?.name || "Error",
     message: error?.message || String(error),
+    code: error?.code || "",
+    details: error?.details && typeof error.details === "object" ? error.details : null,
     audit: error?.audit ? finalizeAiRequestAudit(error.audit) : null
   };
 }
@@ -2856,5 +3555,7 @@ function serializeError(error) {
 function deserializeError(error) {
   const result = new Error(error?.message || "Unknown extension error");
   result.name = error?.name || "Error";
+  result.code = error?.code || "";
+  result.details = error?.details || null;
   return result;
 }

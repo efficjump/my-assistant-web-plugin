@@ -9,6 +9,7 @@
 
   const EXTERNALLY_BLOCKED_ACTION_TYPES = new Set([
     "upload",
+    "visual_click",
     "tab_focus",
     "tab_adopt",
     "tab_close",
@@ -139,7 +140,14 @@
       ref: stringValue(target.ref),
       selector: stringValue(target.selector),
       scope: stringValue(target.scope),
+      frameId: Number.isInteger(Number(target.frameId)) ? Number(target.frameId) : 0,
+      parentFrameId: Number.isInteger(Number(target.parentFrameId)) ? Number(target.parentFrameId) : -1,
+      frameDocumentId: stringValue(target.frameDocumentId),
+      frameUrl: stringValue(target.frameUrl),
+      rectSpace: stringValue(target.rectSpace),
+      rectDigest: digestValue(target.rect || null),
       tag: stringValue(target.tag),
+      kind: stringValue(target.kind),
       role: stringValue(target.role),
       type: stringValue(target.type),
       label: stringValue(target.label),
@@ -185,6 +193,7 @@
       documentId: stringValue(context?.documentId),
       pageUrl: stringValue(context?.url),
       contextDigest: contextDigest(context),
+      visualObservationId: stringValue(action.visualObservationId),
       lookup: {
         ref: stringValue(action.ref),
         selector: stringValue(action.selector),
@@ -230,6 +239,13 @@
         errors.push(`The page URL changed for action ${action.id || "unknown"}.`);
         continue;
       }
+      if (
+        precondition.visualObservationId
+        && precondition.visualObservationId !== context?.visualObservation?.id
+      ) {
+        errors.push(`The visual observation changed for action ${action.id || "unknown"}.`);
+        continue;
+      }
       if (precondition.browserTab) {
         const currentTab = summarizeBrowserTab((context?.browser?.tabs || []).find(
           (tab) => Number(tab.tabId ?? tab.id) === Number(precondition.browserTab.tabId)
@@ -256,8 +272,13 @@
     return digestValue({
       documentId: context?.documentId || "",
       url: context?.url || "",
-      domRevision: context?.domRevision ?? null,
-      elements: (context?.interactiveElements || []).map(summarizeTargetForPrecondition)
+      domRevision: context?.pageState?.domRevision ?? context?.domRevision ?? null,
+      frameRevisions: context?.pageState?.frameRevisions || [],
+      elements: [
+        ...(context?.interactiveElements || []),
+        ...(context?.scrollRegions || []),
+        ...(context?.visualSurfaces || [])
+      ].map(summarizeTargetForPrecondition)
     });
   }
 
@@ -296,6 +317,7 @@
   function isApprovalSensitiveAction(action, target) {
     return Boolean(
       action?.type === "submit"
+      || action?.type === "visual_click"
       || action?.type === "navigate"
       || action?.type === "tab_open"
       || isSubmitLikeClick(action, target)

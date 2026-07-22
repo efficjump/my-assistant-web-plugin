@@ -12,7 +12,8 @@ const assistantPageState = {
   scopes: [],
   observedRoots: new WeakSet(),
   mutationObservers: [],
-  visualOccluderCache: new WeakMap()
+  visualOccluderCache: new WeakMap(),
+  includeChildFrames: true
 };
 
 const INTERACTIVE_ROLES = new Set([
@@ -77,7 +78,8 @@ async function handleContentMessage(message) {
 function collectPageContext(options) {
   assistantPageState.elementsByRef.clear();
   assistantPageState.visualOccluderCache = new WeakMap();
-  assistantPageState.scopes = collectDomScopes();
+  assistantPageState.includeChildFrames = options.includeChildFrames !== false;
+  assistantPageState.scopes = collectDomScopes(assistantPageState.includeChildFrames);
   observeDomScopes(assistantPageState.scopes);
 
   const maxTextChars = clampNumber(options.maxTextChars, 4000, 50000, 16000);
@@ -85,6 +87,10 @@ function collectPageContext(options) {
   const redactSensitiveData = options.redactSensitiveData !== false;
   const interactiveElementCollection = collectInteractiveElements(maxElements, redactSensitiveData);
   const interactiveElements = interactiveElementCollection.elements;
+  const scrollRegions = collectScrollRegions(Math.max(6, Math.min(24, Math.ceil(maxElements / 4))), redactSensitiveData);
+  const visualSurfaces = collectVisualSurfaces(Math.max(4, Math.min(16, Math.ceil(maxElements / 5))), redactSensitiveData);
+  const frameBoundaries = collectFrameBoundaries(36, redactSensitiveData);
+  const iframes = collectIframes(frameBoundaries, 12);
   const collectedVisibleText = collectVisibleText(maxTextChars);
   const visibleText = redactSensitiveData
     ? redactSensitiveText(collectedVisibleText)
@@ -110,14 +116,15 @@ function collectPageContext(options) {
     documentTextExcerpt: visibleText,
     observationScope: {
       kind: "visual-viewport",
-      includes: ["painted text", "visually exposed controls"],
+      includes: ["painted text", "visually exposed controls", "visible scroll regions", "visible visual surfaces"],
       excludes: ["offscreen content", "clipped content", "occluded content", "hidden DOM"]
     },
     headings: collectHeadings(24, redactSensitiveData),
     landmarks: collectLandmarks(24, redactSensitiveData),
     forms: collectForms(12, redactSensitiveData),
     tables: collectTables(10, redactSensitiveData),
-    iframes: collectIframes(12, redactSensitiveData),
+    iframes,
+    frameBoundaries,
     liveRegions: collectLiveRegions(20, redactSensitiveData),
     domScopes: assistantPageState.scopes.map((scope) => ({
       id: scope.id,
@@ -126,7 +133,14 @@ function collectPageContext(options) {
       sameOrigin: scope.sameOrigin !== false
     })),
     interactiveElementStats: interactiveElementCollection.stats,
-    interactiveElements
+    interactiveElements,
+    scrollRegions,
+    visualSurfaces,
+    automationCapabilities: buildLocalAutomationCapabilities({
+      scrollRegions,
+      visualSurfaces,
+      iframes
+    })
   };
 }
 
@@ -140,7 +154,7 @@ function createDocumentId() {
   return `document-${entropy}`;
 }
 
-function collectDomScopes() {
+function collectDomScopes(includeChildFrames = true) {
   const scopes = [];
   const seenRoots = new Set();
 
@@ -170,7 +184,7 @@ function collectDomScopes() {
           parentId: scope.id
         });
       }
-      if (element.tagName?.toLowerCase() === "iframe") {
+      if (includeChildFrames && element.tagName?.toLowerCase() === "iframe") {
         frameIndex += 1;
         try {
           const frameDocument = element.contentDocument;
@@ -194,7 +208,9 @@ function collectDomScopes() {
 }
 
 function getDomScopes() {
-  return assistantPageState.scopes.length ? assistantPageState.scopes : collectDomScopes();
+  return assistantPageState.scopes.length
+    ? assistantPageState.scopes
+    : collectDomScopes(assistantPageState.includeChildFrames);
 }
 
 function queryAllDom(selector) {
@@ -333,7 +349,7 @@ function compareInteractiveCandidatesByVisualPosition(left, right) {
 
 function isPotentiallyInteractive(element) {
   const tag = element.tagName?.toLowerCase() || "";
-  if (!tag || ["html", "body"].includes(tag) || shouldSkipElement(element)) {
+  if (!tag || ["html", "body"].includes(tag) || shouldSkipElement(element) || isVisualSurfaceElement(element)) {
     return false;
   }
 
@@ -492,6 +508,134 @@ function describeInteractiveElement(element, ref, options = {}) {
   });
 }
 
+function collectScrollRegions(limit, redactSensitiveData) {
+  const candidates = queryAllDom("*")
+    .filter((element) => isScrollableRegion(element) && isElementVisuallyExposed(element))
+    .map((element, discoveryIndex) => ({
+      element,
+      discoveryIndex,
+      rect: getGlobalRect(element),
+      scope: findScopeForElement(element)
+    }))
+    .sort(compareInteractiveCandidatesByVisualPosition)
+    .slice(0, limit);
+
+  return candidates.map(({ element, rect, scope }, index) => {
+    const ref = `s${index + 1}`;
+    const labelSource = getAccessibleName(element)
+      || collectVisibleTextWithin(element, 180)
+      || element.getAttribute("role")
+      || element.tagName.toLowerCase();
+    const label = redactSensitiveData ? redactSensitiveText(labelSource) : labelSource;
+    const region = removeEmptyValues({
+      ref,
+      scope: scope?.id || "top",
+      tag: element.tagName.toLowerCase(),
+      role: element.getAttribute("role") || "region",
+      label: truncate(label, 180),
+      selector: buildCssSelector(element),
+      actionability: "scrollable",
+      scrollTop: Math.round(element.scrollTop),
+      scrollLeft: Math.round(element.scrollLeft),
+      maxScrollTop: Math.max(0, Math.round(element.scrollHeight - element.clientHeight)),
+      maxScrollLeft: Math.max(0, Math.round(element.scrollWidth - element.clientWidth)),
+      rect: rectToJson(rect)
+    });
+    assistantPageState.elementsByRef.set(ref, {
+      element,
+      selector: region.selector,
+      label: region.label
+    });
+    return region;
+  });
+}
+
+function isScrollableRegion(element) {
+  const tag = element.tagName?.toLowerCase() || "";
+  if (!tag || ["html", "body"].includes(tag) || shouldSkipElement(element)) {
+    return false;
+  }
+  const ownerWindow = element.ownerDocument?.defaultView || window;
+  const style = ownerWindow.getComputedStyle(element);
+  const scrollableY = element.scrollHeight > element.clientHeight + 2
+    && ["auto", "scroll", "overlay"].includes(String(style.overflowY || "").toLowerCase());
+  const scrollableX = element.scrollWidth > element.clientWidth + 2
+    && ["auto", "scroll", "overlay"].includes(String(style.overflowX || "").toLowerCase());
+  return scrollableY || scrollableX;
+}
+
+function collectVisualSurfaces(limit, redactSensitiveData) {
+  const candidates = queryAllDom("canvas,[role='application']")
+    .filter((element) => isElementVisuallyExposed(element))
+    .map((element, discoveryIndex) => ({
+      element,
+      discoveryIndex,
+      rect: getGlobalRect(element),
+      scope: findScopeForElement(element)
+    }))
+    .sort(compareInteractiveCandidatesByVisualPosition)
+    .slice(0, limit);
+
+  return candidates.map(({ element, rect, scope }, index) => {
+    const ref = `v${index + 1}`;
+    const tag = element.tagName.toLowerCase();
+    const labelSource = getAccessibleName(element)
+      || element.getAttribute("title")
+      || `${tag} visual surface`;
+    const label = redactSensitiveData ? redactSensitiveText(labelSource) : labelSource;
+    const surface = removeEmptyValues({
+      ref,
+      scope: scope?.id || "top",
+      kind: tag === "canvas" ? "canvas" : "application",
+      tag,
+      role: element.getAttribute("role") || (tag === "canvas" ? "img" : "application"),
+      label: truncate(label, 180),
+      selector: buildCssSelector(element),
+      actionability: "visual-coordinate-only",
+      rect: rectToJson(rect)
+    });
+    assistantPageState.elementsByRef.set(ref, {
+      element,
+      selector: surface.selector,
+      label: surface.label
+    });
+    return surface;
+  });
+}
+
+function buildLocalAutomationCapabilities({ scrollRegions, visualSurfaces, iframes }) {
+  const gaps = [];
+  const inaccessibleFrames = (iframes || [])
+    .filter((frame) => frame.contentAccess !== "same-origin")
+    .map((frame) => ({
+      code: "frame_access_required",
+      title: frame.title || "Embedded frame",
+      src: frame.src || ""
+    }));
+  if (inaccessibleFrames.length) {
+    gaps.push({
+      code: "frame_access_required",
+      count: inaccessibleFrames.length,
+      frames: inaccessibleFrames,
+      next: "Grant the embedded frame origins and re-observe before claiming or controlling their contents."
+    });
+  }
+  if ((visualSurfaces || []).length) {
+    gaps.push({
+      code: "visual_surface",
+      count: visualSurfaces.length,
+      refs: visualSurfaces.map((surface) => surface.ref),
+      next: "Use screenshot-grounded visual targeting only when no DOM control represents the visible target."
+    });
+  }
+  return {
+    mode: "dom",
+    scrollRegionCount: (scrollRegions || []).length,
+    visualSurfaceCount: (visualSurfaces || []).length,
+    gaps
+  };
+}
+
 function readFormAction(element) {
   const form = isDomInstance(element, "HTMLFormElement") ? element : element.form || element.closest?.("form");
   if (!form) {
@@ -628,16 +772,67 @@ function collectTables(limit, redactSensitiveData) {
     });
 }
 
-function collectIframes(limit, redactSensitiveData) {
+function collectFrameBoundaries(limit, redactSensitiveData) {
   return queryAllDom("iframe")
-    .filter((iframe) => isElementVisuallyExposed(iframe))
     .slice(0, limit)
-    .map((iframe) => ({
-      title: redactContextText(iframe.title || iframe.getAttribute("aria-label") || "", 260, redactSensitiveData),
-      src: truncate(sanitizeUrlForContext(iframe.src || "", redactSensitiveData), 220),
-      contentAccess: getIframeContentAccess(iframe),
-      rect: rectToJson(getGlobalRect(iframe))
+    .map((iframe, index) => {
+      const visuallyExposed = isElementVisuallyExposed(iframe);
+      const rect = getGlobalRect(iframe);
+      const scaleX = iframe.offsetWidth ? rect.width / iframe.offsetWidth : 1;
+      const scaleY = iframe.offsetHeight ? rect.height / iframe.offsetHeight : 1;
+      const declaredSource = iframe.getAttribute("src")
+        || (iframe.hasAttribute("srcdoc") ? "about:srcdoc" : iframe.src || "about:blank");
+      return removeEmptyValues({
+        id: `frame-boundary-${index + 1}`,
+        src: truncate(sanitizeFrameBoundaryUrl(declaredSource, redactSensitiveData), 220),
+        visuallyExposed,
+        fullyExposed: visuallyExposed && isElementFullyExposed(iframe),
+        contentAccess: getIframeContentAccess(iframe),
+        title: visuallyExposed
+          ? redactContextText(iframe.title || iframe.getAttribute("aria-label") || "", 260, redactSensitiveData)
+          : undefined,
+        rect: visuallyExposed ? rectToJson(rect) : undefined,
+        contentRect: visuallyExposed
+          ? {
+              x: Math.round(rect.left + iframe.clientLeft * scaleX),
+              y: Math.round(rect.top + iframe.clientTop * scaleY),
+              width: Math.round(iframe.clientWidth * scaleX),
+              height: Math.round(iframe.clientHeight * scaleY)
+            }
+          : undefined,
+        childViewport: visuallyExposed
+          ? {
+              width: Math.round(iframe.clientWidth),
+              height: Math.round(iframe.clientHeight)
+            }
+          : undefined
+      });
+    });
+}
+
+function collectIframes(frameBoundaries, limit) {
+  return (frameBoundaries || [])
+    .filter((frame) => frame.visuallyExposed)
+    .slice(0, limit)
+    .map((frame) => removeEmptyValues({
+      title: frame.title,
+      src: frame.src,
+      contentAccess: frame.contentAccess,
+      rect: frame.rect
     }));
+}
+
+function sanitizeFrameBoundaryUrl(value, redactSensitiveData) {
+  const sanitized = sanitizeUrlForContext(value, redactSensitiveData);
+  try {
+    const url = new URL(sanitized, location.href);
+    if (["http:", "https:", "about:"].includes(url.protocol)) {
+      return url.toString();
+    }
+    return url.protocol;
+  } catch {
+    return String(sanitized || "").split(/[?#]/u)[0];
+  }
 }
 
 function getIframeContentAccess(iframe) {
@@ -646,6 +841,41 @@ function getIframeContentAccess(iframe) {
   } catch {
     return "metadata-only";
   }
+}
+
+function isElementFullyExposed(element) {
+  if (!isElementBoxRendered(element)) {
+    return false;
+  }
+  const rect = element.getBoundingClientRect();
+  const visibleRect = clipLocalRectForElement(element, rect);
+  if (
+    !visibleRect
+    || Math.abs(visibleRect.left - rect.left) > 1
+    || Math.abs(visibleRect.top - rect.top) > 1
+    || Math.abs(visibleRect.right - rect.right) > 1
+    || Math.abs(visibleRect.bottom - rect.bottom) > 1
+  ) {
+    return false;
+  }
+
+  const columns = Math.max(2, Math.min(64, Math.ceil(rect.width / 12)));
+  const rows = Math.max(2, Math.min(64, Math.ceil(rect.height / 12)));
+  for (let row = 0; row < rows; row += 1) {
+    for (let column = 0; column < columns; column += 1) {
+      const x = rect.left + rect.width * (column + 0.5) / columns;
+      const y = rect.top + rect.height * (row + 0.5) / rows;
+      const hitTarget = hitTestForElement(element, x, y);
+      if (
+        !hitTarget
+        || !(hitTarget === element || element.contains(hitTarget))
+        || hasPointerTransparentOccluder(element, x, y)
+      ) {
+        return false;
+      }
+    }
+  }
+  return true;
 }
 
 function collectPageState(redactSensitiveData) {
@@ -776,7 +1006,9 @@ async function executePageActions(actions) {
         index,
         ok: false,
         action: normalized,
-        error: error.message || String(error)
+        error: error.message || String(error),
+        code: error.code || "action_failed",
+        details: error.details && typeof error.details === "object" ? error.details : null
       });
       break;
     }
@@ -797,7 +1029,14 @@ async function undoPageActions(undoActions) {
       const result = await executeSingleUndo(undo);
       results.push({ index, ok: true, type: undo.type, result });
     } catch (error) {
-      results.push({ index, ok: false, type: undo?.type || "undo", error: error.message || String(error) });
+      results.push({
+        index,
+        ok: false,
+        type: undo?.type || "undo",
+        error: error.message || String(error),
+        code: error.code || "undo_failed",
+        details: error.details && typeof error.details === "object" ? error.details : null
+      });
       break;
     }
     await delay(180);
@@ -845,6 +1084,15 @@ function buildUndoForAction(action) {
   }
 
   if (action.type === "scroll") {
+    const target = action.ref || action.selector || action.text ? resolveElement(action) : null;
+    if (target && isScrollableRegion(target)) {
+      return {
+        type: "restoreElementScroll",
+        selector: buildCssSelector(target),
+        x: target.scrollLeft,
+        y: target.scrollTop
+      };
+    }
     return {
       type: "restoreScroll",
       x: window.scrollX,
@@ -867,6 +1115,18 @@ function executeSingleUndo(undo) {
   if (undo.type === "restoreScroll") {
     window.scrollTo({ left: Number(undo.x) || 0, top: Number(undo.y) || 0, behavior: "auto" });
     return { restoredScroll: true };
+  }
+
+  if (undo.type === "restoreElementScroll") {
+    const target = undo.selector ? deepQuerySelector(String(undo.selector)) : null;
+    if (!target || !isScrollableRegion(target)) {
+      throw createContentControlError(
+        "scroll_region_missing",
+        "The scroll region is no longer available for undo."
+      );
+    }
+    target.scrollTo({ left: Number(undo.x) || 0, top: Number(undo.y) || 0, behavior: "auto" });
+    return { restoredElementScroll: true };
   }
 
   if (undo.type === "historyBack") {
@@ -911,6 +1171,8 @@ async function executeSingleAction(action) {
   switch (action.type) {
     case "click":
       return clickElement(action);
+    case "visual_click":
+      return visualClickSurface(action);
     case "fill":
       return fillElement(action);
     case "select":
@@ -976,7 +1238,7 @@ async function waitForCondition(action) {
       }
     };
     const check = () => {
-      assistantPageState.scopes = collectDomScopes();
+      assistantPageState.scopes = collectDomScopes(assistantPageState.includeChildFrames);
       lastResult = evaluateWaitCondition(condition, { startedAt });
       if (lastResult.matched) {
         finish(null, {
@@ -1167,12 +1429,21 @@ function normalizeAction(action) {
 
 function clickElement(action) {
   const element = resolveElement(action);
+  if (isVisualSurfaceElement(element)) {
+    throw createContentControlError(
+      "visual_action_required",
+      "A canvas or application surface requires a screenshot-bound visual action."
+    );
+  }
   const mayNavigate = actionMayUnloadPage(element);
   prepareElementForAction(element);
   assistantPageState.visualOccluderCache = new WeakMap();
   const point = findExposedPoint(element);
   if (!point) {
-    throw new Error("Resolved target is not exposed to the user or is covered by another element. Re-observe the page before clicking.");
+    throw createContentControlError(
+      "target_not_exposed",
+      "Resolved target is not exposed to the user or is covered by another element. Re-observe the page before clicking."
+    );
   }
   dispatchPointerSequence(element, point, { activate: true });
   const activate = () => activateDeepestHitTarget(element, point);
@@ -1320,6 +1591,35 @@ function pressKey(action) {
 function scrollPage(action) {
   if (action.ref || action.selector || action.text) {
     const element = resolveElement(action);
+    if (isScrollableRegion(element)) {
+      const direction = String(action.direction || "down").toLowerCase();
+      const verticalAmount = clampNumber(
+        action.amount,
+        40,
+        Math.max(40, element.scrollHeight),
+        Math.max(40, Math.round(element.clientHeight * 0.75))
+      );
+      const horizontalAmount = clampNumber(
+        action.amount,
+        40,
+        Math.max(40, element.scrollWidth),
+        Math.max(40, Math.round(element.clientWidth * 0.75))
+      );
+      const vector = {
+        up: { top: -verticalAmount, left: 0 },
+        down: { top: verticalAmount, left: 0 },
+        left: { top: 0, left: -horizontalAmount },
+        right: { top: 0, left: horizontalAmount }
+      }[direction] || { top: verticalAmount, left: 0 };
+      element.scrollBy({ ...vector, behavior: "auto" });
+      return {
+        target: getAccessibleName(element) || element.tagName.toLowerCase(),
+        direction,
+        amount: direction === "left" || direction === "right" ? horizontalAmount : verticalAmount,
+        scrollTop: Math.round(element.scrollTop),
+        scrollLeft: Math.round(element.scrollLeft)
+      };
+    }
     element.scrollIntoView({
       block: String(action.block || "center"),
       inline: String(action.inline || "nearest"),
@@ -1338,6 +1638,122 @@ function scrollPage(action) {
 
   window.scrollBy({ ...vector, behavior: "auto" });
   return { direction, amount };
+}
+
+function visualClickSurface(action) {
+  const surface = resolveElement(action);
+  const tag = surface.tagName?.toLowerCase() || "";
+  if (!isVisualSurfaceElement(surface)) {
+    throw createContentControlError(
+      "visual_surface_changed",
+      "The referenced visual surface is no longer a canvas or application surface."
+    );
+  }
+  const xNormalized = Number(action.xNormalized);
+  const yNormalized = Number(action.yNormalized);
+  if (
+    !Number.isFinite(xNormalized)
+    || xNormalized < 0
+    || xNormalized > 1000
+    || !Number.isFinite(yNormalized)
+    || yNormalized < 0
+    || yNormalized > 1000
+  ) {
+    throw createContentControlError(
+      "visual_coordinate_invalid",
+      "Visual coordinates must be normalized numbers from 0 through 1000."
+    );
+  }
+  const visibleRect = clipLocalRectForElement(surface, surface.getBoundingClientRect());
+  if (!visibleRect) {
+    throw createContentControlError(
+      "visual_surface_not_exposed",
+      "The referenced visual surface is no longer exposed in the current viewport."
+    );
+  }
+  const localRect = surface.getBoundingClientRect();
+  const x = localRect.left + localRect.width * xNormalized / 1000;
+  const y = localRect.top + localRect.height * yNormalized / 1000;
+  if (
+    x < visibleRect.left
+    || x > visibleRect.right
+    || y < visibleRect.top
+    || y > visibleRect.bottom
+  ) {
+    throw createContentControlError(
+      "visual_coordinate_clipped",
+      "The proposed visual point is outside the exposed portion of its surface."
+    );
+  }
+  const root = surface.getRootNode?.() || surface.ownerDocument;
+  const hitTarget = typeof root.elementFromPoint === "function"
+    ? root.elementFromPoint(x, y)
+    : surface.ownerDocument?.elementFromPoint(x, y);
+  if (!hitTarget || !(hitTarget === surface || surface.contains(hitTarget))) {
+    throw createContentControlError(
+      "visual_target_occluded",
+      "Another element now covers the proposed visual point. Re-observe the page before acting."
+    );
+  }
+  if (hitTarget !== surface && findInteractiveAncestorWithin(hitTarget, surface)) {
+    throw createContentControlError(
+      "visual_dom_target_available",
+      "The proposed point resolves to a normal DOM control. Re-observe and use its element ref instead."
+    );
+  }
+  if (
+    ("disabled" in hitTarget && hitTarget.disabled)
+    || hitTarget.getAttribute?.("aria-disabled") === "true"
+  ) {
+    throw createContentControlError("visual_target_disabled", "The visual target is disabled.");
+  }
+
+  const point = {
+    x,
+    y,
+    globalX: x,
+    globalY: y,
+    hitTarget
+  };
+  dispatchPointerSequence(surface, point, { activate: true });
+  const ownerWindow = hitTarget.ownerDocument?.defaultView || window;
+  hitTarget.dispatchEvent(new ownerWindow.MouseEvent("click", {
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+    clientX: x,
+    clientY: y,
+    screenX: x,
+    screenY: y,
+    button: 0,
+    buttons: 0,
+    view: ownerWindow
+  }));
+  return {
+    clicked: String(action.targetDescription || getAccessibleName(surface) || tag),
+    surface: getAccessibleName(surface) || tag,
+    point: { x: Math.round(x), y: Math.round(y) },
+    normalizedPoint: { x: xNormalized, y: yNormalized },
+    inputSequence: "visual-pointer-mouse-click"
+  };
+}
+
+function isVisualSurfaceElement(element) {
+  return Boolean(
+    element?.tagName?.toLowerCase() === "canvas"
+    || element?.getAttribute?.("role") === "application"
+  );
+}
+
+function findInteractiveAncestorWithin(element, boundary) {
+  let current = element;
+  while (current && current !== boundary) {
+    if (hasStrongInteractionSignal(current)) {
+      return current;
+    }
+    current = getLocalComposedParentElement(current);
+  }
+  return null;
 }
 
 function navigatePage(action) {
@@ -1387,7 +1803,11 @@ function resolveElement(action) {
     }
   }
 
-  throw new Error(`Element not found for action: ${action.ref || action.selector || action.text || action.type}`);
+  throw createContentControlError(
+    "element_not_found",
+    `Element not found for action: ${action.ref || action.selector || action.text || action.type}`,
+    { ref: action.ref || "", selector: action.selector || "", text: action.text || "" }
+  );
 }
 
 function prepareElementForAction(element) {
@@ -1579,7 +1999,7 @@ function observePageMutations() {
     if (!document.documentElement) {
       return;
     }
-    assistantPageState.scopes = collectDomScopes();
+    assistantPageState.scopes = collectDomScopes(assistantPageState.includeChildFrames);
     observeDomScopes(assistantPageState.scopes);
   };
   if (document.documentElement) {
@@ -2505,7 +2925,17 @@ function delay(ms) {
 function serializeContentError(error) {
   return {
     name: error?.name || "Error",
-    message: error?.message || String(error)
+    message: error?.message || String(error),
+    code: error?.code || "",
+    details: error?.details && typeof error.details === "object" ? error.details : null
   };
+}
+
+function createContentControlError(code, message, details = null) {
+  const error = new Error(message);
+  error.name = "WebControlError";
+  error.code = String(code || "control_error");
+  error.details = details && typeof details === "object" ? details : null;
+  return error;
 }
 })();

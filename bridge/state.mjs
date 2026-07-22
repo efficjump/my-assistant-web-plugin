@@ -82,6 +82,11 @@ function validateState(state) {
     state.brokerId.length > 0 &&
     typeof state.mcpToken === "string" &&
     state.mcpToken.length >= 32 &&
+    (
+      state.preferredPort === undefined ||
+      state.preferredPort === null ||
+      (Number.isInteger(state.preferredPort) && state.preferredPort >= 1 && state.preferredPort <= 65535)
+    ) &&
     Array.isArray(state.extensionCredentials) &&
     state.extensionCredentials.every(validateCredential)
   );
@@ -93,6 +98,7 @@ function createInitialState() {
     version: STATE_VERSION,
     brokerId: randomUUID(),
     mcpToken: randomSecret(),
+    preferredPort: null,
     extensionCredentials: [],
     createdAt: now,
     updatedAt: now,
