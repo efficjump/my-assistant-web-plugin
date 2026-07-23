@@ -835,6 +835,64 @@ test("a state-changing proposal waits for trusted approval and re-observes befor
   assert.match(closed.next, /final answer now/i);
 });
 
+test("a policy outage allows deterministic disclosure but still gates a consequential click", async () => {
+  const unavailablePolicy = async () => {
+    throw new Error("policy endpoint unavailable");
+  };
+  const disclosureContext = pageContext({
+    element: {
+      tag: "button",
+      role: "button",
+      type: "button",
+      label: "More actions",
+      ariaHasPopup: "menu",
+      ariaExpanded: "false",
+      formAction: "",
+      formMethod: ""
+    }
+  });
+  const disclosureDriver = new FakeDriver({ observations: [disclosureContext] });
+  const disclosureRuntime = await createRuntime({
+    driver: disclosureDriver,
+    evaluatePolicy: unavailablePolicy
+  });
+  const disclosureSession = await armAndStart(disclosureRuntime.runtime);
+  const disclosureObservation = await observe(
+    disclosureRuntime.runtime,
+    disclosureSession.session_id
+  );
+  const disclosureOperation = await disclosureRuntime.runtime.dispatch(
+    "browser_execute",
+    executionArgs(disclosureSession.session_id, disclosureObservation.observation_id)
+  );
+
+  assert.equal(disclosureOperation.status, "completed");
+  assert.equal(disclosureOperation.policy.verdict, "allow");
+  assert.equal(disclosureDriver.pageExecutions.length, 1);
+
+  const destructiveDriver = new FakeDriver({ observations: [pageContext()] });
+  const destructiveRuntime = await createRuntime({
+    driver: destructiveDriver,
+    evaluatePolicy: unavailablePolicy
+  });
+  const destructiveSession = await armAndStart(destructiveRuntime.runtime);
+  const destructiveObservation = await observe(
+    destructiveRuntime.runtime,
+    destructiveSession.session_id
+  );
+  const destructiveOperation = await destructiveRuntime.runtime.dispatch(
+    "browser_execute",
+    executionArgs(destructiveSession.session_id, destructiveObservation.observation_id)
+  );
+
+  assert.equal(destructiveOperation.status, "waiting_approval");
+  assert.equal(destructiveOperation.policy.verdict, "allow");
+  assert.ok(destructiveOperation.safety.approvalReasons.some(
+    (reason) => reason.includes("state-changing")
+  ));
+  assert.equal(destructiveDriver.pageExecutions.length, 0);
+});
+
 test("a changed target makes an approved operation stale without executing it", async () => {
   const driver = new FakeDriver({
     observations: [

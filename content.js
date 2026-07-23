@@ -850,6 +850,10 @@ function describeInteractiveElement(element, ref, options = {}) {
     checked: "checked" in element ? Boolean(element.checked) : undefined,
     disabled: "disabled" in element ? Boolean(element.disabled) : undefined,
     ariaDisabled: element.getAttribute("aria-disabled") === "true" || undefined,
+    ariaHasPopup: element.getAttribute("aria-haspopup") || undefined,
+    ariaExpanded: element.hasAttribute("aria-expanded")
+      ? element.getAttribute("aria-expanded")
+      : undefined,
     actionability: ("disabled" in element && element.disabled) || element.getAttribute("aria-disabled") === "true"
       ? "disabled"
       : "interactive",

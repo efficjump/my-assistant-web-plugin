@@ -189,6 +189,8 @@
       formMethod: stringValue(target.formMethod).toLowerCase(),
       disabled: Boolean(target.disabled),
       ariaDisabled: Boolean(target.ariaDisabled),
+      ariaHasPopup: stringValue(target.ariaHasPopup),
+      ariaExpanded: stringValue(target.ariaExpanded),
       actionability: stringValue(target.actionability),
       readOnly: Boolean(target.readOnly),
       contentEditable: Boolean(target.contentEditable),
@@ -327,10 +329,13 @@
   }
 
   function semanticEffectKey(action, context, options = {}) {
-    if (!action || !actionChangesState(action)) {
+    if (!action) {
       return "";
     }
     const target = findActionTarget(action, context);
+    if (!actionChangesState(action, target, context)) {
+      return "";
+    }
     const semanticContext = stringValue(target?.searchMatch?.contextSnippet);
     const semanticLabel = stringValue(
       target?.label
@@ -420,20 +425,57 @@
       && (!target.type || target.type === "submit");
   }
 
-  function isApprovalSensitiveAction(action, target) {
+  function isDisclosureClick(action, target) {
+    if (action?.type !== "click" || !target || target.href || target.formAction) {
+      return false;
+    }
+    const popup = stringValue(target.ariaHasPopup).trim().toLowerCase();
+    const hasExpandedState = Object.hasOwn(target, "ariaExpanded")
+      && stringValue(target.ariaExpanded).trim() !== "";
+    return Boolean((popup && popup !== "false") || hasExpandedState);
+  }
+
+  function isSameOriginNavigationClick(action, target, context) {
+    if (action?.type !== "click" || !target?.href || !context?.url) {
+      return false;
+    }
+    try {
+      const source = new URL(context.url);
+      const destination = new URL(target.href, source);
+      return ["http:", "https:"].includes(source.protocol)
+        && ["http:", "https:"].includes(destination.protocol)
+        && source.origin === destination.origin;
+    } catch {
+      return false;
+    }
+  }
+
+  function isLowRiskUiAction(action, target, context) {
+    return isDisclosureClick(action, target)
+      || isSameOriginNavigationClick(action, target, context);
+  }
+
+  function isApprovalSensitiveAction(action, target, context) {
+    if (isLowRiskUiAction(action, target, context)) {
+      return false;
+    }
     return Boolean(
       action?.type === "submit"
       || action?.type === "visual_click"
       || action?.type === "navigate"
       || action?.type === "tab_open"
       || isSubmitLikeClick(action, target)
+      || action?.type === "click"
       || target?.href
       || (target?.formAction && String(target.formMethod || "get").toLowerCase() !== "get")
     );
   }
 
-  function actionChangesState(action) {
-    return !READ_ONLY_ACTION_TYPES.has(action?.type);
+  function actionChangesState(action, target, context) {
+    if (READ_ONLY_ACTION_TYPES.has(action?.type)) {
+      return false;
+    }
+    return !isLowRiskUiAction(action, target, context);
   }
 
   function assessActionSafety(input, positionalContext, positionalSettings) {
@@ -478,9 +520,9 @@
       if (settings.stopOnSensitiveInput !== false && action.type === "fill" && isSensitiveTarget(target)) {
         blockedReasons.push(`Sensitive input is blocked for ${target?.label || action.ref || action.selector || action.id}.`);
       }
-      if (settings.bridgeRequireApproval !== false && actionChangesState(action)) {
+      if (settings.bridgeRequireApproval !== false && actionChangesState(action, target, context)) {
         approvalReasons.push(`External state-changing action requires approval: ${action.type}.`);
-      } else if (isApprovalSensitiveAction(action, target)) {
+      } else if (isApprovalSensitiveAction(action, target, context)) {
         approvalReasons.push(`Consequential action requires approval: ${action.type}.`);
       }
     }

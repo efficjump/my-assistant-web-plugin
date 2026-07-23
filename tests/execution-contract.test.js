@@ -56,6 +56,8 @@ test("preconditions bind execution to the complete observed target fingerprint",
     sensitive: { sensitive: true },
     formAction: { formAction: "https://example.test/delete-account" },
     formMethod: { formMethod: "get" },
+    ariaHasPopup: { ariaHasPopup: "menu" },
+    ariaExpanded: { ariaExpanded: "false" },
     readOnly: { readOnly: true },
     value: { value: "changed-by-page@example.test" },
     options: {
@@ -249,4 +251,89 @@ test("bridge defaults require user approval for a state-changing action", () => 
   assert.equal(assessment.blocked, false);
   assert.equal(assessment.requiresApproval, true);
   assert.ok(assessment.reasons.length > 0);
+});
+
+test("bridge allows deterministic disclosure and same-origin navigation clicks without weakening destructive clicks", () => {
+  const disclosureContext = observedContext({
+    tag: "button",
+    role: "button",
+    type: "button",
+    formAction: "",
+    formMethod: "",
+    ariaHasPopup: "menu",
+    ariaExpanded: "false"
+  });
+  const disclosure = Contract.assessActionSafety({
+    actions: [{ type: "click", ref: "e1", reason: "Open the actions menu" }],
+    context: disclosureContext,
+    settings: { bridgeRequireApproval: true }
+  });
+  assert.equal(disclosure.requiresApproval, false);
+  assert.equal(
+    Contract.semanticEffectKey({ type: "click", ref: "e1" }, disclosureContext),
+    ""
+  );
+
+  const formDisclosureContext = observedContext({
+    tag: "button",
+    role: "button",
+    type: "submit",
+    ariaHasPopup: "menu",
+    ariaExpanded: "false",
+    formAction: "https://example.test/account/update",
+    formMethod: "post"
+  });
+  const formDisclosure = Contract.assessActionSafety({
+    actions: [{ type: "click", ref: "e1", reason: "Submit a form-backed disclosure control" }],
+    context: formDisclosureContext,
+    settings: { bridgeRequireApproval: false }
+  });
+  assert.equal(formDisclosure.requiresApproval, true);
+
+  const sameOriginContext = observedContext({
+    tag: "a",
+    role: "menuitem",
+    type: "",
+    href: "https://example.test/account/settings",
+    formAction: "",
+    formMethod: ""
+  });
+  const sameOriginNavigation = Contract.assessActionSafety({
+    actions: [{ type: "click", ref: "e1", reason: "Open settings" }],
+    context: sameOriginContext,
+    settings: { bridgeRequireApproval: true }
+  });
+  assert.equal(sameOriginNavigation.requiresApproval, false);
+
+  const crossOriginContext = observedContext({
+    tag: "a",
+    role: "link",
+    type: "",
+    href: "https://other.example/settings",
+    ariaHasPopup: "menu",
+    ariaExpanded: "false",
+    formAction: "",
+    formMethod: ""
+  });
+  const crossOriginNavigation = Contract.assessActionSafety({
+    actions: [{ type: "click", ref: "e1", reason: "Open another origin" }],
+    context: crossOriginContext,
+    settings: { bridgeRequireApproval: true }
+  });
+  assert.equal(crossOriginNavigation.requiresApproval, true);
+
+  const destructiveContext = observedContext({
+    tag: "button",
+    role: "button",
+    type: "button",
+    label: "Delete",
+    formAction: "",
+    formMethod: ""
+  });
+  const destructive = Contract.assessActionSafety({
+    actions: [{ type: "click", ref: "e1", reason: "Delete the resource" }],
+    context: destructiveContext,
+    settings: { bridgeRequireApproval: false }
+  });
+  assert.equal(destructive.requiresApproval, true);
 });

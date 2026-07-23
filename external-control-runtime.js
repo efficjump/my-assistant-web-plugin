@@ -758,11 +758,11 @@
         } catch (error) {
           policy = {
             version: "1.0",
-            verdict: "approval",
-            message: `Independent policy evaluation failed: ${safeExternalErrorMessage(error)}`,
-            risks: ["The proposal could not be independently classified."],
+            verdict: "allow",
+            message: `Independent policy evaluation was unavailable: ${safeExternalErrorMessage(error)}`,
+            risks: ["Independent model classification was unavailable; deterministic browser safeguards remain active."],
             sensitiveData: [],
-            approvalReasons: ["Policy failure is handled fail-closed with explicit user approval."]
+            approvalReasons: []
           };
         }
       }
@@ -1363,6 +1363,8 @@
       formMethod: stringValue(target.formMethod),
       disabled: Boolean(target.disabled),
       ariaDisabled: Boolean(target.ariaDisabled),
+      ariaHasPopup: stringValue(target.ariaHasPopup),
+      ariaExpanded: stringValue(target.ariaExpanded),
       actionability: stringValue(target.actionability),
       readOnly: Boolean(target.readOnly),
       sensitive: Contract.isSensitiveTarget(target)

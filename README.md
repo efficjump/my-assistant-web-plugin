@@ -4,7 +4,7 @@ A Manifest V3 browser extension that turns a configured language model into a bo
 
 ![Agent side panel](docs/assets/agent-panel.png)
 
-Version `0.9.3` with Bridge protocol `2.3` targets Chromium-based browsers version 116 or later. This repository contains a source-loaded development build rather than a store package. The screenshots in this README were regenerated from the current version with a temporary browser profile and local fixtures.
+Version `0.9.4` with Bridge protocol `2.3` targets Chromium-based browsers version 116 or later. This repository contains a source-loaded development build rather than a store package. The screenshots in this README were regenerated from the current version with a temporary browser profile and local fixtures.
 
 ## Choose the workflow
 
@@ -342,6 +342,8 @@ This command is for public, disposable compatibility testing only. Its temporary
 ### Approval behavior
 
 Approval of an MCP tool call in the development tool and approval of a browser effect in the extension are separate layers. The former cannot bypass extension policy.
+
+If the independent policy model is unavailable, the Bridge still distinguishes structural, non-consequential UI movement from effects that can change external state. A disclosure control identified by current `aria-haspopup` or `aria-expanded` state can proceed when it has no link or form action; a normal HTTP(S) link can proceed when it stays on the observed origin. Unknown button clicks, submissions, cross-origin navigation, visual clicks, and other consequential effects continue to require extension approval. Popup metadata never bypasses link or form safety checks. This lets an agent open an action menu and its same-origin settings page without weakening the approval gate around the eventual delete, publish, or submit control.
 
 When an operation waits for approval:
 
