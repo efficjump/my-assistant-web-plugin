@@ -22,21 +22,25 @@ test("bridge publishes the guided browser MCP tool surface by default", () => {
     "browser_act",
     "browser_begin",
     "browser_continue",
+    "browser_elements",
     "browser_end",
-    "browser_screenshot"
+    "browser_screenshot",
+    "browser_visual_act"
   ]);
 });
 
 test("bridge retains the identifier-based tool surface as an advanced option", () => {
   const names = getAdvancedTools().map((tool) => tool.name).sort();
   assert.deepEqual(names, [
+    "browser_elements",
     "browser_execute",
     "browser_observe",
     "browser_operation_get",
     "browser_screenshot",
     "browser_session_close",
     "browser_session_start",
-    "browser_status"
+    "browser_status",
+    "browser_visual_act"
   ]);
   assert.equal(
     Protocol.validateToolArguments("browser_screenshot", { session_id: "session-1" }, { advanced: false }).valid,
@@ -53,7 +57,32 @@ test("bridge instructions keep multi-step clients working until the session is c
   assert.match(Protocol.instructions, /identifiers are managed internally/i);
   assert.match(Protocol.instructions, /browser_end before the final answer/i);
   assert.match(Protocol.instructions, /never submit a duplicate proposal/i);
+  assert.match(Protocol.instructions, /element-count limit is never by itself a blocker/i);
+  assert.match(Protocol.instructions, /browser_visual_act/i);
   assert.match(Protocol.getInstructions({ advanced: true }), /browser_session_start/i);
+});
+
+test("bridge exposes observation paging and refresh without accepting visual coordinates", () => {
+  const guidedElements = getTools().find((tool) => tool.name === "browser_elements");
+  const advancedElements = getAdvancedTools().find((tool) => tool.name === "browser_elements");
+  const continueTool = getTools().find((tool) => tool.name === "browser_continue");
+  const visualTool = getTools().find((tool) => tool.name === "browser_visual_act");
+
+  assert.ok(guidedElements.inputSchema.properties.cursor);
+  assert.ok(guidedElements.inputSchema.properties.query);
+  assert.ok(advancedElements.inputSchema.required.includes("session_id"));
+  assert.equal(continueTool.inputSchema.properties.refresh.type, "boolean");
+  assert.deepEqual(visualTool.inputSchema.required, ["surface_ref", "target_description"]);
+  assert.equal(Object.hasOwn(visualTool.inputSchema.properties, "xNormalized"), false);
+  assert.equal(Object.hasOwn(visualTool.inputSchema.properties, "yNormalized"), false);
+  assert.equal(
+    Protocol.validateToolArguments("browser_continue", { refresh: true }, { advanced: false }).valid,
+    true
+  );
+  assert.equal(
+    Protocol.validateToolArguments("browser_elements", { cursor: "cursor-1" }, { advanced: false }).valid,
+    true
+  );
 });
 
 test("browser_act derives its action fields from the canonical decision schema", () => {

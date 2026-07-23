@@ -10,9 +10,10 @@
   }
 
   const DEFAULT_STORAGE_KEY = "externalControlRuntimeV1";
-  const PAGE_ACTION_TYPES = new Set(
-    Contract.EXTERNAL_ACTION_TYPES.filter((type) => type !== "tab_open")
-  );
+  const PAGE_ACTION_TYPES = new Set([
+    ...Contract.EXTERNAL_ACTION_TYPES.filter((type) => type !== "tab_open"),
+    "visual_click"
+  ]);
 
   class ExternalControlRuntime {
     constructor(options = {}) {
@@ -184,8 +185,12 @@
             return this.#guidedBegin(args, client);
           case "browser_act":
             return this.#guidedAct(args, client);
+          case "browser_elements":
+            return Object.hasOwn(args, "session_id")
+              ? this.#discoverElements(args)
+              : this.#guidedElements(args, client);
           case "browser_continue":
-            return this.#guidedContinue(client);
+            return this.#guidedContinue(client, { refresh: Boolean(args.refresh) });
           case "browser_end":
             return this.#guidedEnd(client);
           case "browser_status":
@@ -198,6 +203,10 @@
             return Object.hasOwn(args, "session_id")
               ? this.#screenshot(args)
               : this.#guidedScreenshot(client);
+          case "browser_visual_act":
+            return Object.hasOwn(args, "session_id")
+              ? this.#visualAct(args)
+              : this.#guidedVisualAct(args, client);
           case "browser_execute":
             return this.#proposeExecution(args);
           case "browser_operation_get":
@@ -250,6 +259,45 @@
       return this.#guidedOperationResponse(this.#requireOperation(operation.operation_id));
     }
 
+    async #guidedElements(args, client) {
+      const session = this.#findGuidedSession(client);
+      const request = this.#resolveElementDiscoveryRequest(session, args);
+      const observation = await this.#observeSession(session, request);
+      return this.#guidedReadyResponse(session, observation, {
+        discovery: true
+      });
+    }
+
+    async #discoverElements(args) {
+      const session = this.#requireSession(args.session_id);
+      const request = this.#resolveElementDiscoveryRequest(session, args);
+      return this.#observeSession(session, request);
+    }
+
+    #resolveElementDiscoveryRequest(session, args) {
+      const currentDiscovery = session.observation?.context?.elementDiscovery || null;
+      const suppliedCursor = boundedOptionalString(args.cursor, 24000);
+      const suppliedQuery = boundedOptionalString(args.query, 500);
+      let cursor = suppliedCursor;
+      if (cursor) {
+        if (!currentDiscovery?.nextCursor || cursor !== currentDiscovery.nextCursor) {
+          throw new Error("browser_elements must use nextCursor from the latest elementDiscovery result.");
+        }
+        if (suppliedQuery && suppliedQuery !== String(currentDiscovery.query || "")) {
+          throw new Error("A continued element cursor must keep the query from the latest discovery result.");
+        }
+      } else if (!suppliedQuery) {
+        cursor = String(currentDiscovery?.nextCursor || "");
+        if (!cursor) {
+          throw new Error("No additional visible-element window is available. Supply a new query or continue with a page action.");
+        }
+      }
+      return {
+        elementCursor: cursor,
+        elementQuery: suppliedQuery || (cursor ? String(currentDiscovery?.query || "") : "")
+      };
+    }
+
     async #guidedContinue(client, options = {}) {
       const session = this.#findGuidedSession(client);
       const latestOperation = this.#latestSessionOperation(session);
@@ -261,7 +309,9 @@
         ? Number(latestOperation.completedAt || latestOperation.createdAt || 0)
         : 0;
       if (
-        session.observation
+        !options.refresh
+        && await this.#observationSettingsMatch(session)
+        && session.observation
         && session.latestObservationId
         && Number(session.observation.observedAt || 0) >= operationTimestamp
       ) {
@@ -284,6 +334,60 @@
     async #guidedScreenshot(client) {
       const session = this.#findGuidedSession(client);
       return this.#screenshot({ session_id: session.id });
+    }
+
+    async #guidedVisualAct(args, client) {
+      const session = this.#findGuidedSession(client);
+      const latestOperation = this.#latestSessionOperation(session);
+      if (latestOperation && ["waiting_approval", "approved", "ready", "executing"].includes(latestOperation.status)) {
+        return this.#guidedOperationResponse(latestOperation);
+      }
+      const operation = await this.#resolveAndProposeVisualAction(session, args);
+      return this.#guidedOperationResponse(this.#requireOperation(operation.operation_id));
+    }
+
+    async #visualAct(args) {
+      const session = this.#requireSession(args.session_id);
+      return this.#resolveAndProposeVisualAction(session, args);
+    }
+
+    async #resolveAndProposeVisualAction(session, args) {
+      if (typeof this.driver.resolveVisualAction !== "function") {
+        throw new Error("The extension runtime does not provide verified visual targeting.");
+      }
+      const surfaceRef = boundedString(args.surface_ref, 160, "surface_ref");
+      const targetDescription = boundedString(args.target_description, 500, "target_description");
+      const currentSurface = (session.observation?.context?.visualSurfaces || [])
+        .find((surface) => surface.ref === surfaceRef);
+      if (!currentSurface || currentSurface.actionability !== "visual-coordinate-only") {
+        throw new Error("browser_visual_act requires a visual surface ref from the latest browser observation.");
+      }
+      const visualRequest = {
+        surfaceRef,
+        targetDescription,
+        reason: boundedOptionalString(args.reason, 500),
+        goal: session.goal
+      };
+      const resolved = await this.driver.resolveVisualAction(session.targetTabId, cloneJson(visualRequest));
+      if (!resolved?.context || resolved?.action?.type !== "visual_click") {
+        throw new Error("The extension-owned visual locator returned an invalid resolution.");
+      }
+      if (resolved.action.ref !== surfaceRef) {
+        throw new Error("The extension-owned visual locator changed the requested surface.");
+      }
+      const context = sanitizeObservationForStorage(resolved.context);
+      const observation = await this.#storeObservation(session, context);
+      const effectDigest = Contract.effectDigest([resolved.action]);
+      return this.#proposeExecution({
+        session_id: session.id,
+        observation_id: observation.observation_id,
+        idempotency_key: `visual:${observation.observation_id}:${effectDigest}`.slice(0, 160),
+        actions: [resolved.action]
+      }, {
+        resolvedVisual: true,
+        visualRequest,
+        visualAttestation: resolved.attestation || null
+      });
     }
 
     async #guidedEnd(client) {
@@ -333,6 +437,10 @@
     }
 
     #guidedReadyResponse(session, observation, options = {}) {
+      const discovery = observation.context?.elementDiscovery || null;
+      const discoveryNext = discovery?.hasMore
+        ? " If the needed visible ref is absent, call browser_elements with page.elementDiscovery.nextCursor before reporting a blocker."
+        : "";
       return {
         status: "ready",
         goal: session.goal,
@@ -342,9 +450,11 @@
         ...(options.latestOperation
           ? { last_operation: this.#guidedPublicOperation(options.latestOperation) }
           : {}),
-        next: options.resumed
+        next: `${options.resumed
           ? "The existing browser task is ready. Continue from this snapshot with browser_act, or call browser_end if the visible goal is already satisfied."
-          : "Use only refs from this snapshot. Call browser_act with the next necessary actions, or browser_end if the visible goal is already satisfied."
+          : options.discovery
+            ? "Use only refs from this refreshed visible-element window. Call browser_act when the required target is available."
+            : "Use only refs from this snapshot. Call browser_act with the next necessary actions, or browser_end if the visible goal is already satisfied."}${discoveryNext}`
       };
     }
 
@@ -420,13 +530,23 @@
 
     async #observe(args, options = {}) {
       const session = this.#requireSession(args.session_id);
-      const context = await this.#collectObservation(session.targetTabId);
+      return this.#observeSession(session, options);
+    }
+
+    async #observeSession(session, options = {}) {
+      const context = await this.#collectObservation(session.targetTabId, options);
+      return this.#storeObservation(session, context, options);
+    }
+
+    async #storeObservation(session, context, options = {}) {
       const observationId = this.randomId("observation");
       const now = this.now();
+      const settingsDigest = await this.#currentObservationSettingsDigest();
       session.latestObservationId = observationId;
       session.observation = {
         id: observationId,
         observedAt: now,
+        settingsDigest,
         context
       };
       this.#touchSession(session, now);
@@ -445,6 +565,17 @@
       };
     }
 
+    async #observationSettingsMatch(session) {
+      if (!session.observation?.settingsDigest) {
+        return false;
+      }
+      return session.observation.settingsDigest === await this.#currentObservationSettingsDigest();
+    }
+
+    async #currentObservationSettingsDigest() {
+      return observationSettingsDigest(await this.getSettings());
+    }
+
     async #screenshot(args) {
       const session = this.#requireSession(args.session_id);
       await this.#requireBoundTab(session);
@@ -457,7 +588,7 @@
       return capture;
     }
 
-    async #proposeExecution(args) {
+    async #proposeExecution(args, options = {}) {
       const session = this.#requireSession(args.session_id);
       await this.#requireBoundTab(session);
       const goal = session.goal;
@@ -465,7 +596,9 @@
       const idempotencyKey = boundedString(args.idempotency_key, 160, "idempotency_key");
       const settings = await this.getSettings();
       const maxActions = normalizePositiveInteger(settings.maxActionsPerTurn, 8);
-      const normalizedForIdempotency = Contract.normalizeExternalActions(args.actions, { maxActions });
+      const normalizedForIdempotency = options.resolvedVisual
+        ? cloneJson(args.actions)
+        : Contract.normalizeExternalActions(args.actions, { maxActions });
       const digest = Contract.effectDigest(normalizedForIdempotency);
       const idempotencyIndexKey = `${session.id}:${idempotencyKey}`;
       const priorId = this.state.idempotency[idempotencyIndexKey];
@@ -479,7 +612,9 @@
       if (!session.observation || session.latestObservationId !== observationId) {
         throw new Error("browser_execute must reference the latest observation returned by browser_observe.");
       }
-      const validation = Contract.validateExternalActions(args.actions, session.observation.context, { maxActions });
+      const validation = options.resolvedVisual
+        ? Contract.validateResolvedVisualActions(args.actions, session.observation.context)
+        : Contract.validateExternalActions(args.actions, session.observation.context, { maxActions });
       if (!validation.valid) {
         throw new Error(`The action proposal is invalid: ${validation.errors.join(" ")}`);
       }
@@ -510,7 +645,8 @@
         context: session.observation.context,
         settings,
         policy: normalizedPolicy,
-        validation
+        validation,
+        allowResolvedVisual: options.resolvedVisual === true
       });
       const now = this.now();
       const operationId = this.randomId("operation");
@@ -544,6 +680,13 @@
         completedAt: safety.blocked ? now : 0,
         error: safety.blocked ? safety.blockedReasons.join(" ") : ""
       };
+      if (options.resolvedVisual) {
+        operation.visualRequest = cloneJson(options.visualRequest);
+        operation.visualAttestation = cloneJson(options.visualAttestation);
+        operation.visualSurfaceIdentity = visualSurfaceIdentity(
+          Contract.findActionTarget(actions[0], session.observation.context)
+        );
+      }
       if (safety.blocked) {
         delete operation.actions;
       }
@@ -598,25 +741,77 @@
       operation.startedAt = this.now();
       await this.#persistAndNotify();
       try {
-        const freshContext = await this.#collectObservation(operation.targetTabId);
-        const preconditionResult = Contract.validateActionPreconditions({
-          actions: operation.actions,
-          preconditions: operation.preconditions,
-          observedDocumentId: operation.observedDocumentId,
-          observedPageUrl: operation.observedPageUrl
-        }, freshContext);
-        if (!preconditionResult.valid) {
-          operation.status = "stale";
-          operation.error = preconditionResult.errors.join(" ");
-          operation.completedAt = this.now();
-          delete operation.actions;
-          delete operation.approvalGrant;
-          await this.#persistAndNotify();
-          return this.#publicOperation(operation);
+        let freshContext;
+        let actionsForExecution = operation.actions;
+        if (operation.visualRequest) {
+          if (typeof this.driver.resolveVisualAction !== "function") {
+            throw new Error("Verified visual targeting became unavailable before execution.");
+          }
+          const resolved = await this.driver.resolveVisualAction(
+            operation.targetTabId,
+            cloneJson(operation.visualRequest)
+          );
+          freshContext = sanitizeObservationForStorage(resolved?.context);
+          const validation = Contract.validateResolvedVisualActions(
+            [resolved?.action].filter(Boolean),
+            freshContext
+          );
+          const freshSurfaceIdentity = visualSurfaceIdentity(
+            Contract.findActionTarget(resolved?.action, freshContext)
+          );
+          if (
+            !freshContext
+            || freshContext.documentId !== operation.observedDocumentId
+            || freshContext.url !== operation.observedPageUrl
+            || resolved?.action?.ref !== operation.visualRequest.surfaceRef
+            || JSON.stringify(freshSurfaceIdentity) !== JSON.stringify(operation.visualSurfaceIdentity)
+            || !validation.valid
+          ) {
+            operation.status = "stale";
+            operation.error = [
+              freshContext?.documentId !== operation.observedDocumentId
+                ? "The document changed before the visual action was executed."
+                : "",
+              freshContext?.url !== operation.observedPageUrl
+                ? "The page URL changed before the visual action was executed."
+                : "",
+              resolved?.action?.ref !== operation.visualRequest.surfaceRef
+                ? "The visual locator changed the approved surface."
+                : "",
+              JSON.stringify(freshSurfaceIdentity) !== JSON.stringify(operation.visualSurfaceIdentity)
+                ? "The approved visual surface changed before execution."
+                : "",
+              ...(validation.errors || [])
+            ].filter(Boolean).join(" ");
+            operation.completedAt = this.now();
+            delete operation.actions;
+            delete operation.approvalGrant;
+            await this.#persistAndNotify();
+            return this.#publicOperation(operation);
+          }
+          actionsForExecution = validation.actions;
+          operation.visualAttestation = cloneJson(resolved.attestation || operation.visualAttestation);
+        } else {
+          freshContext = await this.#collectObservation(operation.targetTabId);
+          const preconditionResult = Contract.validateActionPreconditions({
+            actions: operation.actions,
+            preconditions: operation.preconditions,
+            observedDocumentId: operation.observedDocumentId,
+            observedPageUrl: operation.observedPageUrl
+          }, freshContext);
+          if (!preconditionResult.valid) {
+            operation.status = "stale";
+            operation.error = preconditionResult.errors.join(" ");
+            operation.completedAt = this.now();
+            delete operation.actions;
+            delete operation.approvalGrant;
+            await this.#persistAndNotify();
+            return this.#publicOperation(operation);
+          }
         }
 
-        const pageActions = operation.actions.filter((action) => PAGE_ACTION_TYPES.has(action.type));
-        const browserActions = operation.actions.filter((action) => !PAGE_ACTION_TYPES.has(action.type));
+        const pageActions = actionsForExecution.filter((action) => PAGE_ACTION_TYPES.has(action.type));
+        const browserActions = actionsForExecution.filter((action) => !PAGE_ACTION_TYPES.has(action.type));
         let executionResult;
         if (pageActions.length && browserActions.length) {
           throw new Error("Page actions and browser actions cannot execute in one operation.");
@@ -692,9 +887,11 @@
       };
     }
 
-    async #collectObservation(tabId) {
+    async #collectObservation(tabId, options = {}) {
       const context = await this.driver.observe(tabId, {
-        redactSensitiveData: true
+        redactSensitiveData: true,
+        elementCursor: boundedOptionalString(options.elementCursor, 24000),
+        elementQuery: boundedOptionalString(options.elementQuery, 500)
       });
       return sanitizeObservationForStorage(context);
     }
@@ -1108,6 +1305,33 @@
   function normalizePositiveInteger(value, fallback) {
     const parsed = Number(value);
     return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+  }
+
+  function observationSettingsDigest(settings) {
+    const source = settings && typeof settings === "object" ? settings : {};
+    return JSON.stringify({
+      maxTextChars: Number(source.maxTextChars) || 16000,
+      maxElements: Number(source.maxElements) || 80,
+      redactSensitiveData: source.redactSensitiveData !== false
+    });
+  }
+
+  function visualSurfaceIdentity(target) {
+    if (!target) {
+      return null;
+    }
+    return {
+      ref: stringValue(target.ref),
+      selector: stringValue(target.selector),
+      scope: stringValue(target.scope),
+      frameId: Number.isInteger(Number(target.frameId)) ? Number(target.frameId) : 0,
+      frameDocumentId: stringValue(target.frameDocumentId),
+      kind: stringValue(target.kind),
+      tag: stringValue(target.tag),
+      role: stringValue(target.role),
+      label: stringValue(target.label),
+      actionability: stringValue(target.actionability)
+    };
   }
 
   function boundedString(value, maxLength, name) {

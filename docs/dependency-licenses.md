@@ -29,7 +29,7 @@ The non-MIT transitive entries are:
 
 `pnpm audit --prod` reported zero known vulnerabilities at every severity for the resolved production tree at the audit date.
 
-The audit initially identified vulnerable transitive releases below `fast-uri` `3.1.4` and `@hono/node-server` `2.0.5`. The direct MCP SDK dependency did not yet expose a dependency range that could resolve both fixes without assistance, so `pnpm-workspace.yaml` now overrides only those vulnerable ranges. The refreshed lockfile resolves `fast-uri` `3.1.4` and `@hono/node-server` `2.0.11`; the syntax checks, unit tests, companion tests, and real-browser extension E2E suite pass with that tree.
+The audit initially identified vulnerable transitive releases below `fast-uri` `3.1.4` and `@hono/node-server` `2.0.5`. The direct MCP SDK dependency did not yet expose a dependency range that could resolve both fixes without assistance, so `pnpm-workspace.yaml` overrides those vulnerable ranges for the locked pnpm tree and `package.json` declares the equivalent npm overrides. The refreshed pnpm lockfile resolves `fast-uri` `3.1.4` and `@hono/node-server` `2.0.11`; the syntax checks, unit tests, companion tests, and real-browser extension E2E suite pass with that tree.
 
 ## Reproduce the audit
 

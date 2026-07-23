@@ -229,6 +229,29 @@ test("validates independent verifier evidence and policy approval reasons", () =
   assert.equal(Core.validatePolicy(policy).valid, false);
 });
 
+test("normalizes and validates extension-owned visual target localization", () => {
+  const target = Core.normalizeVisualTarget({
+    version: "1.0",
+    status: "found",
+    message: "The requested next-page control is visible.",
+    targetDescription: "Next page",
+    xNormalized: 944,
+    yNormalized: 918,
+    confidence: 0.96
+  });
+  assert.equal(Core.validateVisualTarget(target).valid, true);
+
+  const guessed = Core.normalizeVisualTarget({
+    status: "found",
+    message: "Guess",
+    targetDescription: "Next page",
+    xNormalized: null,
+    yNormalized: null,
+    confidence: 0.1
+  });
+  assert.equal(Core.validateVisualTarget(guessed).valid, false);
+});
+
 test("uses each MCP tool input schema dynamically", () => {
   const decision = Core.normalizeDecision(baseDecision({
     actions: [],

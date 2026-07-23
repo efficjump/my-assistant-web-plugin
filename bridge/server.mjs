@@ -260,6 +260,30 @@ function normalizeToolResult(result) {
     return result;
   }
 
+  const screenshotDataUrl = isObject(result)
+    ? typeof result.data_url === "string"
+      ? result.data_url
+      : typeof result.dataUrl === "string"
+        ? result.dataUrl
+        : ""
+    : "";
+  const parsedScreenshot = screenshotDataUrl.match(/^data:([^;,]+);base64,([A-Za-z0-9+/=]+)$/u);
+  if (parsedScreenshot) {
+    return {
+      content: [{
+        type: "image",
+        mimeType: parsedScreenshot[1],
+        data: parsedScreenshot[2]
+      }],
+      structuredContent: {
+        mimeType: parsedScreenshot[1],
+        ...(typeof result.visual_observation_id === "string"
+          ? { visualObservationId: result.visual_observation_id }
+          : {})
+      }
+    };
+  }
+
   const text = JSON.stringify(result ?? null, null, 2);
   const response = {
     content: [{ type: "text", text }],

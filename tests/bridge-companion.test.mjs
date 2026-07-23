@@ -98,8 +98,10 @@ test("stdio mode exposes guided tools and reports one extension setup value", as
     "browser_act",
     "browser_begin",
     "browser_continue",
+    "browser_elements",
     "browser_end",
     "browser_screenshot",
+    "browser_visual_act",
   ]);
 
   const advancedOnlyInput = await client.callTool({

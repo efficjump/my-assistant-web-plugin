@@ -123,6 +123,37 @@
     return { ...validation, actions: normalized };
   }
 
+  function validateResolvedVisualActions(actions, context) {
+    if (!Array.isArray(actions) || actions.length !== 1 || actions[0]?.type !== "visual_click") {
+      return {
+        valid: false,
+        errors: ["A resolved visual proposal must contain exactly one visual_click."],
+        warnings: [],
+        actions: []
+      };
+    }
+    const decision = AgentCore.normalizeDecision({
+      version: "1.0",
+      status: "continue",
+      message: "",
+      summary: "Extension-resolved visual action",
+      progress: "",
+      doneReason: "",
+      completionEvidence: [],
+      needsUserApproval: true,
+      plan: [],
+      toolCalls: [],
+      actions,
+      verification: {
+        required: true,
+        expectedChange: "The described visual target responds.",
+        successCriteria: []
+      }
+    }, { maxEffects: 1 });
+    const validation = AgentCore.validateDecision(decision, { context, maxEffects: 1 });
+    return { ...validation, actions: decision.actions };
+  }
+
   function findActionTarget(action, context) {
     return AgentCore.findTarget(action || {}, context || {});
   }
@@ -363,7 +394,8 @@
     warnings.push(...(policy?.risks || []));
 
     for (const action of actions) {
-      if (!EXTERNAL_ACTION_TYPE_SET.has(action?.type)) {
+      const resolvedVisualAction = options.allowResolvedVisual === true && action?.type === "visual_click";
+      if (!EXTERNAL_ACTION_TYPE_SET.has(action?.type) && !resolvedVisualAction) {
         blockedReasons.push(`External clients cannot use action type ${action?.type || "missing"}.`);
         continue;
       }
@@ -429,6 +461,7 @@
     summarizeTargetForPrecondition,
     validateActionPreconditions,
     validateExternalActions,
+    validateResolvedVisualActions,
     validateJsonAgainstSchema: AgentCore.validateJsonAgainstSchema
   });
 

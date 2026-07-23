@@ -7,11 +7,11 @@
     throw new Error("WebExecutionContract must be loaded before bridge-protocol.js.");
   }
 
-  const protocolVersion = "2.0";
+  const protocolVersion = "2.1";
   const instructions = `This MCP server controls only the browser tab explicitly shared by the user in the extension.
-Call browser_begin once with the user's complete browser goal. It starts or resumes the caller's short-lived session and returns the current redacted page snapshot. Use only refs from that snapshot. Call browser_act with the next bounded action or action group; session, observation, and idempotency identifiers are managed internally. browser_act accepts proposals, not trusted commands: the extension independently validates policy and safety, may require an in-extension approval, and re-observes immediately before execution. After every proposal, call browser_continue. If approval is required, ask the user to review the extension and call browser_continue again after their decision; never submit a duplicate proposal. Repeat act and continue until the visible result satisfies the goal, then call browser_end before the final answer. Use browser_screenshot only when visible pixels are necessary. Never request, expose, or infer credentials and sensitive field values.`;
+Call browser_begin once with the user's complete browser goal. It starts or resumes the caller's short-lived session and returns the current redacted page snapshot. Use only refs from that snapshot. When page.elementDiscovery.hasMore is true and a needed visible control is absent, call browser_elements with its next cursor or a goal-derived query; an element-count limit is never by itself a blocker or a reason to ask the user to click. Use scroll actions and re-observe when the target is outside the current viewport. Call browser_act with the next bounded action or action group; session, observation, and idempotency identifiers are managed internally. browser_act accepts proposals, not trusted commands: the extension independently validates policy and safety, may require an in-extension approval, and re-observes immediately before execution. After every proposal, call browser_continue. Pass refresh=true when the visible page or observation settings may have changed without an operation. If approval is required, ask the user to review the extension and call browser_continue again after their decision; never submit a duplicate proposal. For a visible canvas or application-surface target with no DOM ref, call browser_visual_act with only its surface ref and a precise target description; the extension-owned model locates and independently verifies the point. Repeat discovery, act, and continue until the visible result satisfies the goal, then call browser_end before the final answer. Use browser_screenshot only when visible pixels are necessary. Never request, expose, or infer credentials and sensitive field values.`;
   const advancedInstructions = `This MCP server is using the advanced identifier-based browser workflow.
-Start with browser_status and browser_session_start, then call browser_observe before proposing actions. The session owns the canonical goal supplied at start, so later execution proposals cannot replace or paraphrase it. Use only element refs from the latest observation. Treat an acquired session as one multi-step transaction: while the user's objective remains incomplete, continue with the next required tool call instead of ending a turn with only a progress announcement. Stop only when the objective is complete, the user must perform an approval or other direct action, or a concrete blocker prevents progress. browser_execute accepts proposals, not trusted commands: the extension independently validates policy and safety, may require an in-extension approval, re-observes immediately before execution, and returns an operation ID. Poll browser_operation_get with that same ID after an approval; never create a duplicate proposal to bypass the approval gate. Close the session after completion or a terminal blocker. Never request, expose, or infer credentials and sensitive field values.`;
+Start with browser_status and browser_session_start, then call browser_observe before proposing actions. The session owns the canonical goal supplied at start, so later execution proposals cannot replace or paraphrase it. Use only element refs from the latest observation. When context.elementDiscovery.hasMore is true and a needed visible control is absent, call browser_elements with its next cursor or a goal-derived query; truncation is never a terminal blocker. Use scroll actions and re-observe for offscreen targets. Treat an acquired session as one multi-step transaction: while the user's objective remains incomplete, continue with the next required tool call instead of ending a turn with only a progress announcement. Stop only when the objective is complete, the user must perform an approval or other direct action, or a concrete blocker prevents progress. browser_execute accepts proposals, not trusted commands: the extension independently validates policy and safety, may require an in-extension approval, re-observes immediately before execution, and returns an operation ID. Use browser_visual_act for a visible canvas or application-surface target with no DOM ref; do not invent or submit coordinates. Poll browser_operation_get with the same operation ID after an approval; never create a duplicate proposal to bypass the approval gate. Close the session after completion or a terminal blocker. Never request, expose, or infer credentials and sensitive field values.`;
 
   const identifierSchema = {
     type: "string",
@@ -30,6 +30,43 @@ Start with browser_status and browser_session_start, then call browser_observe b
       additionalProperties: false,
       properties,
       ...(required.length ? { required } : {})
+    };
+  }
+
+  function elementDiscoveryProperties() {
+    return {
+      cursor: {
+        type: "string",
+        maxLength: 24000,
+        description: "Opaque nextCursor from the latest elementDiscovery result. Omit it to start a new query or continue with the current snapshot's cursor."
+      },
+      query: {
+        type: "string",
+        maxLength: 500,
+        description: "Goal-derived description used to rank and filter currently visible controls. Page-specific symbols or framework names do not need hardcoded rules."
+      }
+    };
+  }
+
+  function visualActionProperties() {
+    return {
+      surface_ref: {
+        type: "string",
+        minLength: 1,
+        maxLength: 160,
+        description: "Visual surface ref from the latest snapshot."
+      },
+      target_description: {
+        type: "string",
+        minLength: 1,
+        maxLength: 500,
+        description: "Precise visible target to locate inside the surface. Coordinates are extension-owned and must not be supplied."
+      },
+      reason: {
+        type: "string",
+        maxLength: 500,
+        description: "Why this target advances the user's retained browser goal."
+      }
     };
   }
 
@@ -65,10 +102,22 @@ Start with browser_status and browser_session_start, then call browser_observe b
         annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true }
       },
       {
+        name: "browser_elements",
+        title: "Inspect more visible controls",
+        description: "Return another observation-bound window of currently visible interactive elements, or dynamically search those elements. Use this whenever elementDiscovery.hasMore is true and the needed ref is absent; truncation alone is not a blocker.",
+        inputSchema: objectSchema(elementDiscoveryProperties()),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
+      },
+      {
         name: "browser_continue",
         title: "Continue browser task",
-        description: "Return the current proposal status or, after completion, rejection, or staleness, refresh the redacted page snapshot for the next decision. Call this after every browser_act and after the user handles an approval.",
-        inputSchema: objectSchema(),
+        description: "Return the current proposal status or refresh the redacted page snapshot for the next decision. Call this after every browser_act and after the user handles an approval. Set refresh=true when the page or observation settings may have changed without an operation.",
+        inputSchema: objectSchema({
+          refresh: {
+            type: "boolean",
+            description: "Force a new observation instead of returning the cached snapshot when no proposal is pending."
+          }
+        }),
         annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
       },
       {
@@ -77,6 +126,13 @@ Start with browser_status and browser_session_start, then call browser_observe b
         description: "Capture the visible pixels of the active user-shared tab. The image can contain on-screen private data, so use it only when the task requires visual evidence.",
         inputSchema: objectSchema(),
         annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
+      },
+      {
+        name: "browser_visual_act",
+        title: "Propose a verified visual action",
+        description: "Ask the extension-owned model to locate and independently verify one visible target inside a canvas or application surface. The caller supplies no coordinates, screenshot token, policy result, or approval.",
+        inputSchema: objectSchema(visualActionProperties(), ["surface_ref", "target_description"]),
+        annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true }
       },
       {
         name: "browser_end",
@@ -127,11 +183,31 @@ Start with browser_status and browser_session_start, then call browser_observe b
         annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
       },
       {
+        name: "browser_elements",
+        title: "Inspect more visible controls",
+        description: "Return another observation-bound window of currently visible controls or dynamically search them. Continue while elementDiscovery.hasMore is true before reporting a missing-control blocker.",
+        inputSchema: objectSchema({
+          session_id: cloneJson(identifierSchema),
+          ...elementDiscoveryProperties()
+        }, ["session_id"]),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
+      },
+      {
         name: "browser_screenshot",
         title: "Capture shared tab",
         description: "Capture the visible pixels of the user-shared tab. The image can contain on-screen private data, so use it only when the user's task requires visual evidence.",
         inputSchema: objectSchema({ session_id: cloneJson(identifierSchema) }, ["session_id"]),
         annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
+      },
+      {
+        name: "browser_visual_act",
+        title: "Propose a verified visual action",
+        description: "Ask the extension-owned model to locate and independently verify one visible target inside a canvas or application surface. Coordinates and verification claims are not accepted from the caller.",
+        inputSchema: objectSchema({
+          session_id: cloneJson(identifierSchema),
+          ...visualActionProperties()
+        }, ["session_id", "surface_ref", "target_description"]),
+        annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true }
       },
       {
         name: "browser_execute",

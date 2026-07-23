@@ -1,6 +1,6 @@
 # Local MCP companion
 
-The local companion lets an MCP-capable development tool work with one browser tab explicitly shared through the extension. The default setup uses standard `stdio`, one extension setup value, and a guided four-step tool loop. Session IDs, observation IDs, operation IDs, and idempotency keys stay inside the extension instead of being copied between model calls.
+The local companion lets an MCP-capable development tool work with one browser tab explicitly shared through the extension. The default setup uses standard `stdio`, one extension setup value, and a guided observe/discover/act/verify loop. Session IDs, observation IDs, operation IDs, and idempotency keys stay inside the extension instead of being copied between model calls.
 
 ```mermaid
 flowchart LR
@@ -23,15 +23,17 @@ The companion does not expose a raw browser-debugging connection. The extension 
 Install dependencies once from the repository root:
 
 ```bash
-pnpm install
+npm install
 ```
+
+If pnpm is installed, `pnpm install` is equivalent. npm is fully supported and uses the transitive dependency overrides declared in `package.json`.
 
 ## Recommended setup: stdio
 
 Generate a generic MCP server entry using the Node.js executable and bridge file detected on the current machine:
 
 ```bash
-pnpm run bridge:config
+npm run bridge:config
 ```
 
 The command prints JSON shaped like this, with real absolute paths filled in at runtime:
@@ -73,28 +75,36 @@ The default tool surface is deliberately small:
 | Tool | Purpose |
 | --- | --- |
 | `browser_begin` | Start or resume the caller's task and return the current redacted page snapshot |
+| `browser_elements` | Continue an opaque visible-control cursor or dynamically search visible controls |
 | `browser_act` | Propose the next bounded actions using refs from that snapshot |
-| `browser_continue` | Read approval status or return a refreshed snapshot after an operation |
+| `browser_continue` | Read approval status or return a refreshed snapshot; `refresh: true` forces a new observation |
 | `browser_screenshot` | Capture visible pixels only when visual evidence is necessary |
+| `browser_visual_act` | Ask the extension model to locate and verify a described target inside a visual surface |
 | `browser_end` | Release the short-lived browser lease |
 
 A development tool should follow this loop:
 
 1. Call `browser_begin` once with the user's complete goal.
 2. Plan only from the returned `page` snapshot and its current element refs.
-3. Call `browser_act` with the next required action or small action group.
-4. Call `browser_continue` after every proposal.
-5. If the response is `approval_required`, ask the user to review the extension and call `browser_continue` again after their decision. Do not resubmit the action.
-6. Repeat `browser_act` and `browser_continue` until the refreshed snapshot verifies the goal.
-7. Call `browser_end` before returning the final answer.
+3. If `page.elementDiscovery.hasMore` is true and the needed visible control is absent, call `browser_elements` with `nextCursor`. A concise goal-derived `query` can start a ranked search instead.
+4. Use a `scroll` action and observe again when the target is outside the current viewport; element paging covers only controls already visible in that viewport.
+5. Call `browser_act` with the next required DOM action or small action group. For an exposed canvas or application surface without a DOM ref, call `browser_visual_act` with only its surface ref and visible target description.
+6. Call `browser_continue` after every proposal.
+7. If the response is `approval_required`, ask the user to review the extension and call `browser_continue` again after their decision. Do not resubmit the action.
+8. Repeat discovery, action, and continuation until the refreshed snapshot verifies the goal.
+9. Call `browser_end` before returning the final answer.
 
 The caller never supplies a session, observation, operation, or retry identifier in this default mode. The extension creates deterministic retry keys from the current observation and proposed effects, prevents a pending proposal from being duplicated, and refreshes the observation between completed actions.
 
 Calling `browser_begin` again with the same goal and MCP client resumes the current snapshot. A different goal must first end the active task. A different MCP client cannot take over an existing guided session.
 
-Element refs remain snapshot-scoped. A refreshed snapshot can assign different refs, so every new action must use only the latest `page` result.
+Element refs remain observation-scoped. A refreshed snapshot or element window can assign different refs, so every new action must use only the latest `page` result.
 
-Visible same-origin and permission-granted cross-origin frames can appear with frame-scoped refs. The extension routes those refs to the bound child document and rejects stale frame identities. Hidden or ambiguously mapped frame contents are withheld. The bridge may capture a screenshot for evidence, but it deliberately does not accept raw visual-coordinate actions because its public request does not carry the extension's screenshot-binding and independent-verifier contract.
+`page.elementDiscovery` reports the current query, returned and visited counts, matching `total`, unfiltered `availableTotal`, `hasMore`, and an opaque `nextCursor`. The cursor is bound to document IDs, DOM revisions, frame visibility, viewport position, and the ordered visible-control digest. If any of those change, the runtime discards the old offsets and returns a first window with `cursorReset: true`. A client must not treat the configured element-window size as an accessibility boundary or ask the user to click until relevant visible windows have been searched or exhausted.
+
+Visible same-origin and permission-granted cross-origin frames can appear with frame-scoped refs. The extension merges their candidates into one visually ordered window, routes actions to the bound child document, and rejects stale frame identities. Hidden or ambiguously mapped frame contents are withheld.
+
+The bridge never accepts raw `visual_click` coordinates. `browser_visual_act` accepts only a current visual-surface ref, a target description, and an optional reason. The extension captures a coherent screenshot, asks the configured model to locate one unambiguous point, runs an independent verification request against the same evidence, and creates the guarded action internally. After approval it repeats that entire resolution against a fresh screenshot and executes only if the document, URL, surface identity, geometry checks, and verifier result still match.
 
 ## Approval behavior
 
@@ -110,6 +120,8 @@ When `browser_act` returns `approval_required`:
 
 The extension re-observes the document and compares target fingerprints immediately before an approved effect. A changed page or control becomes `stale` instead of executing an outdated action. The next `browser_continue` returns a fresh snapshot so the client can reconsider the plan.
 
+The same approval behavior applies to `browser_visual_act`. The approval describes the visible target rather than trusting caller-provided coordinates, because the caller is not allowed to provide them.
+
 ## Advanced identifier-based workflow
 
 The previous low-level surface remains available for clients that need explicit transaction control:
@@ -123,7 +135,9 @@ That configuration starts the stdio server with these tools:
 - `browser_status`
 - `browser_session_start`
 - `browser_observe`
+- `browser_elements`
 - `browser_screenshot`
+- `browser_visual_act`
 - `browser_execute`
 - `browser_operation_get`
 - `browser_session_close`
@@ -135,7 +149,7 @@ In this mode the caller must preserve `session_id`, `observation_id`, `operation
 Use this only when a client cannot launch a local stdio MCP server:
 
 ```bash
-pnpm run bridge
+npm run bridge
 ```
 
 The command prints:
@@ -203,13 +217,15 @@ By default, state is stored in the operating system's per-user application-state
 - Only one user-selected tab is shared. Detaching or changing it closes active external sessions.
 - Page content and MCP input are untrusted. Callers cannot supply approval grants, policy verdicts, browser tab IDs, safety results, or execution preconditions.
 - Structured observations exclude hidden, offscreen, fully occluded, fully transparent, and unrelated-tab content. Sensitive values and URL parameters are redacted.
+- Dense visible controls are exposed through bounded, page-state-bound windows. An element count cap does not become a false capability gap.
 - Child-frame content is included only after a fully exposed iframe boundary maps unambiguously to one browser frame; cross-origin content also needs that origin's browser permission.
 - Screenshots contain the visible pixels of the shared tab and may include private on-screen information, so clients should request them only when required.
+- Visual actions are located and independently verified inside the extension. External callers cannot provide coordinates, screenshot bindings, policy verdicts, or approval grants, and the target is resolved again after approval.
 - Every proposal is schema-checked and independently assessed. Sensitive-data handling can be blocked outright.
 - Approval grants are bound to the operation digest, observation, document, tab, and expiry.
 - A service-worker restart never blindly retries an operation whose execution outcome is unknown.
 
-This design does not make every page automatable. Browser permission prompts, payment confirmation, CAPTCHA, closed shadow roots, ungranted or ambiguous cross-origin frames, visual-only controls, and browser-internal pages can still require direct user interaction or remain unavailable. See [Web structure compatibility](web-compatibility.md) for the complete boundary and diagnostic model.
+This design does not make every page automatable. Browser permission prompts, payment confirmation, CAPTCHA, closed shadow roots, ungranted or ambiguous cross-origin frames, ambiguous or protected visual surfaces, and browser-internal pages can still require direct user interaction or remain unavailable. See [Web structure compatibility](web-compatibility.md) for the complete boundary and diagnostic model.
 
 ## Troubleshooting
 
@@ -232,6 +248,18 @@ Approve or reject it in the extension, then call `browser_continue` in the same 
 ### A proposal becomes `stale`
 
 Call `browser_continue` to get a fresh snapshot, then plan again using only its refs. The stale proposal is never replayed.
+
+### A visible control is missing from `interactiveElements`
+
+Inspect `page.elementDiscovery`. If `hasMore` is true, call `browser_elements` with its `nextCursor`, or start a dynamic search with a short label/role description in `query`. Use scrolling only when the target is outside the current viewport. Do not ask the user to click merely because the first bounded window omitted the control.
+
+### A canvas target has no DOM ref
+
+Use the current entry in `page.visualSurfaces` with `browser_visual_act`. Supply the surface ref and a precise visible description, but no coordinates. Screenshot observation must be enabled in the extension's effective settings, the shared tab must be visible, and the configured model endpoint must accept image input and the structured locator/verifier responses.
+
+### `browser_continue` returns an unchanged page
+
+Pass `{ "refresh": true }` when page content or observation settings may have changed without an operation. The runtime also refreshes automatically when the text limit, element-window size, or redaction setting changes.
 
 ### Another MCP client owns the active task
 

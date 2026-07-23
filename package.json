@@ -1,6 +1,6 @@
 {
   "name": "my-assistant-web-plugin",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "private": true,
   "license": "UNLICENSED",
   "description": "A verifiable AI browser agent for Chrome and Edge.",
@@ -23,5 +23,9 @@
     "@modelcontextprotocol/sdk": "1.29.0",
     "ws": "8.21.1",
     "zod": "4.4.3"
+  },
+  "overrides": {
+    "@hono/node-server": "^2.0.5",
+    "fast-uri": "^3.1.4"
   }
 }

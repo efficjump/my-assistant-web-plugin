@@ -13,9 +13,17 @@ The extension combines DOM evidence with screenshot evidence instead of assuming
 | Same-origin iframe | Visible child frame is observed separately | Action is routed to the child frame | Child document ID and composed top-viewport geometry |
 | Cross-origin iframe | Available after its visible origin is granted | Action is routed to the granted child frame | One fully exposed iframe boundary must map to exactly one browser frame |
 | Nested scroll container | Visible region and current scroll range | Targeted `scroll` action | Newly revealed content is not described until the next observation |
-| Canvas or `role="application"` surface | Surface bounds plus current screenshot | Internal agent-only `visual_click` | Screenshot binding, normalized surface point, approval, fresh observation, independent LLM verification |
+| Canvas or `role="application"` surface | Surface bounds plus current screenshot | Internal `visual_click`, or Bridge `browser_visual_act` with no caller coordinates | Screenshot binding, extension-owned normalized point, approval, fresh observation, independent LLM verification |
 
 Hidden, clipped, or covered frames are not merged merely because their scripts can be injected. The parent frame checks the complete iframe box for viewport clipping and occlusion before accepting a child observation. If multiple frames use the same navigation URL and the runtime cannot prove which fully exposed iframe owns which document, their contents are withheld and reported as `frame_visibility_unverified`. This is deliberately conservative: missing evidence is preferable to presenting hidden DOM as visible page content.
+
+## Dense visible controls and observation windows
+
+The element setting is a response-window size, not a limit on what the page can expose. Each frame gathers all currently visible interactive candidates before ordering them. The background merges those candidates by their top-viewport geometry, returns one bounded window, and includes `elementDiscovery` metadata with an opaque continuation cursor.
+
+The cursor retains per-frame offsets and is bound to the document IDs, DOM revisions, frame visibility, viewport, and an ordered-candidate digest. If the page changes between windows, discovery restarts instead of applying old offsets to a new layout. A goal-derived query can rank and filter controls from accessible names, roles, element types, titles, ARIA descriptions, names, and test identifiers; no site or framework-specific selector is embedded in the runtime.
+
+The built-in agent automatically requests the next window when its planner reports a missing-target blocker while `hasMore` is true. External MCP clients receive the same state through `browser_elements`. Only after relevant visible windows are exhausted should the runtime consider scrolling or a precise capability blocker. This prevents a lower grid pager or action button from being mistaken for an inaccessible control merely because it appeared after the first configured window.
 
 ## How model-assisted visual targeting works
 
@@ -23,15 +31,15 @@ Normal DOM refs remain the first choice. A visual action is eligible only when a
 
 1. The current observation contains an exposed canvas or application surface.
 2. A screenshot was captured and bound to that exact viewport observation.
-3. The planner describes one unambiguous visible target and returns a point normalized from `0` to `1000` inside the surface, not the whole screen.
+3. The internal planner, or the Bridge's extension-owned locator, describes one unambiguous visible target and returns a point normalized from `0` to `1000` inside the surface, not the whole screen.
 4. The user reviews the action; visual actions never bypass approval in automatic mode.
 5. Immediately before execution, the runtime captures another coherent observation and screenshot.
-6. An independent verifier using the configured LLM confirms that the description still matches the proposed point. Screenshot text is treated as untrusted evidence, not instructions.
+6. An independent verifier request using the configured LLM confirms that the description still matches the proposed point. Screenshot text is treated as untrusted evidence, not instructions.
 7. The content script checks the surface type, exposed rectangle, point bounds, current hit target, occlusion, and disabled state before dispatching pointer and mouse events.
 
 Any missing screenshot, changed geometry, replaced frame document, occluded point, uncertain verifier response, or model/API failure stops the action. The runtime replans from fresh evidence instead of replaying the coordinate.
 
-The authenticated external MCP bridge currently does not accept raw `visual_click` actions. Its public action contract has no screenshot-binding token, so accepting caller-provided coordinates would weaken the execution boundary. External clients may request a screenshot for analysis, but coordinate execution remains extension-owned until a complete observation-token and independent-verification flow is exposed by that protocol.
+The authenticated external MCP bridge still does not accept raw `visual_click` actions. Instead, `browser_visual_act` lets the caller provide only a current surface ref and a precise target description. The extension captures and binds the screenshot, obtains and verifies the normalized point with the configured model, applies policy and approval, then resolves and verifies the target again against a fresh screenshot immediately before execution. Coordinates, screenshot tokens, policy results, and approval claims never cross the public input boundary.
 
 ## Permission behavior
 
@@ -79,15 +87,21 @@ The real-browser E2E fixture checks that:
 - a hidden cross-origin frame is absent from visible text and actions;
 - child-frame rectangles are transformed into top-viewport coordinates;
 - a nested scroll region reveals a previously clipped control only after scrolling and re-observation;
+- a 121st dense-grid control is found through both opaque cursor paging and dynamic query without a user handoff;
+- changing the DOM invalidates an old element cursor and safely restarts discovery;
+- the built-in model loop continues from a missing-target decision into the next visible-element window;
 - a canvas surface accepts a normalized visual point and produces an observable state change;
 - the independent visual verifier receives the current screenshot, can approve a grounded target, and fails closed on rejection;
+- the authenticated Bridge performs locator and verifier calls both before approval and again before executing a visual action;
 - document replacement, worker restart, approvals, and the authenticated MCP bridge continue to pass their existing regression scenarios.
 
 Run the checks from the repository root:
 
 ```bash
-pnpm run check
-pnpm test
-pnpm run test:bridge
-pnpm run test:e2e
+npm run check
+npm test
+npm run test:bridge
+npm run test:e2e
 ```
+
+The corresponding pnpm commands remain supported.

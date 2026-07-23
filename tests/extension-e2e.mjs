@@ -66,6 +66,7 @@ let server;
 let frameServer;
 let companion;
 let mcpClient;
+let visualAiCallCounts = { locator: 0, verifier: 0, imageInputs: 0 };
 
 const silentLogger = Object.freeze({
   debug() {},
@@ -384,6 +385,18 @@ try {
     assert.equal(verificationContracts.visualVerifierReceivedScreenshot, true);
     assert.equal(verificationContracts.visualActionRejectedClosed, true);
 
+    const internalDiscovery = await exerciseInternalElementDiscoveryContract({
+      cdp,
+      panelSessionId,
+      tabId: firstTabId,
+      context: firstContext.data
+    });
+    assert.equal(internalDiscovery.decisionStatus, "continue");
+    assert.equal(internalDiscovery.actionRef, "e121");
+    assert.deepEqual(internalDiscovery.requestedCursors, ["", "cursor-window-2"]);
+    assert.equal(internalDiscovery.modelCalls, 2);
+    assert.equal(internalDiscovery.userHandoffSuppressed, true);
+
     const transitionContracts = await exerciseTabTransitionContracts({ cdp, panelSessionId });
     assert.equal(transitionContracts.preservedRunningSession, true);
     assert.equal(transitionContracts.deferredWhileBound, true);
@@ -457,6 +470,83 @@ try {
       "Visual-first late candidate",
       "all exposed candidates must be collected before visual ordering and limiting"
     );
+    assert.equal(limitedContext.data.elementDiscovery.hasMore, true);
+    assert.ok(limitedContext.data.elementDiscovery.nextCursor);
+
+    let elementPage = limitedContext;
+    let denseNextPage = elementPage.data.interactiveElements.find(
+      (element) => element.label === "Dense grid next page"
+    );
+    let previousVisited = elementPage.data.elementDiscovery.visited;
+    for (let page = 0; !denseNextPage && elementPage.data.elementDiscovery.hasMore && page < 20; page += 1) {
+      elementPage = await extensionMessage(cdp, panelSessionId, {
+        type: "COLLECT_PAGE_CONTEXT",
+        targetTabId: firstTabId,
+        options: {
+          maxTextChars: 8000,
+          maxElements: 20,
+          elementCursor: elementPage.data.elementDiscovery.nextCursor,
+          redactSensitiveData: true
+        }
+      });
+      assert.ok(elementPage.data.elementDiscovery.visited > previousVisited);
+      previousVisited = elementPage.data.elementDiscovery.visited;
+      denseNextPage = elementPage.data.interactiveElements.find(
+        (element) => element.label === "Dense grid next page"
+      );
+    }
+    assert.ok(
+      denseNextPage?.ref,
+      `cursor paging must make a control after a dense grid reachable: ${JSON.stringify({
+        visited: elementPage.data.elementDiscovery.visited,
+        total: elementPage.data.elementDiscovery.total,
+        hasMore: elementPage.data.elementDiscovery.hasMore,
+        labels: elementPage.data.interactiveElements.map((element) => element.label)
+      })}`
+    );
+
+    const queriedElements = await extensionMessage(cdp, panelSessionId, {
+      type: "COLLECT_PAGE_CONTEXT",
+      targetTabId: firstTabId,
+      options: {
+        maxTextChars: 8000,
+        maxElements: 20,
+        elementQuery: "Dense grid next page",
+        redactSensitiveData: true
+      }
+    });
+    assert.ok(
+      queriedElements.data.interactiveElements.some((element) => element.label === "Dense grid next page"),
+      "goal-derived visible-element search should find the paginator without a page-specific hardcoded rule"
+    );
+    assert.ok(
+      queriedElements.data.elementDiscovery.availableTotal > queriedElements.data.elementDiscovery.total
+    );
+    await evaluate(cdp, panelSessionId, `(async () => {
+      await chrome.scripting.executeScript({
+        target: { tabId: ${JSON.stringify(firstTabId)} },
+        func: () => {
+          const marker = document.createElement("div");
+          marker.id = "cursor-dom-mutation";
+          marker.hidden = true;
+          document.body.appendChild(marker);
+        }
+      });
+      await new Promise((resolve) => setTimeout(resolve, 60));
+    })()`);
+    const resetCursorContext = await extensionMessage(cdp, panelSessionId, {
+      type: "COLLECT_PAGE_CONTEXT",
+      targetTabId: firstTabId,
+      options: {
+        maxTextChars: 8000,
+        maxElements: 20,
+        elementCursor: limitedContext.data.elementDiscovery.nextCursor,
+        redactSensitiveData: true
+      }
+    });
+    assert.equal(resetCursorContext.data.elementDiscovery.cursorReset, true);
+    assert.match(resetCursorContext.data.elementDiscovery.cursorResetReason, /page changed/i);
+    assert.equal(resetCursorContext.data.elementDiscovery.visited, 20);
 
     const lowerScrollResult = await extensionMessage(cdp, panelSessionId, {
       type: "EXECUTE_PAGE_ACTIONS",
@@ -952,6 +1042,88 @@ try {
     }));
     assert.equal(closedSession.closed, true);
 
+    const visualSettingsSnapshot = await evaluate(cdp, panelSessionId, `(async () => {
+      const stored = await chrome.storage.local.get("settings");
+      await chrome.storage.local.set({
+        settings: {
+          ...(stored.settings || {}),
+          apiProfile: "openai-responses",
+          apiEndpoint: ${JSON.stringify(`${origin}/mock-visual-ai`)},
+          model: "e2e-visual-model",
+          includeScreenshot: true,
+          structuredOutput: true,
+          maxApiRetries: 0,
+          bridgeRequireApproval: true,
+          policyGuardEnabled: false
+        }
+      });
+      return stored.settings || {};
+    })()`);
+    const targetPageSessionId = await attach(cdp, firstTargetId);
+    await evaluate(
+      cdp,
+      targetPageSessionId,
+      "document.querySelector('#visual-status').textContent = 'Visual surface idle'; true"
+    );
+    const visualTargetActivated = await evaluate(cdp, panelSessionId, `(async () => {
+      const tab = await chrome.tabs.update(${JSON.stringify(firstTabId)}, { active: true });
+      return Boolean(tab?.active);
+    })()`);
+    assert.equal(visualTargetActivated, true);
+
+    const visualTask = toolData(await mcpClient.callTool({
+      name: "browser_begin",
+      arguments: {
+        goal: "Use the visible canvas to activate the green Apply area and verify the result."
+      }
+    }));
+    const bridgeVisualSurface = visualTask.page.visualSurfaces.find(
+      (surface) => surface.label === "Visual command surface"
+    );
+    assert.ok(bridgeVisualSurface?.ref, "the Bridge observation must expose the current visual surface");
+
+    const visualProposal = toolData(await mcpClient.callTool({
+      name: "browser_visual_act",
+      arguments: {
+        surface_ref: bridgeVisualSurface.ref,
+        target_description: "green Apply area",
+        reason: "Activate the requested visible canvas control."
+      }
+    }));
+    assert.equal(visualProposal.status, "approval_required");
+    assert.equal(visualProposal.operation.status, "waiting_approval");
+
+    const visualApprovals = await extensionMessage(cdp, panelSessionId, {
+      type: "LIST_EXTERNAL_APPROVALS"
+    });
+    const visualPendingOperation = visualApprovals.data.operations.find(
+      (operation) => operation.status === "waiting_approval"
+    );
+    assert.ok(visualPendingOperation?.operation_id);
+    const approvedVisualOperation = await extensionMessage(cdp, panelSessionId, {
+      type: "APPROVE_EXTERNAL_OPERATION",
+      operationId: visualPendingOperation.operation_id
+    });
+    assert.equal(approvedVisualOperation.ok, true);
+    assert.equal(approvedVisualOperation.data.operation.status, "completed");
+
+    const visualCompletion = toolData(await mcpClient.callTool({
+      name: "browser_continue",
+      arguments: {}
+    }));
+    assert.equal(visualCompletion.status, "ready");
+    assert.match(visualCompletion.page.visibleText, /Visual apply complete/);
+    const visualModelStats = await (await fetch(`${origin}/mock-visual-ai-stats`)).json();
+    assert.deepEqual(visualModelStats, { locator: 2, verifier: 2, imageInputs: 4 });
+    const closedVisualSession = toolData(await mcpClient.callTool({
+      name: "browser_end",
+      arguments: {}
+    }));
+    assert.equal(closedVisualSession.closed, true);
+    await evaluate(cdp, panelSessionId, `chrome.storage.local.set({
+      settings: ${JSON.stringify(visualSettingsSnapshot)}
+    })`);
+
     if (process.argv.includes("--local-harness")) {
       await runLocalHarnessBridgeScenario({
         cdp,
@@ -1009,7 +1181,10 @@ async function prepareTestExtension() {
   const { publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
   const publicKeyDer = publicKey.export({ type: "spki", format: "der" });
   manifest.key = publicKeyDer.toString("base64");
-  manifest.host_permissions = ["http://127.0.0.1/*"];
+  // Headless Chrome cannot grant activeTab through a toolbar click, so the
+  // disposable E2E copy receives screenshot access without changing the
+  // production manifest's optional-host-permission policy.
+  manifest.host_permissions = ["<all_urls>"];
   await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
   const digest = createHash("sha256").update(publicKeyDer).digest().subarray(0, 16);
   return Array.from(digest)
@@ -1051,6 +1226,7 @@ async function resolveChromePath() {
 }
 
 async function startFixtureServer() {
+  visualAiCallCounts = { locator: 0, verifier: 0, imageInputs: 0 };
   frameServer = createServer((request, response) => {
     response.setHeader("content-type", "text/html; charset=utf-8");
     if (request.url?.startsWith("/hidden-cross-frame")) {
@@ -1080,7 +1256,66 @@ async function startFixtureServer() {
   const frameAddress = frameServer.address();
   const frameOrigin = `http://127.0.0.1:${frameAddress.port}`;
 
-  server = createServer((request, response) => {
+  server = createServer(async (request, response) => {
+    if (request.url?.startsWith("/mock-visual-ai-stats")) {
+      response.setHeader("content-type", "application/json; charset=utf-8");
+      response.end(JSON.stringify(visualAiCallCounts));
+      return;
+    }
+    if (request.url?.startsWith("/mock-visual-ai")) {
+      const body = await readJsonRequest(request);
+      const instructions = String(body.instructions || "");
+      const hasImage = (body.input || []).some((message) => (
+        (message.content || []).some((item) => item.type === "input_image" && item.image_url)
+      ));
+      if (hasImage) {
+        visualAiCallCounts.imageInputs += 1;
+      }
+
+      let payload;
+      if (instructions.includes("visual target locator")) {
+        visualAiCallCounts.locator += 1;
+        payload = {
+          version: "1.0",
+          status: "found",
+          message: "The requested Apply target is unambiguous inside the current surface.",
+          targetDescription: "green Apply area",
+          xNormalized: 750,
+          yNormalized: 500,
+          confidence: 0.99
+        };
+      } else if (instructions.includes("independent visual-action verifier")) {
+        visualAiCallCounts.verifier += 1;
+        const evidenceId = JSON.stringify(body).match(/visual-evidence-[a-z0-9]+/)?.[0] || "";
+        payload = {
+          version: "1.0",
+          status: "verified",
+          message: "The proposed point matches the visible Apply target.",
+          evidenceIds: [evidenceId],
+          missingEvidence: [],
+          confidence: 0.99
+        };
+      } else {
+        response.statusCode = 400;
+        response.end(JSON.stringify({ error: { message: "Unexpected visual model request." } }));
+        return;
+      }
+
+      response.setHeader("content-type", "application/json; charset=utf-8");
+      response.end(JSON.stringify({
+        id: `resp-e2e-visual-${visualAiCallCounts.locator + visualAiCallCounts.verifier}`,
+        status: "completed",
+        model: "e2e-visual-model",
+        output: [{
+          type: "message",
+          status: "completed",
+          role: "assistant",
+          content: [{ type: "output_text", text: JSON.stringify(payload), annotations: [] }]
+        }],
+        usage: { input_tokens: 20, output_tokens: 10, total_tokens: 30 }
+      }));
+      return;
+    }
     if (request.url?.startsWith("/mock-empty-ai")) {
       response.setHeader("content-type", "application/json; charset=utf-8");
       response.end(JSON.stringify({
@@ -1123,6 +1358,9 @@ async function startFixtureServer() {
     const candidateProbes = Array.from({ length: 24 }, (_, index) => (
       `<button type="button" aria-label="Candidate probe ${index + 1}">${index + 1}</button>`
     )).join("");
+    const denseGridCells = Array.from({ length: 120 }, (_, index) => (
+      `<button type="button" aria-label="Dense grid cell ${index + 1}">${index + 1}</button>`
+    )).join("");
     response.end(`<!doctype html><html><head><title>${second ? "Second" : "First"} tab</title><style>
       #interaction-lab { position: relative; width: 520px; height: 96px; margin-top: 12px; }
       #covered-action { position: absolute; inset: 0 auto auto 0; width: 130px; height: 34px; }
@@ -1133,6 +1371,9 @@ async function startFixtureServer() {
       iframe { width: 180px; height: 70px; }
       #candidate-probes { position: fixed; left: 570px; top: 8px; z-index: 1; display: grid; grid-template-columns: repeat(6, 32px); gap: 2px; }
       #candidate-probes button { box-sizing: border-box; width: 32px; height: 14px; min-width: 0; padding: 0; overflow: hidden; font-size: 7px; }
+      #dense-grid { position: fixed; left: 600px; top: 205px; z-index: 2; width: 190px; display: grid; grid-template-columns: repeat(10, 16px); gap: 1px; padding: 2px; background: white; }
+      #dense-grid button { box-sizing: border-box; width: 16px; height: 12px; min-width: 0; padding: 0; overflow: hidden; font-size: 6px; }
+      #dense-next-page { grid-column: 1 / -1; width: 100% !important; height: 16px !important; font-size: 8px !important; }
       #visual-first-candidate { position: fixed; left: 540px; top: 1px; z-index: 2; width: 24px; height: 14px; padding: 0; font-size: 0; }
       #robustness-lab { position: fixed; left: 540px; top: 82px; z-index: 1; width: 240px; font: 12px sans-serif; }
       #display-contents-copy { display: contents; }
@@ -1151,6 +1392,10 @@ async function startFixtureServer() {
       <h1>${second ? "Second" : "First"} page</h1>
       <div style="display:none">Hidden DOM fact</div>
       <div id="candidate-probes" aria-label="Candidate limit fixtures">${candidateProbes}</div>
+      <div id="dense-grid" role="grid" aria-label="Dense issue grid">
+        ${denseGridCells}
+        <button id="dense-next-page" type="button" aria-label="Dense grid next page">&gt;</button>
+      </div>
       <div id="interaction-lab">
         <button id="covered-action" type="button">Covered action</button>
         <div id="action-cover">Visible cover</div>
@@ -1247,6 +1492,14 @@ async function startFixtureServer() {
   });
   const address = server.address();
   return `http://127.0.0.1:${address.port}`;
+}
+
+async function readJsonRequest(request) {
+  let source = "";
+  for await (const chunk of request) {
+    source += chunk;
+  }
+  return JSON.parse(source || "{}");
 }
 
 async function readDebugPort(profile) {
@@ -1807,6 +2060,199 @@ async function exercisePanelContracts({ cdp, panelSessionId, tabId, context }) {
       await cdp.send("Emulation.clearDeviceMetricsOverride", {}, panelSessionId).catch(() => {});
     }
   }
+}
+
+async function exerciseInternalElementDiscoveryContract({ cdp, panelSessionId, tabId, context }) {
+  return evaluate(cdp, panelSessionId, `(async () => {
+    const originalState = {
+      runtimeSettings: state.runtimeSettings,
+      activeTab: state.activeTab,
+      lastContext: state.lastContext,
+      agentSession: state.agentSession,
+      agentRunUi: state.agentRunUi,
+      currentPlan: state.currentPlan,
+      conversation: state.conversation,
+      evaluationLogs: state.evaluationLogs
+    };
+    const originalCollectDecisionObservation = collectDecisionObservation;
+    const originalLoadMcpToolContext = loadMcpToolContext;
+    const originalLoadMcpAssetContext = loadMcpAssetContext;
+    const originalRequestAiDecision = requestAiDecision;
+    try {
+      state.runtimeSettings = {
+        ...state.settings,
+        includeScreenshot: false,
+        mcpEnabled: false,
+        maxNoProgressSteps: 2,
+        maxActionsPerTurn: 3
+      };
+      state.activeTab = {
+        id: ${JSON.stringify(tabId)},
+        title: ${JSON.stringify(context.title)},
+        url: ${JSON.stringify(context.url)}
+      };
+      state.conversation = [{ role: "user", text: "문제점 조회 그리드의 다음 페이지로 이동해줘" }];
+      state.evaluationLogs = [];
+      state.agentRunUi = null;
+      state.currentPlan = null;
+      state.agentSession = {
+        runId: "element-discovery-e2e",
+        targetTabId: ${JSON.stringify(tabId)},
+        documentId: ${JSON.stringify(context.documentId)},
+        latestUserMessage: "문제점 조회 그리드의 다음 페이지로 이동해줘",
+        step: 0,
+        history: [],
+        evidence: [],
+        currentPageEvidenceId: "",
+        status: "running",
+        stopRequested: false,
+        pendingRequestId: "",
+        noProgressCount: 0,
+        lastObservationFingerprint: "",
+        lastDecisionFingerprint: "",
+        startedAt: new Date().toISOString()
+      };
+
+      const firstContext = {
+        ...structuredClone(${JSON.stringify(context)}),
+        interactiveElements: [{
+          ref: "e1",
+          tag: "button",
+          role: "button",
+          type: "button",
+          label: "Grid row 1",
+          selector: "#row-1",
+          actionability: "interactive"
+        }],
+        interactiveElementStats: {
+          total: 121,
+          availableTotal: 121,
+          included: 80,
+          visited: 80,
+          truncated: true
+        },
+        elementDiscovery: {
+          scope: "current-visual-viewport",
+          query: "",
+          pageSize: 80,
+          returned: 80,
+          total: 121,
+          availableTotal: 121,
+          visited: 80,
+          remaining: 41,
+          hasMore: true,
+          nextCursor: "cursor-window-2"
+        }
+      };
+      const secondContext = {
+        ...structuredClone(firstContext),
+        interactiveElements: [{
+          ref: "e121",
+          tag: "button",
+          role: "button",
+          type: "button",
+          label: "Dense grid next page",
+          selector: "#dense-next-page",
+          actionability: "interactive"
+        }],
+        interactiveElementStats: {
+          total: 121,
+          availableTotal: 121,
+          included: 41,
+          visited: 121,
+          truncated: false
+        },
+        elementDiscovery: {
+          scope: "current-visual-viewport",
+          query: "",
+          pageSize: 80,
+          returned: 41,
+          total: 121,
+          availableTotal: 121,
+          visited: 121,
+          remaining: 0,
+          hasMore: false,
+          nextCursor: ""
+        }
+      };
+      const requestedCursors = [];
+      let modelCalls = 0;
+      collectDecisionObservation = async (discovery = {}) => {
+        requestedCursors.push(discovery.elementCursor || "");
+        const observed = discovery.elementCursor ? secondContext : firstContext;
+        state.lastContext = observed;
+        return { context: observed, screenshotDataUrl: "" };
+      };
+      loadMcpToolContext = async () => ({ enabled: false, tools: [], error: "" });
+      loadMcpAssetContext = async () => ({ enabled: false, resources: [], prompts: [], error: "" });
+      requestAiDecision = async () => {
+        modelCalls += 1;
+        const payload = modelCalls === 1
+          ? {
+              version: "1.0",
+              status: "blocked",
+              message: "현재 요소 묶음에는 다음 페이지 버튼 ref가 없습니다.",
+              summary: "대상 ref 누락",
+              progress: "첫 요소 묶음을 확인했습니다.",
+              doneReason: "현재 요소 묶음에서 대상 누락",
+              completionEvidence: [],
+              needsUserApproval: false,
+              plan: ["다음 페이지 버튼 찾기"],
+              toolCalls: [],
+              actions: [],
+              verification: { required: false, expectedChange: "", successCriteria: [] }
+            }
+          : {
+              version: "1.0",
+              status: "continue",
+              message: "다음 페이지 버튼을 클릭합니다.",
+              summary: "다음 페이지 이동",
+              progress: "추가 요소 묶음에서 대상 버튼을 찾았습니다.",
+              doneReason: "",
+              completionEvidence: [],
+              needsUserApproval: false,
+              plan: ["다음 페이지 버튼 클릭", "결과 재확인"],
+              toolCalls: [],
+              actions: [{
+                id: "click-next-page",
+                type: "click",
+                ref: "e121",
+                reason: "문제점 조회 그리드의 다음 페이지로 이동"
+              }],
+              verification: {
+                required: true,
+                expectedChange: "그리드가 2페이지로 변경됩니다.",
+                successCriteria: ["2페이지 데이터가 보입니다."]
+              }
+            };
+        return { text: JSON.stringify(payload) };
+      };
+
+      const decision = await requestChatDecision(state.agentSession);
+      return {
+        decisionStatus: decision.status,
+        actionRef: decision.actions[0]?.ref || "",
+        requestedCursors,
+        modelCalls,
+        userHandoffSuppressed: !state.conversation.some(
+          (message) => message.role === "assistant" && /직접|수동/.test(message.text || "")
+        )
+      };
+    } finally {
+      collectDecisionObservation = originalCollectDecisionObservation;
+      loadMcpToolContext = originalLoadMcpToolContext;
+      loadMcpAssetContext = originalLoadMcpAssetContext;
+      requestAiDecision = originalRequestAiDecision;
+      state.runtimeSettings = originalState.runtimeSettings;
+      state.activeTab = originalState.activeTab;
+      state.lastContext = originalState.lastContext;
+      state.agentSession = originalState.agentSession;
+      state.agentRunUi = originalState.agentRunUi;
+      state.currentPlan = originalState.currentPlan;
+      state.conversation = originalState.conversation;
+      state.evaluationLogs = originalState.evaluationLogs;
+    }
+  })()`);
 }
 
 async function exerciseAgentVerificationContracts({ cdp, panelSessionId, tabId, context }) {

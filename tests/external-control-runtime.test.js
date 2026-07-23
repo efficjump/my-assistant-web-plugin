@@ -99,6 +99,8 @@ class FakeDriver {
     this.pageExecutions = [];
     this.browserExecutions = [];
     this.screenshotCalls = [];
+    this.visualResolutions = (options.visualResolutions || []).map(clone);
+    this.visualResolutionCalls = [];
   }
 
   async getTab(tabId) {
@@ -129,6 +131,18 @@ class FakeDriver {
     this.screenshotCalls.push(tabId);
     return "data:image/png;base64,ZmFrZQ==";
   }
+
+  async resolveVisualAction(tabId, request) {
+    this.visualResolutionCalls.push({ tabId, request: clone(request) });
+    const index = Math.min(
+      this.visualResolutionCalls.length - 1,
+      Math.max(0, this.visualResolutions.length - 1)
+    );
+    if (!this.visualResolutions.length) {
+      throw new Error("visual resolution unavailable");
+    }
+    return clone(this.visualResolutions[index]);
+  }
 }
 
 function defaultTab(overrides = {}) {
@@ -147,6 +161,57 @@ function createIdFactory() {
     const count = (counts.get(prefix) || 0) + 1;
     counts.set(prefix, count);
     return `${prefix}-${count}`;
+  };
+}
+
+function visualContext(overrides = {}) {
+  return pageContext({
+    interactiveElements: [],
+    visualSurfaces: [{
+      ref: "v1",
+      kind: "canvas",
+      tag: "canvas",
+      role: "img",
+      label: "Nexacro grid",
+      selector: "#grid",
+      actionability: "visual-coordinate-only",
+      rect: { x: 20, y: 80, width: 600, height: 400 }
+    }],
+    visualObservation: {
+      id: "visual-observation-1",
+      screenshotBound: true,
+      coordinateSystem: "surface-relative-0-1000",
+      surfaceRefs: ["v1"]
+    },
+    ...overrides
+  });
+}
+
+function visualResolution(xNormalized) {
+  const context = visualContext({
+    visualObservation: {
+      id: `visual-observation-${xNormalized}`,
+      screenshotBound: true,
+      coordinateSystem: "surface-relative-0-1000",
+      surfaceRefs: ["v1"]
+    }
+  });
+  return {
+    context,
+    action: {
+      id: `visual-${xNormalized}`,
+      type: "visual_click",
+      ref: "v1",
+      visualObservationId: context.visualObservation.id,
+      xNormalized,
+      yNormalized: 920,
+      targetDescription: "다음 페이지 버튼",
+      reason: "문제점 조회 그리드의 다음 페이지로 이동"
+    },
+    attestation: {
+      evidenceId: `visual-evidence-${xNormalized}`,
+      verifier: { message: "verified", confidence: 0.99 }
+    }
   };
 }
 
@@ -297,6 +362,170 @@ test("guided MCP tools manage session, observation, retry, and operation identif
   assert.equal(runtime.getStatus().sessionActive, false);
   const endedAgain = await runtime.dispatch("browser_end", {}, client);
   assert.equal(endedAgain.status, "idle");
+});
+
+test("guided element discovery pages through every visible control and supports dynamic queries", async () => {
+  const driver = new FakeDriver({
+    observations: [
+      pageContext({
+        interactiveElements: [{ ...pageContext().interactiveElements[0], ref: "e1", label: "Grid row 1" }],
+        interactiveElementStats: { total: 121, included: 80, visited: 80, truncated: true },
+        elementDiscovery: {
+          query: "",
+          pageSize: 80,
+          returned: 80,
+          total: 121,
+          visited: 80,
+          remaining: 41,
+          hasMore: true,
+          nextCursor: "cursor-page-2"
+        }
+      }),
+      pageContext({
+        interactiveElements: [{ ...pageContext().interactiveElements[0], ref: "e121", label: "Next page" }],
+        interactiveElementStats: { total: 121, included: 41, visited: 121, truncated: false },
+        elementDiscovery: {
+          query: "",
+          pageSize: 80,
+          returned: 41,
+          total: 121,
+          visited: 121,
+          remaining: 0,
+          hasMore: false,
+          nextCursor: ""
+        }
+      }),
+      pageContext({
+        interactiveElements: [{ ...pageContext().interactiveElements[0], ref: "e1", label: "Next page" }],
+        interactiveElementStats: { total: 1, availableTotal: 121, included: 1, visited: 1, truncated: false },
+        elementDiscovery: {
+          query: "next page",
+          pageSize: 80,
+          returned: 1,
+          total: 1,
+          availableTotal: 121,
+          visited: 1,
+          remaining: 0,
+          hasMore: false,
+          nextCursor: ""
+        }
+      })
+    ]
+  });
+  const { runtime } = await createRuntime({ driver });
+  const client = { name: "Discovery client", version: "1.0.0" };
+  await runtime.armTab(defaultTab());
+
+  const first = await runtime.dispatch("browser_begin", { goal: GOAL }, client);
+  assert.equal(first.page.elementDiscovery.hasMore, true);
+  assert.match(first.next, /browser_elements/i);
+
+  const second = await runtime.dispatch("browser_elements", {}, client);
+  assert.equal(second.page.interactiveElements[0].ref, "e121");
+  assert.equal(second.page.elementDiscovery.hasMore, false);
+  assert.equal(driver.observeCalls[1].options.elementCursor, "cursor-page-2");
+
+  const searched = await runtime.dispatch("browser_elements", { query: "next page" }, client);
+  assert.equal(searched.page.elementDiscovery.query, "next page");
+  assert.equal(driver.observeCalls[2].options.elementQuery, "next page");
+  await assert.rejects(
+    runtime.dispatch("browser_elements", { cursor: "forged-cursor" }, client),
+    /must use nextCursor|No additional visible-element window/
+  );
+});
+
+test("browser_continue can force refresh and automatically invalidates snapshots after observation settings change", async () => {
+  let maxElements = 80;
+  const driver = new FakeDriver({
+    observations: [
+      pageContext({ visibleText: "first snapshot" }),
+      pageContext({ visibleText: "forced snapshot" }),
+      pageContext({ visibleText: "settings snapshot" })
+    ]
+  });
+  const { runtime } = await createRuntime({
+    driver,
+    getSettings: async () => ({
+      bridgeRequireApproval: true,
+      stopOnSensitiveInput: true,
+      redactSensitiveData: true,
+      maxActionsPerTurn: 8,
+      maxElements,
+      maxTextChars: 16000
+    })
+  });
+  const client = { name: "Refresh client", version: "1.0.0" };
+  await runtime.armTab(defaultTab());
+
+  await runtime.dispatch("browser_begin", { goal: GOAL }, client);
+  await runtime.dispatch("browser_continue", {}, client);
+  assert.equal(driver.observeCalls.length, 1, "an unchanged snapshot should remain cached");
+
+  const forced = await runtime.dispatch("browser_continue", { refresh: true }, client);
+  assert.match(forced.page.visibleText, /forced snapshot/);
+  assert.equal(driver.observeCalls.length, 2);
+
+  maxElements = 180;
+  const settingsRefreshed = await runtime.dispatch("browser_continue", {}, client);
+  assert.match(settingsRefreshed.page.visibleText, /settings snapshot/);
+  assert.equal(driver.observeCalls.length, 3);
+});
+
+test("verified visual actions are extension-located, approved, and re-resolved on the latest screenshot", async () => {
+  const initial = visualContext({
+    visualObservation: undefined,
+    automationCapabilities: {
+      visualTargeting: { availableInObservation: false }
+    }
+  });
+  const driver = new FakeDriver({
+    observations: [initial, visualContext({ visibleText: "Page 2" })],
+    visualResolutions: [visualResolution(930), visualResolution(940)]
+  });
+  const { runtime } = await createRuntime({ driver });
+  const client = { name: "Visual client", version: "1.0.0" };
+  await runtime.armTab(defaultTab());
+  await runtime.dispatch("browser_begin", { goal: "Open page 2 of the grid" }, client);
+
+  const proposed = await runtime.dispatch("browser_visual_act", {
+    surface_ref: "v1",
+    target_description: "문제점 조회 그리드 하단의 다음 페이지 버튼",
+    reason: "2페이지를 조회"
+  }, client);
+  assert.equal(proposed.status, "approval_required");
+  assert.equal(driver.pageExecutions.length, 0);
+  assert.equal(driver.visualResolutionCalls.length, 1);
+  assert.equal(driver.visualResolutionCalls[0].request.targetDescription, "문제점 조회 그리드 하단의 다음 페이지 버튼");
+
+  const pendingId = runtime.getStatus().pendingOperationIds[0];
+  const completed = await runtime.approveOperation(pendingId);
+  assert.equal(completed.status, "completed");
+  assert.equal(driver.visualResolutionCalls.length, 2, "approval must trigger a fresh screenshot-bound resolution");
+  assert.equal(driver.pageExecutions.length, 1);
+  assert.equal(driver.pageExecutions[0].actions[0].type, "visual_click");
+  assert.equal(driver.pageExecutions[0].actions[0].xNormalized, 940);
+});
+
+test("a changed visual surface invalidates approval instead of clicking a re-bound ref", async () => {
+  const changedResolution = visualResolution(950);
+  changedResolution.context.visualSurfaces[0].label = "Different application surface";
+  const driver = new FakeDriver({
+    observations: [visualContext({ visualObservation: undefined })],
+    visualResolutions: [visualResolution(930), changedResolution]
+  });
+  const { runtime } = await createRuntime({ driver });
+  const client = { name: "Visual stale client", version: "1.0.0" };
+  await runtime.armTab(defaultTab());
+  await runtime.dispatch("browser_begin", { goal: "Open page 2 of the grid" }, client);
+  await runtime.dispatch("browser_visual_act", {
+    surface_ref: "v1",
+    target_description: "다음 페이지 버튼"
+  }, client);
+
+  const result = await runtime.approveOperation(runtime.getStatus().pendingOperationIds[0]);
+  assert.equal(result.status, "stale");
+  assert.match(result.error, /visual surface changed/i);
+  assert.equal(driver.pageExecutions.length, 0);
 });
 
 test("browser status returns a state-derived next step for MCP clients", async () => {

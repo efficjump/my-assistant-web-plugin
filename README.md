@@ -4,7 +4,7 @@ A Manifest V3 browser extension that observes the active page, plans the next ac
 
 ![Agent side panel](docs/assets/agent-panel.png)
 
-Version `0.7.0` targets Chromium-based browsers version 116 or later. This repository contains a source-loaded development build rather than a store package.
+Version `0.8.0` targets Chromium-based browsers version 116 or later. This repository contains a source-loaded development build rather than a store package.
 
 ## Why this project exists
 
@@ -27,10 +27,11 @@ Completion is not accepted from model prose alone. The runtime issues evidence i
 ## Capabilities
 
 - Observes the URL and only the text, controls, forms, tables, and live regions that are visually exposed in the current viewport
+- Exposes dense visible controls through observation-bound windows and dynamic label/role search instead of treating the configured element count as a browser limit
 - Traverses open Shadow DOM and visually verified same-origin or permission-granted cross-origin frames, while keeping every child-frame ref bound to its document
 - Discovers visible nested scroll regions and scrolls the intended container before observing newly revealed controls
 - Supports `click`, screenshot-bound `visual_click`, `fill`, `select`, `focus`, `hover`, `submit`, `press`, `scroll`, `navigate`, `wait`, `wait_for`, `extract`, and `upload`
-- Uses visual coordinates only inside an observed canvas or application surface, requires approval, and asks an independent LLM verifier to confirm the same target against a fresh screenshot before execution
+- Uses visual coordinates only inside an observed canvas or application surface; coordinates are created inside the extension, require approval, and are independently verified against a fresh screenshot before execution
 - Recognizes semantic controls and visible custom pointer controls, then sends a pointer/mouse sequence before click activation
 - Supports `tab_open`, `tab_focus`, `tab_adopt`, `tab_close`, `download`, and `download_wait`
 - Waits for element state, text, URL, title, live-region, and DOM-stability conditions
@@ -131,21 +132,23 @@ This is the extension's outbound MCP client. To let an MCP-capable local develop
 The recommended bridge path is a standard local `stdio` MCP server. The development tool starts the companion itself, so its MCP configuration does not need a separately copied URL or bearer token. Generate a client-neutral JSON entry with the actual runtime and server paths detected on the current machine:
 
 ```bash
-pnpm install
-pnpm run bridge:config
+npm install
+npm run bridge:config
 ```
+
+`pnpm install` and `pnpm run bridge:config` are equivalent when pnpm is available. npm is fully supported; the package manifest carries the same vulnerable-transitive-version overrides as the pnpm workspace configuration.
 
 Merge the printed server entry into the development tool's documented MCP configuration and restart that tool. On first use, the companion prints one short-lived `Extension setup` value. Paste that value into **Settings → Bridge** and select **연결하고 현재 탭 공유**. The extension strips the one-time code before saving the endpoint, and the companion remembers its selected loopback port so later launches normally reconnect without configuration changes while the browser-side credential remains available.
 
-The default MCP surface is intentionally guided: `browser_begin` returns the first redacted snapshot, `browser_act` submits actions without caller-managed session or observation IDs, `browser_continue` handles approval polling and refreshed observations, and `browser_end` releases the tab. Existing identifier-based tools remain available with `--advanced-tools`. Actions that need approval still appear in the extension, which re-observes the page and validates target preconditions immediately before an approved effect.
+The default MCP surface is intentionally guided: `browser_begin` returns the first redacted snapshot, `browser_elements` searches or pages through additional visible controls, `browser_act` submits DOM actions, `browser_visual_act` requests extension-owned targeting for a canvas or application surface, `browser_continue` handles approval polling and refreshed observations, and `browser_end` releases the tab. Existing identifier-based tools remain available with `--advanced-tools`. Actions that need approval still appear in the extension, which re-observes the page and validates target preconditions immediately before an approved effect.
 
-Clients that support only Streamable HTTP can run `pnpm run bridge` and use the printed endpoint and bearer token. This remains the advanced fallback, not the default setup.
+Clients that support only Streamable HTTP can run `npm run bridge` and use the printed endpoint and bearer token. This remains the advanced fallback, not the default setup.
 
 | Pair and share one tab | Review a state-changing proposal |
 | --- | --- |
 | ![Bridge settings showing an authenticated local connection and one shared test tab](docs/assets/bridge-settings.png) | ![External action approval card for a non-sensitive fixture field](docs/assets/bridge-approval.png) |
 
-Both screenshots are generated by `pnpm run capture:docs` against a temporary browser profile and a local fixture. They contain no user session, private page, persistent credential, or machine-specific path.
+Both screenshots are generated by `npm run capture:docs` against a temporary browser profile and a local fixture. They contain no user session, private page, persistent credential, or machine-specific path.
 
 See [Local MCP companion](docs/bridge.md) for complete startup options, portable MCP client configuration patterns, the tool workflow, security properties, and troubleshooting.
 See [Web structure compatibility](docs/web-compatibility.md) for frame, Shadow DOM, nested-scroll, visual-surface, permission, and browser-policy boundaries.
@@ -176,10 +179,11 @@ The production manifest does not require `<all_urls>`. Site and endpoint origins
 - The model can use only element references and tools present in the current observation.
 - Each run is pinned to an exact tab and document identity.
 - External development tools can access only the tab explicitly shared in the Bridge panel, and detaching it closes their active sessions.
+- A partial interactive-element window is never reported as a page capability limit; internal runs continue discovery automatically, while Bridge clients receive an opaque next cursor and search tool.
 - The local companion binds only to loopback, requires independent MCP and extension credentials, and never puts either credential in a URL.
 - URL, document identity, and target preconditions are checked again immediately before an approved effect.
 - Submission, external navigation, upload, tab changes, downloads, and destructive MCP tools require approval even in automatic mode.
-- A visual-coordinate action always requires a fresh screenshot, explicit approval, stable geometry, and an independent verifier result; a changed or ambiguous target fails closed.
+- A visual-coordinate action always requires a fresh screenshot, explicit approval, stable surface identity, and an independent verifier result. Bridge callers can describe a target but cannot submit coordinates, screenshot bindings, policy results, or approval claims.
 - Passwords, tokens, card data, verification codes, and sensitive URL parameters are blocked or masked by policy.
 - Structured observations are redacted, but a Bridge screenshot contains the visible pixels of the shared tab and can include private on-screen data; request it only when the task needs visual evidence.
 - Upload contents are handed off only after the user selects a file and are not persisted in conversations, traces, or settings.
@@ -206,23 +210,25 @@ Exported traces and audit logs may still contain page-derived information. Revie
 Node.js 20 or later is required.
 
 ```bash
-pnpm run check
-pnpm test
-pnpm run test:bridge
-pnpm run test:e2e
+npm run check
+npm test
+npm run test:bridge
+npm run test:e2e
 # Optional: requires a compatible local CLI already routed to an OpenAI-compatible local endpoint.
-LOCAL_HARNESS_BIN="<COMPATIBLE_CLI>" pnpm run test:e2e:local-harness
+LOCAL_HARNESS_BIN="<COMPATIBLE_CLI>" npm run test:e2e:local-harness
 # Regenerates the privacy-safe documentation screenshots from a temporary profile.
-pnpm run capture:docs
+npm run capture:docs
 ```
+
+The corresponding pnpm commands remain supported.
 
 Run the local panel harness with:
 
 ```bash
-pnpm run serve:test
+npm run serve:test
 ```
 
-The command reports the temporary development address. The E2E suite exercises the Manifest V3 service worker, document replacement, viewport-scoped deep DOM observation, visible cross-origin frame routing, hidden-frame exclusion, nested scroll regions, guarded visual-surface clicks, occlusion and clipping filters, file handoff, tab lifecycle, worker restart, and empty-response protection. The opt-in local-harness scenario additionally launches a compatible CLI, loads a temporary secret-protected MCP configuration, confirms that every assistant turn reports the local `default` model alias, and requires the model to complete the guided begin → act → approval/continue → verification → end workflow against a temporary browser profile.
+The command reports the temporary development address. The E2E suite exercises the Manifest V3 service worker, document replacement, viewport-scoped deep DOM observation, dense-control pagination and search, cursor invalidation after DOM changes, internal-model discovery continuation, visible cross-origin frame routing, hidden-frame exclusion, nested scroll regions, guarded visual-surface clicks, extension-owned Bridge visual targeting, occlusion and clipping filters, file handoff, tab lifecycle, worker restart, and empty-response protection. The opt-in local-harness scenario additionally launches a compatible CLI, loads a temporary secret-protected MCP configuration, confirms that every assistant turn reports the local `default` model alias, and requires the model to complete the guided begin → act → approval/continue → verification → end workflow against a temporary browser profile.
 
 ## Public-release audit
 

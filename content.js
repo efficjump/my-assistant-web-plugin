@@ -83,9 +83,16 @@ function collectPageContext(options) {
   observeDomScopes(assistantPageState.scopes);
 
   const maxTextChars = clampNumber(options.maxTextChars, 4000, 50000, 16000);
-  const maxElements = clampNumber(options.maxElements, 20, 180, 80);
+  const maxElements = clampNumber(options.maxElements, 1, 500, 80);
+  const elementOffset = Math.floor(clampNumber(options.elementOffset, 0, Number.MAX_SAFE_INTEGER, 0));
+  const elementQuery = normalizeWhitespace(options.elementQuery || "").slice(0, 500);
   const redactSensitiveData = options.redactSensitiveData !== false;
-  const interactiveElementCollection = collectInteractiveElements(maxElements, redactSensitiveData);
+  const interactiveElementCollection = collectInteractiveElements({
+    limit: maxElements,
+    offset: elementOffset,
+    query: elementQuery,
+    redactSensitiveData
+  });
   const interactiveElements = interactiveElementCollection.elements;
   const scrollRegions = collectScrollRegions(Math.max(6, Math.min(24, Math.ceil(maxElements / 4))), redactSensitiveData);
   const visualSurfaces = collectVisualSurfaces(Math.max(4, Math.min(16, Math.ceil(maxElements / 5))), redactSensitiveData);
@@ -277,7 +284,11 @@ function isDomInstance(element, constructorName) {
   return Boolean(Constructor && element instanceof Constructor);
 }
 
-function collectInteractiveElements(maxElements, redactSensitiveData) {
+function collectInteractiveElements(options) {
+  const limit = Math.floor(clampNumber(options?.limit, 1, 500, 80));
+  const offset = Math.floor(clampNumber(options?.offset, 0, Number.MAX_SAFE_INTEGER, 0));
+  const query = normalizeWhitespace(options?.query || "").slice(0, 500);
+  const redactSensitiveData = options?.redactSensitiveData !== false;
   const seen = new Set();
   const candidates = [];
   for (const [discoveryIndex, rawElement] of queryAllDom("*").entries()) {
@@ -302,15 +313,23 @@ function collectInteractiveElements(maxElements, redactSensitiveData) {
       hitPoint,
       scope: findScopeForElement(element),
       rect: getGlobalRect(element),
-      discoveryIndex
+      discoveryIndex,
+      searchScore: query ? scoreInteractiveCandidateForQuery(element, query) : 0
     });
   }
 
-  candidates.sort(compareInteractiveCandidatesByVisualPosition);
-  const includedCandidates = candidates.slice(0, maxElements);
+  const matchingCandidates = query
+    ? candidates
+      .filter((candidate) => candidate.searchScore > 0)
+      .sort((left, right) => (
+        right.searchScore - left.searchScore
+        || compareInteractiveCandidatesByVisualPosition(left, right)
+      ))
+    : candidates.sort(compareInteractiveCandidatesByVisualPosition);
+  const includedCandidates = matchingCandidates.slice(offset, offset + limit);
   const elements = includedCandidates.map((candidate, index) => {
     const { element } = candidate;
-    const ref = `e${index + 1}`;
+    const ref = `e${offset + index + 1}`;
     const info = describeInteractiveElement(element, ref, {
       redactSensitiveData,
       scope: candidate.scope,
@@ -328,11 +347,85 @@ function collectInteractiveElements(maxElements, redactSensitiveData) {
   return {
     elements,
     stats: {
-      total: candidates.length,
+      total: matchingCandidates.length,
+      availableTotal: candidates.length,
       included: elements.length,
-      truncated: candidates.length > elements.length
+      offset,
+      query,
+      orderDigest: digestInteractiveCandidateOrder(matchingCandidates),
+      truncated: offset + elements.length < matchingCandidates.length
     }
   };
+}
+
+function digestInteractiveCandidateOrder(candidates) {
+  const source = (candidates || []).map((candidate) => [
+    candidate.discoveryIndex,
+    candidate.element.tagName?.toLowerCase() || "",
+    getAccessibleName(candidate.element),
+    Math.round(candidate.rect.left),
+    Math.round(candidate.rect.top),
+    Math.round(candidate.rect.width),
+    Math.round(candidate.rect.height)
+  ]);
+  let hash = 2166136261;
+  const text = JSON.stringify(source);
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+function scoreInteractiveCandidateForQuery(element, query) {
+  const normalizedQuery = normalizeSearchText(query);
+  if (!normalizedQuery) {
+    return 0;
+  }
+  const tag = element.tagName?.toLowerCase() || "";
+  const inputType = tag === "input" ? String(element.type || "").toLowerCase() : "";
+  const role = element.getAttribute("role") || inferredRole(element, inputType);
+  const label = getAccessibleName(element);
+  const descriptor = normalizeSearchText([
+    label,
+    role,
+    tag,
+    inputType,
+    element.getAttribute("name"),
+    element.getAttribute("title"),
+    element.getAttribute("aria-description"),
+    element.getAttribute("data-testid")
+  ].filter(Boolean).join(" "));
+  if (!descriptor) {
+    return 0;
+  }
+
+  let score = 0;
+  if (descriptor === normalizedQuery) {
+    score += 1000;
+  } else if (descriptor.includes(normalizedQuery) || normalizedQuery.includes(descriptor)) {
+    score += 500;
+  }
+  const tokens = tokenizeSearchText(normalizedQuery);
+  for (const token of tokens) {
+    if (descriptor.includes(token)) {
+      score += Math.max(8, Math.min(80, token.length * 8));
+    }
+    if (normalizeSearchText(label).includes(token)) {
+      score += 40;
+    }
+  }
+  return score;
+}
+
+function normalizeSearchText(value) {
+  return normalizeWhitespace(value).toLocaleLowerCase();
+}
+
+function tokenizeSearchText(value) {
+  const normalized = normalizeSearchText(value);
+  const words = normalized.match(/[\p{L}\p{N}_-]+|[^\p{L}\p{N}\s]/gu) || [];
+  return Array.from(new Set(words.filter((token) => token.length > 0))).slice(0, 32);
 }
 
 function compareInteractiveCandidatesByVisualPosition(left, right) {
