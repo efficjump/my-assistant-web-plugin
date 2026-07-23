@@ -1,10 +1,22 @@
 # My Assistant Web Plugin
 
-A Manifest V3 browser extension that observes the active page, plans the next action for a natural-language goal, executes approved tools or page actions, and verifies the resulting state.
+A Manifest V3 browser extension that turns a configured language model into a bounded browser agent. It observes the active page, plans the next action for a natural-language goal, executes approved tools or page actions, and verifies the resulting state before reporting completion.
 
 ![Agent side panel](docs/assets/agent-panel.png)
 
-Version `0.9.0` targets Chromium-based browsers version 116 or later. This repository contains a source-loaded development build rather than a store package.
+Version `0.9.0` with Bridge protocol `2.2` targets Chromium-based browsers version 116 or later. This repository contains a source-loaded development build rather than a store package. The screenshots in this README were regenerated from the current version with a temporary browser profile and local fixtures.
+
+## Choose the workflow
+
+The extension has three related but distinct integration paths:
+
+| What you want to do | Use | Where the model runs | Does it control the page? |
+| --- | --- | --- | --- |
+| Give browser tasks directly in the extension | **Built-in agent** | At the AI endpoint configured in **Settings → AI 연결** | Yes, through the extension's observe → approve → act → verify loop |
+| Let a local MCP-capable development tool use the current browser tab | **Local Bridge** | In the external development tool; visual targeting uses the extension's configured model | Yes, but only for the tab explicitly shared in **Settings → 개발 도구** |
+| Let the built-in agent call a remote tool server | **Outbound MCP client** | At the configured AI endpoint | No direct browser sharing; it calls the configured Streamable HTTP MCP tools |
+
+The Bridge is not required for normal use of the built-in agent. Conversely, enabling outbound MCP does not register this browser extension in a development tool; that is the Bridge's job.
 
 ## Why this project exists
 
@@ -46,6 +58,10 @@ Completion is not accepted from model prose alone. The runtime issues evidence i
 - Records privacy-preserving AI request audit metadata
 - Treats an HTTP success with no usable output as an explicit failure
 
+The **Context** inspector shows what the current browser observation actually contains: visible text and controls, mapped frames, nested scroll regions, visual surfaces, automation constraints, selection, and recent logs. It is useful for distinguishing a model-planning problem from a browser-permission or page-structure boundary.
+
+![Context inspector populated by the real-browser compatibility fixture](docs/assets/web-compatibility.png)
+
 ## API profiles
 
 | Profile | Purpose | Structured response strategy |
@@ -71,16 +87,49 @@ Custom JSON templates may use the following values:
 
 When `Response path` is empty, the extension dynamically inspects common response structures for usable text.
 
-## Installation
+## Quick start: built-in agent
 
-1. Clone or download the repository.
-2. Open the extension management page in a supported Chromium-based browser.
+### Requirements
+
+- Chromium-based browser version 116 or later
+- An AI endpoint compatible with one of the profiles above
+- A model that can reliably return structured JSON decisions
+- Image input support on that endpoint only when screenshot reasoning or visual-surface actions are needed
+
+Node.js is not required to load and use the extension itself. Node.js 20 or later is required for the local Bridge, tests, and documentation capture.
+
+### 1. Load the extension
+
+1. Clone or download this repository.
+2. Open the browser's extension management page.
 3. Enable developer mode.
 4. Choose **Load unpacked**.
-5. Select the repository root.
-6. Select the extension action. The default workspace is the side panel; **Settings → 일반** can switch the action to a reusable full tab.
+5. Select the repository root: the directory containing `manifest.json`.
+6. Pin or select the extension action. The default workspace opens in the side panel.
 
-In the **AI 연결** settings tab, configure the API format, endpoint, model, and authentication header. Authentication values are session-only by default and are persisted only when the user explicitly enables persistent storage.
+After pulling a newer source revision, return to the extension management page and select **Reload** for this extension. A source-loaded extension does not update itself.
+
+### 2. Connect a model
+
+Open **Settings → AI 연결** and configure:
+
+1. **API format** matching the endpoint protocol.
+2. **Endpoint URL** and **Model**.
+3. The authentication header name and value required by the endpoint.
+4. A custom request template and response path only when using **Custom JSON**.
+5. **Connection test** before starting a browser task.
+
+Authentication values are session-only by default and are persisted only when the user explicitly enables persistent storage. The endpoint must support the selected structured-response strategy. If visual targeting is expected, enable screenshots and confirm that the selected model accepts image input.
+
+### 3. Run and verify a task
+
+1. Open a normal web page and then open the extension.
+2. Enter a complete goal, including the result or evidence you expect.
+3. Review approval cards for state-changing, sensitive, or externally visible effects.
+4. Keep the target tab open while the task runs.
+5. Check the final answer and **작업 흐름** card. A task is complete only after the extension has re-observed the result and verified the returned evidence.
+
+The agent can dynamically request another visible-control window with a `discover` decision. It searches accessible labels, roles, safe attributes, and nearby table/row/form/dialog/region text locally, similar to using a targeted source search instead of loading an entire file. Only matched control descriptors are sent to the model. If the target is outside the viewport, the agent must scroll and observe again; local search does not expose offscreen or hidden content.
 
 ## Settings and workspace placement
 
@@ -129,26 +178,162 @@ This is the extension's outbound MCP client. To let an MCP-capable local develop
 
 ## External developer-tool bridge
 
-The recommended bridge path is a standard local `stdio` MCP server. The development tool starts the companion itself, so its MCP configuration does not need a separately copied URL or bearer token. Generate a client-neutral JSON entry with the actual runtime and server paths detected on the current machine:
+The Bridge lets an MCP-capable local development tool operate one browser tab that the user explicitly shares. It does not expose a raw browser-debugging port. The extension remains responsible for page observation, redaction, action validation, approval, execution, and result verification.
+
+```mermaid
+flowchart LR
+    C["MCP development tool"] -->|"stdio"| B["Local companion"]
+    B -->|"Authenticated loopback WebSocket"| E["Extension"]
+    E -->|"Observe and act"| T["One shared tab"]
+    E -->|"Approval card"| U["User"]
+    U -->|"Approve or reject"| E
+```
+
+### Bridge requirements
+
+- Node.js 20 or later
+- This extension loaded and enabled in a Chromium-based browser
+- An MCP client that can start a local `stdio` server; Streamable HTTP is available as a fallback
+- Loopback connections permitted on the machine
+
+### Recommended setup: stdio
+
+The recommended path is a standard local `stdio` MCP server. The development tool starts and stops the companion as its child process, so there is no separate daemon to launch and no bearer token to copy into the client.
+
+From the repository root:
 
 ```bash
 npm install
 npm run bridge:config
 ```
 
-`pnpm install` and `pnpm run bridge:config` are equivalent when pnpm is available. npm is fully supported; the package manifest carries the same vulnerable-transitive-version overrides as the pnpm workspace configuration.
+`npm` is fully supported. If `pnpm` is not installed, do not install it just for the Bridge; use the commands above. When pnpm is already available, `pnpm install` and `pnpm run bridge:config` are equivalent.
 
-Merge the printed server entry into the development tool's documented MCP configuration and restart that tool. On first use, the companion prints one short-lived `Extension setup` value. Paste that value into **Settings → Bridge** and select **연결하고 현재 탭 공유**. The extension strips the one-time code before saving the endpoint, and the companion remembers its selected loopback port so later launches normally reconnect without configuration changes while the browser-side credential remains available.
+`bridge:config` detects the current Node.js executable and companion file and prints a client-neutral entry:
 
-The default MCP surface is intentionally guided: `browser_begin` returns the first redacted snapshot, `browser_elements` retrieves relevant visible controls with `query`, `roles`, and `near_text` before falling back to an opaque cursor, `browser_act` submits DOM actions, `browser_visual_act` requests extension-owned targeting for a canvas or application surface, `browser_continue` handles approval polling and refreshed observations, and `browser_end` releases the tab. The built-in model uses the same local retrieval layer through a structured `discover` decision. Existing identifier-based tools remain available with `--advanced-tools`. Actions that need approval still appear in the extension, which reconstructs the exact search window and validates target preconditions immediately before an approved effect.
+```json
+{
+  "mcpServers": {
+    "my-assistant-web": {
+      "command": "<ABSOLUTE_NODE_EXECUTABLE>",
+      "args": ["<ABSOLUTE_REPOSITORY_PATH>/bridge/server.mjs", "--stdio"]
+    }
+  }
+}
+```
 
-Clients that support only Streamable HTTP can run `npm run bridge` and use the printed endpoint and bearer token. This remains the advanced fallback, not the default setup.
+The generated absolute paths are machine-specific. Merge the complete server entry into the development tool's documented MCP configuration rather than copying the placeholder example, then restart or reconnect that tool. Do not commit the generated paths.
+
+On the first Bridge call, the companion reports one short-lived value through its MCP error and standard-error log:
+
+```text
+Extension setup: ws://127.0.0.1:<PORT>/extension#pair=<ONE_TIME_CODE>
+```
+
+Finish the browser side once:
+
+1. Bring the intended normal web page to the foreground.
+2. Open the extension and choose **Settings → 개발 도구**.
+3. Paste the complete `Extension setup` value, including `#pair=...`.
+4. Select **연결하고 현재 탭 공유**.
+5. Confirm that the panel shows **연결됨** and names the intended shared tab.
+6. Retry the original Bridge call in the development tool.
+
+The one-time code is consumed during pairing and stripped before the endpoint is stored. The companion remembers its loopback port, so later launches normally reconnect without repeating these steps while the browser-side credential remains available. Sharing a different tab or stopping sharing is always an explicit extension action.
 
 | Pair and share one tab | Review a state-changing proposal |
 | --- | --- |
 | ![Bridge settings showing an authenticated local connection and one shared test tab](docs/assets/bridge-settings.png) | ![External action approval card for a non-sensitive fixture field](docs/assets/bridge-approval.png) |
 
-Both screenshots are generated by `npm run capture:docs` against a temporary browser profile and a local fixture. They contain no user session, private page, persistent credential, or machine-specific path.
+### Guided Bridge workflow
+
+The default MCP surface keeps protocol bookkeeping inside the companion:
+
+| Tool | When to use it |
+| --- | --- |
+| `browser_begin` | Start or safely resume one complete browser goal and receive the first redacted page snapshot |
+| `browser_elements` | Retrieve visible controls by label terms, roles, and nearby context, or continue an opaque result cursor |
+| `browser_act` | Propose a bounded DOM action or small action group using refs from the latest snapshot |
+| `browser_continue` | Read an approval result and receive the refreshed page; use `refresh: true` after an out-of-band page change |
+| `browser_screenshot` | Request visible pixels only when DOM observation is insufficient and visual evidence is necessary |
+| `browser_visual_act` | Describe a target inside a current canvas/application surface; the extension locates and verifies it |
+| `browser_end` | Release the shared-tab lease after completion or a terminal blocker |
+
+A reliable client loop is:
+
+1. Call `browser_begin` once with the user's full browser goal.
+2. Inspect the returned visible page state and use only refs from that result.
+3. If a visible target is absent, call `browser_elements` with a focused search before paging blindly or asking the user to click.
+4. Propose the next required effect with `browser_act`, then always call `browser_continue`.
+5. If the response is `approval_required`, let the user approve or reject it in the extension and call `browser_continue` again. Do not submit a duplicate action.
+6. Re-observe after scrolling, navigation, approval, or any other page change and use only the new refs.
+7. Verify the requested result in the refreshed page state, then call `browser_end`.
+
+The caller does not need to preserve session, observation, operation, or retry identifiers in guided mode. Those identifiers, deterministic retry protection, and page-state bindings remain inside the companion and extension.
+
+### Finding controls on dense pages
+
+The first page snapshot is deliberately bounded, but that is not an 80-element browser limit. Search currently visible controls by semantic evidence:
+
+```json
+{
+  "query": "next page",
+  "roles": ["button"],
+  "near_text": "issue grid"
+}
+```
+
+The extension searches accessible names, roles, tags, input types, placeholders, titles, safe attributes, and bounded context from the nearest visible cell, row, collection, form, dialog, or region. Only relevant descriptors cross the Bridge boundary. Each result includes `searchMatch` evidence explaining the matched fields and redacted context.
+
+When `hasMore` is true, continue the returned opaque `nextCursor` with the same search. The cursor is bound to the query, role and context filters, document and frame identities, DOM revisions, viewport, and ranked result digest. If page state changes, it resets instead of silently rebinding a ref. A target outside the viewport still requires scrolling and a fresh observation.
+
+For a canvas or application surface with no DOM ref, use `browser_visual_act` with a current surface ref and precise visible description. Do not send coordinates. The extension's configured model locates the point, an independent verifier checks the same screenshot evidence, and approval-time re-observation repeats the resolution before execution.
+
+### Approval behavior
+
+Approval of an MCP tool call in the development tool and approval of a browser effect in the extension are separate layers. The former cannot bypass extension policy.
+
+When an operation waits for approval:
+
+1. Review the exact target, action, reason, and warning in the extension.
+2. Approve or reject the proposal there.
+3. Continue the same task in the development tool.
+4. Call `browser_continue` to read the existing operation result and fresh page state.
+
+Immediately before an approved effect, the extension re-observes the document and validates URL, document identity, target fingerprint, and any structured-search window that produced the ref. A changed or rebound target becomes `stale` and is not executed.
+
+### Streamable HTTP fallback
+
+Use this only when the MCP client cannot launch a local `stdio` server:
+
+```bash
+npm run bridge
+```
+
+The command prints a loopback `/mcp` endpoint, an MCP bearer token, and a separate `Extension setup` value. Configure the token as an authorization header or through the client's supported secret environment-variable mechanism:
+
+```text
+Authorization: Bearer <MCP_BEARER_TOKEN>
+```
+
+Never put the token in the URL or commit it to the repository. The exact HTTP transport keys and configuration-file location vary by MCP client.
+
+### Bridge troubleshooting
+
+| Symptom | What to check |
+| --- | --- |
+| `pnpm: command not found` | Use `npm install` and `npm run bridge:config`; pnpm is optional. |
+| First call says the extension is not connected | Copy the complete new `Extension setup` value into **Settings → 개발 도구**, share the intended tab, and retry `browser_begin`. |
+| Setup value is invalid or expired | Restart or reconnect the MCP server to generate a new one-time value. |
+| Connected, but the wrong tab is shared | Focus the intended web page and select **현재 탭으로 변경** in the Bridge settings. |
+| Operation remains `approval_required` | Approve or reject it in the extension, then call `browser_continue`; do not call `browser_act` again for the same proposal. |
+| A ref or proposal becomes `stale` | Refresh with `browser_continue` and plan from the latest refs. |
+| A visible control is missing | Use a focused `browser_elements` query and its cursor; scroll and re-observe if the target is outside the viewport. |
+| Canvas target has no ref | Use `browser_visual_act` with the current visual-surface ref and description; screenshot input must be enabled and supported by the configured model. |
+| `uv_spawn`, `ENOENT`, or a stop-hook spawn error appears | This normally comes from the development tool's local hook process, not from the Bridge protocol. Check that hook's executable and `PATH`, or disable the broken hook; verify the Bridge separately from the extension's connected/shared indicators and actual MCP call log. |
+| Streamable HTTP returns `401` | Send the current MCP token as `Authorization: Bearer ...`; the one-time extension setup code is not that token. |
+
+All documentation screenshots are generated by `npm run capture:docs` against a temporary browser profile and local fixtures. They contain no user session, private page, persistent credential, or machine-specific filesystem path. Loopback ports and synthetic fixture URLs may vary between captures.
 
 See [Local MCP companion](docs/bridge.md) for complete startup options, portable MCP client configuration patterns, the tool workflow, security properties, and troubleshooting.
 See [Web structure compatibility](docs/web-compatibility.md) for frame, Shadow DOM, nested-scroll, visual-surface, permission, and browser-policy boundaries.

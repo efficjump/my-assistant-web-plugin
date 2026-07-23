@@ -60,7 +60,7 @@ Extension setup: ws://127.0.0.1:<PORT>/extension#pair=<ONE_TIME_CODE>
 In the extension side panel:
 
 1. Open the intended normal web page.
-2. Open **Settings → Bridge**.
+2. Open **Settings → 개발 도구**.
 3. Paste the complete `Extension setup` value.
 4. Select **연결하고 현재 탭 공유**.
 
@@ -243,7 +243,18 @@ This design does not make every page automatable. Browser permission prompts, pa
 
 ### The first browser call says the extension is not connected
 
-Copy the complete `Extension setup` value from that error or from the companion's standard-error log. Paste it into **Settings → Bridge** and select **연결하고 현재 탭 공유**, then retry `browser_begin`.
+Copy the complete `Extension setup` value from that error or from the companion's standard-error log. Paste it into **Settings → 개발 도구** and select **연결하고 현재 탭 공유**, then retry `browser_begin`.
+
+### `pnpm` is not installed
+
+Use npm:
+
+```bash
+npm install
+npm run bridge:config
+```
+
+pnpm is optional. The Bridge does not require installing or enabling it when npm is already available.
 
 ### The setup code is invalid or expired
 
@@ -251,7 +262,7 @@ The code is one-time and short-lived. Restart the MCP server process to generate
 
 ### The bridge is connected but the wrong tab is shared
 
-Bring the intended normal web page to the foreground, open **Settings → Bridge**, and select **현재 탭으로 변경**. Browser-internal and other restricted URLs cannot be shared.
+Bring the intended normal web page to the foreground, open **Settings → 개발 도구**, and select **현재 탭으로 변경**. Browser-internal and other restricted URLs cannot be shared.
 
 ### An operation remains `approval_required`
 
@@ -288,3 +299,7 @@ Confirm that the client sends the current token as `Authorization: Bearer ...`. 
 ### Tools are listed but no real browser call appears
 
 Verify that the configured MCP server is connected in the same development-tool process and that the extension badge shows a shared tab. Model-generated text that resembles a tool name is not proof of an invocation; use the client's MCP event view or the extension's external-session indicator.
+
+### The development tool reports `uv_spawn`, `ENOENT`, or a stop-hook error
+
+These errors normally come from a local hook process that the development tool tried to start, rather than from an MCP Bridge response. Check the hook command, executable permissions, absolute path, and inherited `PATH`, or temporarily disable that hook. Diagnose the Bridge independently by confirming that **Settings → 개발 도구** shows both a connected companion and the intended shared tab, then check whether an actual MCP tool call appears in the client or extension session log.
