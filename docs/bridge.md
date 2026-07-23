@@ -1,6 +1,6 @@
 # Local MCP companion
 
-The local companion lets an MCP-capable development tool work with one browser tab explicitly shared through the extension. The default setup uses standard `stdio`, one extension setup value, and a guided observe/discover/act/verify loop. Session IDs, observation IDs, operation IDs, and idempotency keys stay inside the extension instead of being copied between model calls.
+The local companion lets an MCP-capable development tool work with one browser tab explicitly shared through the extension. Bridge protocol `2.3` uses standard `stdio`, one extension setup value, and a guided observe/discover/act/verify loop by default. Session IDs, observation IDs, operation IDs, idempotency keys, and the immutable task intent stay inside the extension instead of being reconstructed between model calls.
 
 ```mermaid
 flowchart LR
@@ -74,7 +74,7 @@ The default tool surface is deliberately small:
 
 | Tool | Purpose |
 | --- | --- |
-| `browser_begin` | Start or resume the caller's task and return the current redacted page snapshot |
+| `browser_begin` | Start or resume the caller's task and return its immutable intent with the current redacted page snapshot |
 | `browser_elements` | Retrieve relevant visible controls by label terms, roles, and nearby context, or continue its opaque cursor |
 | `browser_act` | Propose the next bounded actions using refs from that snapshot |
 | `browser_continue` | Read approval status or return a refreshed snapshot; `refresh: true` forces a new observation |
@@ -85,18 +85,39 @@ The default tool surface is deliberately small:
 A development tool should follow this loop:
 
 1. Call `browser_begin` once with the user's complete goal.
-2. Plan only from the returned `page` snapshot and its current element refs.
+2. Read the returned `intent`, then plan only from that boundary and the returned `page` snapshot with its current element refs.
 3. If the needed visible control is absent, first call `browser_elements` with a goal-derived `query`, optional `roles`, and optional `near_text`. Continue its `nextCursor` only when more matching results are needed.
 4. Use a `scroll` action and observe again when the target is outside the current viewport; element paging covers only controls already visible in that viewport.
 5. Call `browser_act` with the next required DOM action or small action group. For an exposed canvas or application surface without a DOM ref, call `browser_visual_act` with only its surface ref and visible target description.
 6. Call `browser_continue` after every proposal.
 7. If the response is `approval_required`, ask the user to review the extension and call `browser_continue` again after their decision. Do not resubmit the action.
-8. Repeat discovery, action, and continuation until the refreshed snapshot verifies the goal.
-9. Call `browser_end` before returning the final answer.
+8. Repeat discovery, action, and continuation only while the refreshed snapshot has not met the goal and the returned intent still authorizes the next effect.
+9. If an operation returns `failed`, `blocked`, `rejected`, `cancelled`, or `unknown_after_restart`, do not propose another action in that task.
+10. Call `browser_end` after completion or a terminal operation and before returning the final answer.
 
 The caller never supplies a session, observation, operation, or retry identifier in this default mode. The extension creates deterministic retry keys from the current observation and proposed effects, prevents a pending proposal from being duplicated, and refreshes the observation between completed actions.
 
 Calling `browser_begin` again with the same goal and MCP client resumes the current snapshot. A different goal must first end the active task. A different MCP client cannot take over an existing guided session.
+
+### Immutable goal and repetition boundary
+
+`browser_begin` resolves the complete goal once, before an action is proposed. The returned object includes an `intent` such as:
+
+```json
+{
+  "mode": "standalone",
+  "objective": "Move to the next page once and report the visible result.",
+  "repeatPolicy": "once",
+  "repeatLimit": 1,
+  "completionCriteria": [
+    "The refreshed snapshot shows one page transition and contains the requested visible result."
+  ]
+}
+```
+
+The exact objective and criteria are produced dynamically from the supplied goal. `once` is the safe default. An explicit numeric request can resolve to `bounded` with that count, while a request that names an observable stopping condition can resolve to `until_condition`. The same visible control remaining after a successful action is not permission to repeat it.
+
+The extension records a semantic effect key from the action type, stable target description, and material parameters rather than relying on short-lived refs or action IDs. It checks the limit when an action is proposed and again immediately before execution. This second check prevents two approved or retried proposals from crossing the boundary. If the goal really needs more occurrences, end the current task and begin a new complete goal with an explicit count or stopping condition.
 
 Element refs remain observation-scoped. A refreshed snapshot or element window can assign different refs, so every new action must use only the latest `page` result.
 
@@ -128,9 +149,11 @@ When `browser_act` returns `approval_required`:
 2. Review the exact redacted effects and targets.
 3. Approve or reject them.
 4. Continue the same development-tool conversation.
-5. Call `browser_continue`; it reads the existing operation and refreshes the page after a completed or rejected proposal.
+5. Call `browser_continue`; it reads the existing operation and refreshes the page after a completed proposal.
 
 The extension re-observes the document and compares target fingerprints immediately before an approved effect. For a target returned by `browser_elements`, it privately retains and reconstructs the exact search filter and cursor window before checking the ref. A changed page, reordered result set, changed filter binding, or changed control becomes `stale` instead of executing an outdated or rebound action. The next `browser_continue` returns a fresh snapshot so the client can reconsider the plan.
+
+A rejection or execution failure is terminal for the current guided task. `browser_continue` returns that same terminal result with an instruction to call `browser_end`; it does not turn the error into a fresh action opportunity. This prevents a later natural-language message from being merged into the failed task and replaying a relative action such as “next page.”
 
 The same approval behavior applies to `browser_visual_act`. The approval describes the visible target rather than trusting caller-provided coordinates, because the caller is not allowed to provide them.
 
@@ -154,7 +177,7 @@ That configuration starts the stdio server with these tools:
 - `browser_operation_get`
 - `browser_session_close`
 
-In this mode the caller must preserve `session_id`, `observation_id`, `operation_id`, and a caller-generated `idempotency_key`. The extension applies the same tab isolation, policy, approval, precondition, and evidence checks in both modes.
+In this mode the caller must preserve `session_id`, `observation_id`, `operation_id`, and a caller-generated `idempotency_key`. The extension applies the same immutable intent, semantic repetition boundary, tab isolation, policy, approval, precondition, and evidence checks in both modes.
 
 ## Streamable HTTP fallback
 
@@ -234,6 +257,8 @@ By default, state is stored in the operating system's per-user application-state
 - Screenshots contain the visible pixels of the shared tab and may include private on-screen information, so clients should request them only when required.
 - Visual actions are located and independently verified inside the extension. External callers cannot provide coordinates, screenshot bindings, policy verdicts, or approval grants, and the target is resolved again after approval.
 - Every proposal is schema-checked and independently assessed. Sensitive-data handling can be blocked outright.
+- Every session freezes its goal into a repetition policy before execution. Completed semantic effects are counted independently of observation-scoped refs and cannot exceed that policy.
+- Failed, blocked, rejected, cancelled, and restart-unknown guided operations are terminal until the caller closes the session.
 - Approval grants are bound to the operation digest, observation, document, tab, and expiry.
 - A service-worker restart never blindly retries an operation whose execution outcome is unknown.
 
@@ -271,6 +296,14 @@ Approve or reject it in the extension, then call `browser_continue` in the same 
 ### A proposal becomes `stale`
 
 Call `browser_continue` to get a fresh snapshot, then plan again using only its refs. The stale proposal is never replayed.
+
+### An operation is terminal after an error or rejection
+
+For `failed`, `blocked`, `rejected`, `cancelled`, or `unknown_after_restart`, call `browser_end`. Do not submit another action in the same task. If the user still wants to proceed, start a new `browser_begin` with a complete goal after the old task is closed.
+
+### A repeated action is blocked after one success
+
+Inspect the `intent` returned by `browser_begin`. A standalone goal normally has `repeatPolicy: "once"`, so the same semantic state change cannot run again merely because its button remains visible. End the task and state an explicit count or observable stopping condition in a new goal when repetition is intentional.
 
 ### A visible control is missing from `interactiveElements`
 

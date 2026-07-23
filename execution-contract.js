@@ -326,6 +326,81 @@
     return `effects-v1:${canonical.length.toString(36)}:${AgentCore.hashString(canonical)}`;
   }
 
+  function semanticEffectKey(action, context, options = {}) {
+    if (!action || !actionChangesState(action)) {
+      return "";
+    }
+    const target = findActionTarget(action, context);
+    const semanticContext = stringValue(target?.searchMatch?.contextSnippet);
+    const semanticLabel = stringValue(
+      target?.label
+      || target?.name
+      || action.targetDescription
+      || action.text
+    );
+    const contextAnchored = Boolean(semanticContext || action.targetDescription);
+    const materialValue = {};
+    for (const key of [
+      "checked",
+      "key",
+      "code",
+      "direction",
+      "block",
+      "inline",
+      "amount",
+      "ms",
+      "conditionJson",
+      "tabId",
+      "downloadId",
+      "targetDescription"
+    ]) {
+      if (action[key] !== undefined && action[key] !== null && action[key] !== "") {
+        materialValue[key] = action[key];
+      }
+    }
+    if (action.url) {
+      materialValue.url = semanticUrlIdentity(action.url);
+    }
+    const canonical = AgentCore.stableStringify({
+      salt: stringValue(options.salt),
+      type: action.type || "",
+      target: target
+        ? {
+            selector: contextAnchored ? "" : target.selector || action.selector || "",
+            tag: target.tag || "",
+            role: target.role || "",
+            type: target.type || "",
+            label: semanticLabel,
+            name: target.name || "",
+            context: semanticContext,
+            href: semanticLabel ? "" : semanticUrlIdentity(target.href),
+            formAction: semanticLabel ? "" : semanticUrlIdentity(target.formAction),
+            frameId: Number.isInteger(target.frameId) ? target.frameId : 0,
+            visualKind: target.kind || ""
+          }
+        : {
+            selector: action.selector || "",
+            text: action.text || "",
+            url: semanticUrlIdentity(action.url)
+          },
+      materialValue
+    });
+    return `semantic-effect-v1:${canonical.length.toString(36)}:${AgentCore.hashString(canonical)}`;
+  }
+
+  function semanticUrlIdentity(value) {
+    const source = stringValue(value).trim();
+    if (!source) {
+      return "";
+    }
+    try {
+      const url = new URL(source);
+      return `${url.protocol}//${url.host}${url.pathname}`;
+    } catch {
+      return source.split(/[?#]/u, 1)[0];
+    }
+  }
+
   function isSensitiveTarget(target) {
     if (!target) {
       return false;
@@ -457,12 +532,15 @@
     isApprovalSensitiveAction,
     isSensitiveTarget,
     normalizeExternalActions,
+    normalizeTurnIntent: AgentCore.normalizeTurnIntent,
     sanitizeActions,
+    semanticEffectKey,
     summarizeTargetForPrecondition,
     validateActionPreconditions,
     validateExternalActions,
     validateResolvedVisualActions,
-    validateJsonAgainstSchema: AgentCore.validateJsonAgainstSchema
+    validateJsonAgainstSchema: AgentCore.validateJsonAgainstSchema,
+    validateTurnIntent: AgentCore.validateTurnIntent
   });
 
   globalScope.WebExecutionContract = api;

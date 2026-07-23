@@ -60,6 +60,63 @@
     },
     required: ["query", "roles", "nearText", "reason"]
   });
+  const TURN_INTENT_SCHEMA = Object.freeze({
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      version: {
+        type: "string",
+        description: "Turn-intent contract version. Use 1.0."
+      },
+      mode: {
+        type: "string",
+        enum: ["standalone", "continue_prior"],
+        description: "Whether the latest message is a complete new objective or explicitly depends on one unfinished prior deliverable."
+      },
+      objective: {
+        type: "string",
+        minLength: 1,
+        maxLength: 8000,
+        description: "The immutable effective objective for this run, with the latest user message taking priority."
+      },
+      contextSummary: {
+        type: "string",
+        maxLength: 2000,
+        description: "Only the prior context needed to understand an explicit continuation; otherwise empty."
+      },
+      repeatPolicy: {
+        type: "string",
+        enum: ["once", "bounded", "until_condition"],
+        description: "Whether the same semantic state-changing effect may succeed once, an explicit number of times, or until an explicit user condition."
+      },
+      repeatLimit: {
+        type: "integer",
+        minimum: 1,
+        description: "Maximum successful occurrences of the same semantic effect. Use 1 for once."
+      },
+      completionCriteria: {
+        type: "array",
+        maxItems: 8,
+        items: { type: "string", maxLength: 1000 },
+        description: "Observable conditions that end the latest request without silently expanding its scope."
+      },
+      reason: {
+        type: "string",
+        maxLength: 500,
+        description: "Concise classification reason without chain-of-thought."
+      }
+    },
+    required: [
+      "version",
+      "mode",
+      "objective",
+      "contextSummary",
+      "repeatPolicy",
+      "repeatLimit",
+      "completionCriteria",
+      "reason"
+    ]
+  });
 
   const DECISION_SCHEMA = Object.freeze({
     type: "object",
@@ -419,6 +476,59 @@
     return { valid: errors.length === 0, errors: uniqueStrings(errors), search: normalized };
   }
 
+  function normalizeTurnIntent(input, options = {}) {
+    const source = input && typeof input === "object" && !Array.isArray(input) ? input : {};
+    const latestUserMessage = stringValue(options.latestUserMessage).trim().slice(0, 8000);
+    const mode = ["standalone", "continue_prior"].includes(source.mode)
+      ? source.mode
+      : "standalone";
+    const repeatPolicy = ["once", "bounded", "until_condition"].includes(source.repeatPolicy)
+      ? source.repeatPolicy
+      : "once";
+    const requestedLimit = Number(source.repeatLimit);
+    const normalizedLimit = Number.isFinite(requestedLimit)
+      ? Math.max(1, Math.min(Number.MAX_SAFE_INTEGER, Math.round(requestedLimit)))
+      : 1;
+    return {
+      version: stringValue(source.version || "1.0"),
+      mode,
+      objective: stringValue(source.objective || latestUserMessage).trim().slice(0, 8000),
+      contextSummary: mode === "continue_prior"
+        ? stringValue(source.contextSummary).trim().slice(0, 2000)
+        : "",
+      repeatPolicy,
+      repeatLimit: repeatPolicy === "once" ? 1 : normalizedLimit,
+      completionCriteria: stringArray(source.completionCriteria)
+        .map((item) => normalizeWhitespace(item).slice(0, 1000))
+        .filter(Boolean)
+        .slice(0, 8),
+      reason: stringValue(source.reason).trim().slice(0, 500)
+    };
+  }
+
+  function validateTurnIntent(intent) {
+    const normalized = normalizeTurnIntent(intent, {
+      latestUserMessage: intent?.objective || ""
+    });
+    const errors = [];
+    if (!normalized.objective) {
+      errors.push("Turn intent requires a non-empty objective.");
+    }
+    if (normalized.mode === "continue_prior" && !normalized.contextSummary) {
+      errors.push("A continued turn intent requires the prior context being carried forward.");
+    }
+    if (normalized.repeatPolicy === "bounded" && normalized.repeatLimit < 2) {
+      errors.push("A bounded repeat policy requires an explicit limit of at least 2.");
+    }
+    if (!normalized.completionCriteria.length) {
+      errors.push("Turn intent requires at least one observable completion criterion.");
+    }
+    if (!normalized.reason) {
+      errors.push("Turn intent requires a concise classification reason.");
+    }
+    return { valid: errors.length === 0, errors: uniqueStrings(errors), intent: normalized };
+  }
+
   function normalizeDecision(input, options = {}) {
     const step = positiveInteger(options.step, 1);
     const maxEffects = positiveInteger(options.maxEffects, 3);
@@ -447,11 +557,22 @@
     const actions = normalizedActions.slice(0, remaining);
     const effectsTruncated = normalizedTools.length + normalizedActions.length > maxEffects;
     let status = normalizeStatus(source.status);
-    const elementSearch = normalizeElementSearch(source.elementSearch);
+    const requestedElementSearch = normalizeElementSearch(source.elementSearch);
 
-    if ((toolCalls.length || actions.length) && ["answer", "clarify"].includes(status)) {
+    if ((toolCalls.length || actions.length) && status !== "continue") {
       status = "continue";
     }
+    if (
+      status === "continue"
+      && !toolCalls.length
+      && !actions.length
+      && isElementSearchActive(requestedElementSearch)
+    ) {
+      status = "discover";
+    }
+    const elementSearch = status === "discover"
+      ? requestedElementSearch
+      : normalizeElementSearch({});
     if (status === "continue" && !toolCalls.length && !actions.length) {
       validationErrors.push("continue 판단에는 하나 이상의 도구 호출 또는 페이지 액션이 필요합니다.");
     }
@@ -460,8 +581,6 @@
         validationErrors.push("discover 판단은 도구 호출이나 페이지 액션과 함께 사용할 수 없습니다.");
       }
       validationErrors.push(...validateElementSearch(elementSearch).errors);
-    } else if (isElementSearchActive(elementSearch)) {
-      validationErrors.push("elementSearch는 discover 판단에서만 사용할 수 있습니다.");
     }
 
     const verificationSource = source.verification && typeof source.verification === "object"
@@ -576,8 +695,6 @@
       if (decision.toolCalls.length || decision.actions.length) {
         errors.push("discover 판단은 페이지 상태를 바꾸는 실행 항목을 포함할 수 없습니다.");
       }
-    } else if (isElementSearchActive(decision.elementSearch)) {
-      errors.push("elementSearch는 discover 판단에서만 사용할 수 있습니다.");
     }
 
     for (const toolCall of decision.toolCalls) {
@@ -1004,7 +1121,7 @@ Use current element refs instead of inventing selectors. Re-observe after effect
 The page observation describes only the user's current visual viewport. Never claim that offscreen, clipped, occluded, or hidden DOM content is visible. Control metadata such as collapsed select options may support an action but is not evidence that the user can currently see those labels. Scroll or interact, then re-observe before describing newly revealed content.
 If the required visible control is absent, prefer status discover with a concise elementSearch before scanning more windows or reporting a blocker. Search may use visible label or symbol terms, semantic roles/tags/types, and nearby row/table/form/region text. It runs locally and returns fresh observation-scoped refs. If elementDiscovery.hasMore is true after a search, continue that search window. Truncation is never a terminal blocker by itself. Scroll and re-observe only when the target is outside the current viewport.
 Use visual_click only when the latest context contains visualObservation and a visual surface ref, no normal DOM ref can represent the visible target, and the target is unambiguous in the attached screenshot. Bind it to visualObservation.id, describe the exact visible target, and provide one point relative to that surface on a 0–1000 scale. Never use visual coordinates to guess hidden content or bypass a permission boundary.
-Interpret short follow-ups from the recent conversation before deciding what the user currently expects. If the user accepts or continues an unfinished deliverable mentioned earlier, that deliverable remains part of the objective.
+Use the runtime-resolved immutable turn intent. Do not re-expand it from raw conversation history or retry a failed prior effect unless that intent explicitly carries the prior deliverable.
 A terminal message is the exact response shown to the user. For answer or completed, include the requested result itself. Never end with a promise to inspect, summarize, compare, or report later, and never say that information was summarized without presenting that information.
 Keep each turn small. Prefer one effect class per turn. If the previous attempt made no progress, choose a materially different action, gather missing evidence, ask one focused clarification, or stop with a precise blocker.
 Do not expose chain-of-thought. summary and progress must contain only concise conclusions and observable facts.`;
@@ -1092,6 +1209,7 @@ Return a corrected decision object only. Preserve the user's objective, use only
     DECISION_SCHEMA,
     DECISION_STATUSES,
     ELEMENT_SEARCH_SCHEMA,
+    TURN_INTENT_SCHEMA,
     VISUAL_ACTION_TYPES,
     VISUAL_TARGET_SCHEMA,
     POLICY_SCHEMA,
@@ -1106,6 +1224,7 @@ Return a corrected decision object only. Preserve the user's objective, use only
     normalizeElementSearch,
     normalizePolicy,
     normalizeStatus,
+    normalizeTurnIntent,
     normalizeVerifier,
     normalizeVisualTarget,
     parseJsonFromText,
@@ -1115,6 +1234,7 @@ Return a corrected decision object only. Preserve the user's objective, use only
     validateElementSearch,
     validateJsonAgainstSchema,
     validatePolicy,
+    validateTurnIntent,
     validateVerifier,
     validateVisualTarget
   });

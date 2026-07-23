@@ -146,6 +146,83 @@ test("effect digests are deterministic and bind the material action content", ()
   );
 });
 
+test("semantic effect keys survive observation ref and selector changes when search context is stable", () => {
+  const firstContext = observedContext({
+    ref: "e81",
+    tag: "button",
+    role: "button",
+    type: "button",
+    name: "",
+    label: "Next page",
+    selector: "#generated-page-control-81",
+    searchMatch: {
+      score: 100,
+      matchedFields: ["label", "role", "context"],
+      contextSnippet: "collection: Issue grid"
+    }
+  });
+  const nextContext = observedContext({
+    ref: "e3",
+    tag: "button",
+    role: "button",
+    type: "button",
+    name: "",
+    label: "Next page",
+    selector: "#generated-page-control-144",
+    searchMatch: {
+      score: 96,
+      matchedFields: ["label", "role", "context"],
+      contextSnippet: "collection: Issue grid"
+    }
+  });
+
+  assert.equal(
+    Contract.semanticEffectKey({ type: "click", ref: "e81" }, firstContext),
+    Contract.semanticEffectKey({ type: "click", ref: "e3" }, nextContext)
+  );
+  assert.notEqual(
+    Contract.semanticEffectKey({ type: "click", ref: "e81" }, firstContext),
+    Contract.semanticEffectKey(
+      { type: "click", ref: "e3" },
+      observedContext({
+        ...nextContext.interactiveElements[0],
+        searchMatch: {
+          ...nextContext.interactiveElements[0].searchMatch,
+          contextSnippet: "collection: Audit grid"
+        }
+      })
+    )
+  );
+});
+
+test("semantic effect keys avoid retaining value and URL-query data", () => {
+  const context = observedContext();
+  assert.equal(
+    Contract.semanticEffectKey(fillAction({ value: "first-private-value" }), context),
+    Contract.semanticEffectKey(fillAction({ value: "different-private-value" }), context)
+  );
+  assert.equal(
+    Contract.semanticEffectKey({
+      type: "navigate",
+      url: "https://example.test/results?page=1&token=first-secret"
+    }, context),
+    Contract.semanticEffectKey({
+      type: "navigate",
+      url: "https://example.test/results?page=2&token=second-secret"
+    }, context)
+  );
+  assert.notEqual(
+    Contract.semanticEffectKey({
+      type: "navigate",
+      url: "https://example.test/results?page=1"
+    }, context),
+    Contract.semanticEffectKey({
+      type: "navigate",
+      url: "https://example.test/account"
+    }, context)
+  );
+});
+
 test("external control blocks filling a sensitive target", () => {
   const assessment = Contract.assessActionSafety({
     actions: [fillAction({ value: "replacement-secret" })],

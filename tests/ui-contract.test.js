@@ -253,23 +253,43 @@ test("tab changes are deferred without losing or clearing a running session", ()
   assert.match(script, /queueMicrotask\(resumeActiveTabTransition\)/);
 });
 
-test("terminal response verification carries conversational obligations and current visual evidence", () => {
+test("terminal response verification uses one immutable turn intent and current visual evidence", () => {
   const script = fs.readFileSync(path.join(root, "panel.js"), "utf8");
   const completionStart = script.indexOf("async function requestCompletionVerification");
   const groundingStart = script.indexOf("async function requestAnswerGroundingVerification");
   const groundingEnd = script.indexOf("async function requestExecutionPolicy", groundingStart);
   const completionFunction = script.slice(completionStart, groundingStart);
   const groundingFunction = script.slice(groundingStart, groundingEnd);
-  assert.match(completionFunction, /formatConversationObjectiveContext\(\)/);
+  assert.match(completionFunction, /getEffectiveTurnIntent\(session\)/);
+  assert.doesNotMatch(completionFunction, /formatConversationObjectiveContext\(\)/);
   assert.match(completionFunction, /actually delivers every requested result/);
   assert.match(groundingFunction, /session\.currentPageEvidenceId/);
   assert.match(groundingFunction, /entry\.id === currentPageEvidenceId/);
-  assert.match(groundingFunction, /formatConversationObjectiveContext\(\)/);
+  assert.match(groundingFunction, /getEffectiveTurnIntent\(session\)/);
+  assert.doesNotMatch(groundingFunction, /formatConversationObjectiveContext\(\)/);
   assert.match(groundingFunction, /merely promising future work/);
   assert.doesNotMatch(groundingFunction, /slice\(-2\)/);
   assert.match(groundingFunction, /screenshotDataUrl,/);
   assert.match(script, /\["answer", "completed"\]\.includes\(decision\.status\)/);
   assert.match(script, /decision\.status === "completed"[\s\S]*decision\.verifier\?\.status !== "verified"/);
+  assert.match(script, /resolveAgentTurnIntent\(state\.agentSession\)/);
+  assert.match(script, /repeatPolicy === "until_condition"/);
+  assert.match(script, /recordSuccessfulEffects/);
+});
+
+test("malformed decision output and internal JSON stay out of user-facing chat", () => {
+  const script = fs.readFileSync(path.join(root, "panel.js"), "utf8");
+  const parserStart = script.indexOf("function parseDecisionFromAiText");
+  const parserEnd = script.indexOf("function normalizeChatDecision", parserStart);
+  const parserFunctions = script.slice(parserStart, parserEnd);
+  assert.match(parserFunctions, /AgentCore\.parseJsonFromText\(text\)/);
+  assert.match(parserFunctions, /normalizeAiDecisionResponse/);
+  assert.doesNotMatch(parserFunctions, /message:\s*String\(text/);
+  assert.match(script, /looksLikeInternalDecisionPayload\(decision\.message\)/);
+  assert.match(script, /사용자에게 표시할 message에는 내부 판단 JSON을 넣을 수 없습니다/);
+  assert.match(script, /AI 응답을 안전한 실행 계획으로 변환하지 못해/);
+  assert.match(script, /normalizeUserFacingErrorMessage/);
+  assert.match(script, /getUserFacingErrorMessage\([\s\S]*result\.error \|\| result\.text/);
 });
 
 test("the run timeline preserves earlier effects and successful raw payloads stay out of chat", () => {
@@ -284,6 +304,8 @@ test("the run timeline preserves earlier effects and successful raw payloads sta
   const effectsFunction = script.slice(effectsStart, effectsEnd);
   assert.match(effectsFunction, /markTimelinePhaseSkippedIfUnused\("tools"/);
   assert.match(effectsFunction, /markTimelinePhaseSkippedIfUnused\("actions"/);
+  assert.match(script, /function semanticToolEffectKey/);
+  assert.match(script, /readOnlyHint === true/);
 
   const executionStart = script.indexOf("function appendExecutionResultMessage");
   const executionEnd = script.indexOf("function appendToolResultMessage", executionStart);

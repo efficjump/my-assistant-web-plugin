@@ -14,6 +14,14 @@
     ...Contract.EXTERNAL_ACTION_TYPES.filter((type) => type !== "tab_open"),
     "visual_click"
   ]);
+  const ACTIVE_OPERATION_STATUSES = new Set(["waiting_approval", "approved", "ready", "executing"]);
+  const TERMINAL_OPERATION_STATUSES = new Set([
+    "blocked",
+    "rejected",
+    "failed",
+    "unknown_after_restart",
+    "cancelled"
+  ]);
 
   class ExternalControlRuntime {
     constructor(options = {}) {
@@ -29,6 +37,16 @@
         risks: [],
         sensitiveData: [],
         approvalReasons: ["Policy evaluation is unavailable, so approval is required."]
+      }));
+      this.resolveGoalIntent = options.resolveGoalIntent || (async ({ goal }) => ({
+        version: "1.0",
+        mode: "standalone",
+        objective: goal,
+        contextSummary: "",
+        repeatPolicy: "once",
+        repeatLimit: 1,
+        completionCriteria: ["Complete the external browser goal without repeating a successful semantic effect."],
+        reason: "Safe standalone Bridge fallback."
       }));
       this.getSettings = options.getSettings || (async () => ({}));
       this.onStatusChange = options.onStatusChange || (() => {});
@@ -173,50 +191,54 @@
     }
 
     async dispatch(toolName, args = {}, client = {}) {
-      return this.#serialize(async () => {
-        this.#assertReady();
-        this.#expireState(this.now());
-        const inputValidation = Protocol.validateToolArguments(toolName, args);
-        if (!inputValidation.valid) {
-          throw new Error(`Invalid ${toolName || "bridge tool"} input: ${inputValidation.errors.join(" ")}`);
-        }
-        switch (toolName) {
-          case "browser_begin":
-            return this.#guidedBegin(args, client);
-          case "browser_act":
-            return this.#guidedAct(args, client);
-          case "browser_elements":
-            return Object.hasOwn(args, "session_id")
-              ? this.#discoverElements(args)
-              : this.#guidedElements(args, client);
-          case "browser_continue":
-            return this.#guidedContinue(client, { refresh: Boolean(args.refresh) });
-          case "browser_end":
-            return this.#guidedEnd(client);
-          case "browser_status":
-            return this.#getClientStatus();
-          case "browser_session_start":
-            return this.#startSession(args, client);
-          case "browser_observe":
-            return this.#observe(args);
-          case "browser_screenshot":
-            return Object.hasOwn(args, "session_id")
-              ? this.#screenshot(args)
-              : this.#guidedScreenshot(client);
-          case "browser_visual_act":
-            return Object.hasOwn(args, "session_id")
-              ? this.#visualAct(args)
-              : this.#guidedVisualAct(args, client);
-          case "browser_execute":
-            return this.#proposeExecution(args);
-          case "browser_operation_get":
-            return this.#getOperation(args);
-          case "browser_session_close":
-            return this.#closeSession(args);
-          default:
-            throw new Error(`Unsupported bridge tool: ${toolName || "missing"}`);
-        }
-      });
+      try {
+        return await this.#serialize(async () => {
+          this.#assertReady();
+          this.#expireState(this.now());
+          const inputValidation = Protocol.validateToolArguments(toolName, args);
+          if (!inputValidation.valid) {
+            throw new Error(`Invalid ${toolName || "bridge tool"} input: ${inputValidation.errors.join(" ")}`);
+          }
+          switch (toolName) {
+            case "browser_begin":
+              return this.#guidedBegin(args, client);
+            case "browser_act":
+              return this.#guidedAct(args, client);
+            case "browser_elements":
+              return Object.hasOwn(args, "session_id")
+                ? this.#discoverElements(args)
+                : this.#guidedElements(args, client);
+            case "browser_continue":
+              return this.#guidedContinue(client, { refresh: Boolean(args.refresh) });
+            case "browser_end":
+              return this.#guidedEnd(client);
+            case "browser_status":
+              return this.#getClientStatus();
+            case "browser_session_start":
+              return this.#startSession(args, client);
+            case "browser_observe":
+              return this.#observe(args);
+            case "browser_screenshot":
+              return Object.hasOwn(args, "session_id")
+                ? this.#screenshot(args)
+                : this.#guidedScreenshot(client);
+            case "browser_visual_act":
+              return Object.hasOwn(args, "session_id")
+                ? this.#visualAct(args)
+                : this.#guidedVisualAct(args, client);
+            case "browser_execute":
+              return this.#proposeExecution(args);
+            case "browser_operation_get":
+              return this.#getOperation(args);
+            case "browser_session_close":
+              return this.#closeSession(args);
+            default:
+              throw new Error(`Unsupported bridge tool: ${toolName || "missing"}`);
+          }
+        });
+      } catch (error) {
+        throw new Error(safeExternalErrorMessage(error));
+      }
     }
 
     async #guidedBegin(args, client) {
@@ -238,7 +260,11 @@
     async #guidedAct(args, client) {
       const session = this.#findGuidedSession(client);
       const latestOperation = this.#latestSessionOperation(session);
-      if (latestOperation && ["waiting_approval", "approved", "ready", "executing"].includes(latestOperation.status)) {
+      if (
+        latestOperation
+        && (ACTIVE_OPERATION_STATUSES.has(latestOperation.status)
+          || TERMINAL_OPERATION_STATUSES.has(latestOperation.status))
+      ) {
         return this.#guidedOperationResponse(latestOperation);
       }
       if (!session.observation || !session.latestObservationId) {
@@ -315,7 +341,11 @@
     async #guidedContinue(client, options = {}) {
       const session = this.#findGuidedSession(client);
       const latestOperation = this.#latestSessionOperation(session);
-      if (latestOperation && ["waiting_approval", "approved", "ready", "executing"].includes(latestOperation.status)) {
+      if (
+        latestOperation
+        && (ACTIVE_OPERATION_STATUSES.has(latestOperation.status)
+          || TERMINAL_OPERATION_STATUSES.has(latestOperation.status))
+      ) {
         return this.#guidedOperationResponse(latestOperation, options);
       }
 
@@ -353,7 +383,11 @@
     async #guidedVisualAct(args, client) {
       const session = this.#findGuidedSession(client);
       const latestOperation = this.#latestSessionOperation(session);
-      if (latestOperation && ["waiting_approval", "approved", "ready", "executing"].includes(latestOperation.status)) {
+      if (
+        latestOperation
+        && (ACTIVE_OPERATION_STATUSES.has(latestOperation.status)
+          || TERMINAL_OPERATION_STATUSES.has(latestOperation.status))
+      ) {
         return this.#guidedOperationResponse(latestOperation);
       }
       const operation = await this.#resolveAndProposeVisualAction(session, args);
@@ -366,6 +400,7 @@
     }
 
     async #resolveAndProposeVisualAction(session, args) {
+      this.#assertSessionAcceptsNewOperation(session);
       if (typeof this.driver.resolveVisualAction !== "function") {
         throw new Error("The extension runtime does not provide verified visual targeting.");
       }
@@ -450,6 +485,15 @@
         }, null);
     }
 
+    #assertSessionAcceptsNewOperation(session) {
+      const latestOperation = this.#latestSessionOperation(session);
+      if (latestOperation && TERMINAL_OPERATION_STATUSES.has(latestOperation.status)) {
+        throw new Error(
+          `The previous operation ended in terminal state ${latestOperation.status}. Close this browser session before starting another user request.`
+        );
+      }
+    }
+
     #guidedReadyResponse(session, observation, options = {}) {
       const discovery = observation.context?.elementDiscovery || null;
       const discoveryNext = discovery?.hasMore
@@ -458,6 +502,7 @@
       return {
         status: "ready",
         goal: session.goal,
+        intent: cloneJson(session.turnIntent || null),
         shared_tab: this.state.armedTab ? summarizeSharedTab(this.state.armedTab) : null,
         observed_at: observation.observed_at,
         page: cloneJson(observation.context),
@@ -481,6 +526,8 @@
         next = "Ask the user to approve or reject the proposal in the extension, then call browser_continue again. Do not submit the proposal again.";
       } else if (["approved", "ready", "executing"].includes(operation.status)) {
         next = "Call browser_continue again to read the completed result. Do not submit another proposal.";
+      } else if (TERMINAL_OPERATION_STATUSES.has(operation.status)) {
+        next = "This browser task ended with a terminal operation. Call browser_end before starting another user request; do not submit another action in this session.";
       }
       return {
         status,
@@ -505,11 +552,14 @@
       if (activeSession) {
         throw new Error("The shared tab already has an active external-control session.");
       }
+      const turnIntent = await this.#resolveSessionTurnIntent(goal, client);
       const id = this.randomId("session");
       this.state.sessions[id] = {
         id,
         status: "active",
         goal,
+        turnIntent,
+        effectKeySalt: this.randomId("effect-key"),
         clientId: boundedOptionalString(client.id || client.clientId, 160),
         clientName: boundedOptionalString(client.name || client.clientName, 160),
         targetTabId: armedTab.id,
@@ -523,10 +573,50 @@
       return {
         session_id: id,
         goal,
+        intent: cloneJson(turnIntent),
         expires_at: new Date(now + this.sessionTtlMs).toISOString(),
         shared_tab: summarizeSharedTab(armedTab),
         next: "Call browser_observe now. Do not end with only a progress announcement."
       };
+    }
+
+    async #resolveSessionTurnIntent(goal, client) {
+      const fallback = Contract.normalizeTurnIntent({
+        version: "1.0",
+        mode: "standalone",
+        objective: goal,
+        contextSummary: "",
+        repeatPolicy: "once",
+        repeatLimit: 1,
+        completionCriteria: [
+          "Complete the external browser goal without repeating a successful semantic effect."
+        ],
+        reason: "Safe standalone Bridge fallback."
+      }, { latestUserMessage: goal });
+      try {
+        const candidate = await this.resolveGoalIntent({
+          goal,
+          client: {
+            id: boundedOptionalString(client?.id || client?.clientId, 160),
+            name: boundedOptionalString(client?.name || client?.clientName, 160)
+          }
+        });
+        const resolved = Contract.normalizeTurnIntent(
+          {
+            ...(candidate && typeof candidate === "object" && !Array.isArray(candidate)
+              ? candidate
+              : {}),
+            mode: "standalone",
+            objective: goal,
+            contextSummary: ""
+          },
+          { latestUserMessage: goal }
+        );
+        const validation = Contract.validateTurnIntent(resolved);
+        return validation.valid ? validation.intent : fallback;
+      } catch {
+        return fallback;
+      }
     }
 
     #getClientStatus() {
@@ -624,6 +714,7 @@
         }
         return this.#publicOperation(prior);
       }
+      this.#assertSessionAcceptsNewOperation(session);
       if (!session.observation || session.latestObservationId !== observationId) {
         throw new Error("browser_execute must reference the latest observation returned by browser_observe.");
       }
@@ -634,25 +725,46 @@
         throw new Error(`The action proposal is invalid: ${validation.errors.join(" ")}`);
       }
       const actions = validation.actions;
+      const semanticEffectKeys = actions.map((action) => (
+        Contract.semanticEffectKey(action, session.observation.context, {
+          salt: session.effectKeySalt
+        })
+      ));
+      const repeatBoundary = this.#evaluateRepeatBoundary(
+        session,
+        semanticEffectKeys
+      );
 
       let policy;
-      try {
-        policy = await this.evaluatePolicy({
-          goal,
-          actions: Contract.sanitizeActions(actions),
-          context: sanitizeObservationForPolicy(session.observation.context),
-          session: summarizeSession(session),
-          settings: sanitizePolicySettings(settings)
-        });
-      } catch (error) {
+      if (!repeatBoundary.valid) {
         policy = {
           version: "1.0",
-          verdict: "approval",
-          message: `Independent policy evaluation failed: ${error.message || String(error)}`,
-          risks: ["The proposal could not be independently classified."],
+          verdict: "block",
+          message: "The same semantic state-changing effect already reached this browser task's resolved repetition limit.",
+          risks: ["Repeating the effect could advance beyond the user's requested scope."],
           sensitiveData: [],
-          approvalReasons: ["Policy failure is handled fail-closed with explicit user approval."]
+          approvalReasons: []
         };
+      } else {
+        try {
+          policy = await this.evaluatePolicy({
+            goal,
+            intent: cloneJson(session.turnIntent || null),
+            actions: Contract.sanitizeActions(actions),
+            context: sanitizeObservationForPolicy(session.observation.context),
+            session: summarizeSession(session),
+            settings: sanitizePolicySettings(settings)
+          });
+        } catch (error) {
+          policy = {
+            version: "1.0",
+            verdict: "approval",
+            message: `Independent policy evaluation failed: ${safeExternalErrorMessage(error)}`,
+            risks: ["The proposal could not be independently classified."],
+            sensitiveData: [],
+            approvalReasons: ["Policy failure is handled fail-closed with explicit user approval."]
+          };
+        }
       }
       const normalizedPolicy = normalizePolicy(policy);
       const safety = Contract.assessActionSafety({
@@ -677,6 +789,7 @@
         targetTabId: session.targetTabId,
         goal,
         effectDigest: digest,
+        semanticEffectKeys,
         actionSummary: Contract.sanitizeActions(actions),
         targetSummary: actions.map((action) => ({
           actionId: action.id,
@@ -718,12 +831,63 @@
       return this.#publicOperation(operation);
     }
 
+    #evaluateRepeatBoundary(session, semanticEffectKeys, options = {}) {
+      const intent = Contract.normalizeTurnIntent(session.turnIntent, {
+        latestUserMessage: session.goal
+      });
+      if (intent.repeatPolicy === "until_condition") {
+        return { valid: true, violations: [] };
+      }
+      const limit = Math.max(1, Number(intent.repeatLimit) || 1);
+      const counts = new Map();
+      for (const operation of Object.values(this.state.operations)) {
+        if (
+          operation.sessionId !== session.id
+          || operation.id === options.excludeOperationId
+          || operation.status !== "completed"
+        ) {
+          continue;
+        }
+        for (const key of operation.semanticEffectKeys || []) {
+          if (key) {
+            counts.set(key, (counts.get(key) || 0) + 1);
+          }
+        }
+      }
+      const violations = [];
+      for (const key of semanticEffectKeys || []) {
+        if (!key) {
+          continue;
+        }
+        const count = counts.get(key) || 0;
+        if (count >= limit) {
+          violations.push({ key, count, limit });
+        }
+        counts.set(key, count + 1);
+      }
+      return { valid: violations.length === 0, violations };
+    }
+
     async #commitOperation(operation) {
       if (!['ready', 'approved'].includes(operation.status)) {
         return this.#publicOperation(operation);
       }
       const session = this.#requireSession(operation.sessionId);
       await this.#requireBoundTab(session);
+      const repeatBoundary = this.#evaluateRepeatBoundary(
+        session,
+        operation.semanticEffectKeys || [],
+        { excludeOperationId: operation.id }
+      );
+      if (!repeatBoundary.valid) {
+        operation.status = "blocked";
+        operation.error = "The semantic state-changing effect reached this browser task's resolved repetition limit before execution.";
+        operation.completedAt = this.now();
+        delete operation.actions;
+        delete operation.approvalGrant;
+        await this.#persistAndNotify();
+        return this.#publicOperation(operation);
+      }
       if (operation.effectDigest !== Contract.effectDigest(operation.actions || [])) {
         operation.status = "blocked";
         operation.error = "The action proposal changed after policy review.";
@@ -866,7 +1030,7 @@
       } catch (error) {
         operation.status = "failed";
         operation.completedAt = this.now();
-        operation.error = error.message || String(error);
+        operation.error = safeExternalErrorMessage(error);
         delete operation.actions;
         delete operation.approvalGrant;
         await this.#persistAndNotify();
@@ -1275,10 +1439,48 @@
     if (["stale", "expired"].includes(operation.status)) {
       return "Call browser_observe for a fresh observation before creating a new proposal.";
     }
-    if (["blocked", "rejected", "unknown_after_restart", "cancelled"].includes(operation.status)) {
+    if (["blocked", "rejected", "failed", "unknown_after_restart", "cancelled"].includes(operation.status)) {
       return "Report this terminal blocker and close the session.";
     }
     return "Continue the session according to the current operation status.";
+  }
+
+  function safeExternalErrorMessage(error) {
+    let message = stringValue(error?.message || error || "The external operation failed.").trim();
+    for (let depth = 0; depth < 4; depth += 1) {
+      const objectStart = message.indexOf("{");
+      const objectEnd = message.lastIndexOf("}");
+      const candidate = objectStart >= 0 && objectEnd > objectStart
+        ? message.slice(objectStart, objectEnd + 1)
+        : message;
+      let parsed;
+      try {
+        parsed = JSON.parse(candidate);
+      } catch {
+        return redactExternalText(message).slice(0, 1000);
+      }
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return "The external operation returned an unreadable structured error.";
+      }
+      const internalKeys = [
+        "status",
+        "actions",
+        "toolCalls",
+        "elementSearch",
+        "completionEvidence",
+        "verification",
+        "doneReason"
+      ];
+      if (internalKeys.filter((key) => Object.hasOwn(parsed, key)).length >= 2) {
+        return "The external operation returned an internal decision payload instead of a user-facing error.";
+      }
+      const detail = parsed.error?.message || parsed.error_description || parsed.message;
+      if (typeof detail !== "string" || !detail.trim() || detail.trim() === message) {
+        return "The external operation returned a structured error without a user-facing message.";
+      }
+      message = detail.trim();
+    }
+    return "The external operation error was nested too deeply to display safely.";
   }
 
   function redactExternalText(value) {

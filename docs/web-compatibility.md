@@ -105,10 +105,13 @@ The real-browser E2E fixture checks that:
 - search results expose their matched context, multi-window search cursors preserve the complete filter, and a mismatched role invalidates the cursor;
 - changing the DOM invalidates an old element cursor and safely restarts discovery;
 - the built-in model loop issues `discover` and obtains the target without blindly advancing the unfiltered cursor;
+- a complete latest message becomes a standalone immutable intent even after a failed related run, while an explicit continuation carries only the named unfinished deliverable;
+- malformed decision output and stray `elementSearch` metadata are repaired without exposing internal JSON or schema errors, and one successful semantic effect cannot be repeated beyond the resolved turn boundary;
 - approval-time validation reconstructs the search observation instead of rebinding its ref in the default window;
 - a canvas surface accepts a normalized visual point and produces an observable state change;
 - the independent visual verifier receives the current screenshot, can approve a grounded target, and fails closed on rejection;
 - the authenticated Bridge performs locator and verifier calls both before approval and again before executing a visual action;
+- the Bridge allows an explicitly bounded repeated effect only up to its resolved count and makes failed guided operations terminal until `browser_end`;
 - document replacement, worker restart, approvals, and the authenticated MCP bridge continue to pass their existing regression scenarios.
 
 Run the checks from the repository root:

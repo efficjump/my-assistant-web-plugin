@@ -239,7 +239,8 @@ async function createRuntime(options = {}) {
       risks: [],
       sensitiveData: [],
       approvalReasons: []
-    }))
+    })),
+    resolveGoalIntent: options.resolveGoalIntent
   });
   await runtime.initialize();
   return { runtime, storage, driver, clock };
@@ -315,6 +316,7 @@ test("guided MCP tools manage session, observation, retry, and operation identif
   const begun = await runtime.dispatch("browser_begin", { goal: GOAL }, client);
   assert.equal(begun.status, "ready");
   assert.equal(begun.goal, GOAL);
+  assert.equal(begun.intent.repeatPolicy, "once");
   assert.equal(begun.page.interactiveElements[0].ref, "e1");
   assert.equal(Object.hasOwn(begun, "session_id"), false);
   assert.equal(Object.hasOwn(begun, "observation_id"), false);
@@ -347,14 +349,12 @@ test("guided MCP tools manage session, observation, retry, and operation identif
   assert.equal(driver.pageExecutions.length, 1);
 
   const secondProposed = await runtime.dispatch("browser_act", { actions: [clickAction()] }, client);
-  assert.equal(secondProposed.status, "approval_required");
+  assert.equal(secondProposed.status, "blocked");
+  assert.match(secondProposed.next, /browser_end/i);
   const secondContinued = await runtime.dispatch("browser_continue", {}, client);
-  assert.equal(
-    secondContinued.status,
-    "approval_required",
-    "the most recently inserted operation must win when timestamps are equal"
-  );
-  assert.equal(runtime.listPendingOperations().length, 1);
+  assert.equal(secondContinued.status, "blocked");
+  assert.match(secondContinued.next, /do not submit another action/i);
+  assert.equal(runtime.listPendingOperations().length, 0);
 
   const ended = await runtime.dispatch("browser_end", {}, client);
   assert.deepEqual(ended.closed, true);
@@ -362,6 +362,155 @@ test("guided MCP tools manage session, observation, retry, and operation identif
   assert.equal(runtime.getStatus().sessionActive, false);
   const endedAgain = await runtime.dispatch("browser_end", {}, client);
   assert.equal(endedAgain.status, "idle");
+});
+
+test("an explicit repeated-effect intent allows the same semantic action up to its bound", async () => {
+  const driver = new FakeDriver({
+    observations: [
+      pageContext({ domRevision: 1 }),
+      pageContext({ domRevision: 2 }),
+      pageContext({ domRevision: 3 }),
+      pageContext({ domRevision: 4 }),
+      pageContext({ domRevision: 5 })
+    ]
+  });
+  const { runtime } = await createRuntime({
+    driver,
+    resolveGoalIntent: async ({ goal }) => ({
+      version: "1.0",
+      mode: "continue_prior",
+      objective: `${goal} and repeat any unfinished earlier browser work`,
+      contextSummary: "External goals have no prior task to continue.",
+      repeatPolicy: "bounded",
+      repeatLimit: 2,
+      completionCriteria: ["The same requested effect succeeds twice."],
+      reason: "The supplied test goal explicitly authorizes two occurrences."
+    })
+  });
+  const client = { name: "Bounded repeat client" };
+  await runtime.armTab(defaultTab());
+  const begun = await runtime.dispatch("browser_begin", {
+    goal: "Apply the same visible setting exactly twice"
+  }, client);
+  assert.equal(begun.intent.mode, "standalone");
+  assert.equal(begun.intent.contextSummary, "");
+  assert.equal(begun.intent.objective, "Apply the same visible setting exactly twice");
+  assert.equal(begun.intent.repeatPolicy, "bounded");
+  assert.equal(begun.intent.repeatLimit, 2);
+
+  const first = await runtime.dispatch("browser_act", { actions: [clickAction()] }, client);
+  await runtime.approveOperation(runtime.getStatus().pendingOperationIds[0]);
+  assert.equal(first.status, "approval_required");
+  await runtime.dispatch("browser_continue", {}, client);
+
+  const second = await runtime.dispatch("browser_act", { actions: [clickAction()] }, client);
+  assert.equal(second.status, "approval_required");
+  await runtime.approveOperation(runtime.getStatus().pendingOperationIds[0]);
+  await runtime.dispatch("browser_continue", {}, client);
+
+  const third = await runtime.dispatch("browser_act", { actions: [clickAction()] }, client);
+  assert.equal(third.status, "blocked");
+  assert.equal(driver.pageExecutions.length, 2);
+});
+
+test("a failed guided operation is terminal and cannot inherit a later action request", async () => {
+  const driver = new FakeDriver({
+    observations: [
+      pageContext({ domRevision: 1 }),
+      pageContext({ domRevision: 2 })
+    ]
+  });
+  let executionAttempts = 0;
+  driver.executePage = async () => {
+    executionAttempts += 1;
+    throw new Error(JSON.stringify({
+      error: { message: "Synthetic page execution failure" }
+    }));
+  };
+  const { runtime } = await createRuntime({ driver });
+  const client = { name: "Terminal failure client" };
+  await runtime.armTab(defaultTab());
+  await runtime.dispatch("browser_begin", { goal: "Save the visible setting once" }, client);
+
+  const proposed = await runtime.dispatch("browser_act", { actions: [clickAction()] }, client);
+  assert.equal(proposed.status, "approval_required");
+  const failed = await runtime.approveOperation(runtime.getStatus().pendingOperationIds[0]);
+  assert.equal(failed.status, "failed");
+  assert.equal(failed.error, "Synthetic page execution failure");
+  assert.doesNotMatch(failed.error, /[{}]/);
+  assert.equal(executionAttempts, 1);
+
+  const continued = await runtime.dispatch("browser_continue", {}, client);
+  assert.equal(continued.status, "failed");
+  assert.match(continued.next, /browser_end/i);
+  const laterAction = await runtime.dispatch("browser_act", {
+    actions: [clickAction({ reason: "A later request must not revive the failed task" })]
+  }, client);
+  assert.equal(laterAction.status, "failed");
+  assert.equal(executionAttempts, 1);
+
+  const ended = await runtime.dispatch("browser_end", {}, client);
+  assert.equal(ended.status, "closed");
+});
+
+test("the advanced workflow also rejects new proposals after a terminal failure", async () => {
+  const driver = new FakeDriver({
+    observations: [
+      pageContext({ domRevision: 1 }),
+      pageContext({ domRevision: 2 }),
+      pageContext({ domRevision: 3 })
+    ]
+  });
+  let executionAttempts = 0;
+  driver.executePage = async () => {
+    executionAttempts += 1;
+    throw new Error("Synthetic advanced execution failure");
+  };
+  const { runtime } = await createRuntime({ driver });
+  const session = await armAndStart(runtime);
+  const firstObservation = await observe(runtime, session.session_id);
+  const proposed = await runtime.dispatch("browser_execute", executionArgs(
+    session.session_id,
+    firstObservation.observation_id
+  ));
+  const failed = await runtime.approveOperation(proposed.operation_id);
+  assert.equal(failed.status, "failed");
+  assert.equal(executionAttempts, 1);
+
+  const nextObservation = await observe(runtime, session.session_id);
+  await assert.rejects(
+    runtime.dispatch("browser_execute", executionArgs(
+      session.session_id,
+      nextObservation.observation_id,
+      { idempotency_key: "request-after-terminal-failure" }
+    )),
+    /terminal state failed/
+  );
+  assert.equal(executionAttempts, 1);
+});
+
+test("bridge dispatch never exposes a structured internal error payload", async () => {
+  const driver = new FakeDriver();
+  driver.screenshot = async () => {
+    throw new Error(JSON.stringify({
+      status: "continue",
+      actions: [{ type: "click", ref: "e1" }],
+      elementSearch: { query: "next", roles: ["button"] }
+    }));
+  };
+  const { runtime } = await createRuntime({ driver });
+  const client = { name: "Structured error client" };
+  await runtime.armTab(defaultTab());
+  await runtime.dispatch("browser_begin", { goal: "Inspect the visible page once" }, client);
+
+  await assert.rejects(
+    runtime.dispatch("browser_screenshot", {}, client),
+    (error) => {
+      assert.match(error.message, /internal decision payload/);
+      assert.doesNotMatch(error.message, /[{}]/);
+      return true;
+    }
+  );
 });
 
 test("guided element discovery pages through every visible control and supports dynamic queries", async () => {

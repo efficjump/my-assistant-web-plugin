@@ -113,7 +113,7 @@ test("decision contract distinguishes the visual viewport from hidden DOM metada
   assert.match(contract, /offscreen, clipped, occluded, or hidden DOM/i);
 });
 
-test("accepts a bounded local element-search decision and rejects mixed effects", () => {
+test("accepts local element search and removes stale search metadata from executable decisions", () => {
   const discovery = Core.normalizeDecision(baseDecision({
     status: "discover",
     message: "",
@@ -139,8 +139,22 @@ test("accepts a bounded local element-search decision and rejects mixed effects"
     elementSearch: discovery.elementSearch
   }));
   const mixedValidation = Core.validateDecision(mixed, { context });
-  assert.equal(mixedValidation.valid, false);
-  assert.match(mixedValidation.errors.join(" "), /discover/);
+  assert.equal(mixed.status, "continue");
+  assert.deepEqual(mixed.elementSearch, {
+    query: "",
+    roles: [],
+    nearText: "",
+    reason: ""
+  });
+  assert.equal(mixedValidation.valid, true);
+
+  const searchOnlyContinue = Core.normalizeDecision(baseDecision({
+    status: "continue",
+    actions: [],
+    elementSearch: discovery.elementSearch
+  }));
+  assert.equal(searchOnlyContinue.status, "discover");
+  assert.equal(Core.validateDecision(searchOnlyContinue, { context }).valid, true);
 
   const empty = Core.normalizeDecision(baseDecision({
     status: "discover",
@@ -224,9 +238,47 @@ test("rejects terminal decisions without an exact user-facing message", () => {
 
 test("decision contract requires terminal responses to deliver accepted conversational work", () => {
   const contract = Core.buildDecisionContractText();
-  assert.match(contract, /short follow-ups from the recent conversation/i);
+  assert.match(contract, /runtime-resolved immutable turn intent/i);
+  assert.match(contract, /do not re-expand it from raw conversation history/i);
   assert.match(contract, /include the requested result itself/i);
   assert.match(contract, /never end with a promise/i);
+});
+
+test("turn intent defaults to a standalone single-effect boundary and validates explicit repetition", () => {
+  const fallback = Core.normalizeTurnIntent(null, {
+    latestUserMessage: "Move to the next page"
+  });
+  assert.deepEqual(fallback, {
+    version: "1.0",
+    mode: "standalone",
+    objective: "Move to the next page",
+    contextSummary: "",
+    repeatPolicy: "once",
+    repeatLimit: 1,
+    completionCriteria: [],
+    reason: ""
+  });
+
+  const bounded = Core.normalizeTurnIntent({
+    version: "1.0",
+    mode: "standalone",
+    objective: "Check the next three pages",
+    contextSummary: "must be discarded",
+    repeatPolicy: "bounded",
+    repeatLimit: 3,
+    completionCriteria: ["Three additional pages were inspected."],
+    reason: "The latest request contains an explicit numeric bound."
+  });
+  assert.equal(Core.validateTurnIntent(bounded).valid, true);
+  assert.equal(bounded.contextSummary, "");
+  assert.equal(bounded.repeatLimit, 3);
+
+  const invalidContinuation = Core.normalizeTurnIntent({
+    ...bounded,
+    mode: "continue_prior",
+    contextSummary: ""
+  });
+  assert.equal(Core.validateTurnIntent(invalidContinuation).valid, false);
 });
 
 test("accepts only runtime-issued completion evidence IDs", () => {

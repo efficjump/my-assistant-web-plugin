@@ -17,7 +17,7 @@ function getAdvancedTools() {
 }
 
 test("bridge publishes the guided browser MCP tool surface by default", () => {
-  assert.equal(Protocol.protocolVersion, "2.2");
+  assert.equal(Protocol.protocolVersion, "2.3");
   const names = getTools().map((tool) => tool.name).sort();
   assert.deepEqual(names, [
     "browser_act",
@@ -55,13 +55,19 @@ test("bridge retains the identifier-based tool surface as an advanced option", (
 
 test("bridge instructions keep multi-step clients working until the session is closed", () => {
   assert.match(Protocol.instructions, /browser_begin once/i);
+  assert.match(Protocol.instructions, /immutable repetition boundary/i);
+  assert.match(Protocol.instructions, /terminal for that browser task/i);
   assert.match(Protocol.instructions, /identifiers are managed internally/i);
   assert.match(Protocol.instructions, /browser_end before the final answer/i);
   assert.match(Protocol.instructions, /never submit a duplicate proposal/i);
   assert.match(Protocol.instructions, /element-count limit is never by itself a blocker/i);
   assert.match(Protocol.instructions, /semantic roles, and nearby visible text/i);
   assert.match(Protocol.instructions, /browser_visual_act/i);
-  assert.match(Protocol.getInstructions({ advanced: true }), /browser_session_start/i);
+  const advancedInstructions = Protocol.getInstructions({ advanced: true });
+  assert.match(advancedInstructions, /browser_session_start/i);
+  assert.match(advancedInstructions, /immutable intent/i);
+  assert.match(advancedInstructions, /repetition boundary/i);
+  assert.match(advancedInstructions, /failed, blocked, rejected/i);
 });
 
 test("bridge exposes observation paging and refresh without accepting visual coordinates", () => {

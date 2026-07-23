@@ -66,7 +66,7 @@ let server;
 let frameServer;
 let companion;
 let mcpClient;
-let visualAiCallCounts = { locator: 0, verifier: 0, imageInputs: 0 };
+let visualAiCallCounts = { intent: 0, locator: 0, verifier: 0, imageInputs: 0 };
 
 const silentLogger = Object.freeze({
   debug() {},
@@ -365,8 +365,8 @@ try {
     assert.equal(verificationContracts.repairedStatus, "completed");
     assert.equal(verificationContracts.completionVerified, true);
     assert.equal(verificationContracts.terminalGroundingVerified, true);
-    assert.equal(verificationContracts.completionVerifierSawConversation, true);
-    assert.equal(verificationContracts.groundingVerifierSawConversation, true);
+    assert.equal(verificationContracts.completionVerifierSawTurnIntent, true);
+    assert.equal(verificationContracts.groundingVerifierSawTurnIntent, true);
     assert.equal(verificationContracts.promiseReplanOccurred, true);
     assert.equal(verificationContracts.promiseCompletionVerifierCalls, 2);
     assert.equal(verificationContracts.promiseFinalStatus, "completed");
@@ -402,6 +402,26 @@ try {
     });
     assert.equal(internalDiscovery.modelCalls, 2);
     assert.equal(internalDiscovery.userHandoffSuppressed, true);
+
+    const turnBoundaryContracts = await exerciseTurnBoundaryContracts({
+      cdp,
+      panelSessionId,
+      tabId: firstTabId,
+      context: firstContext.data
+    });
+    assert.equal(turnBoundaryContracts.intentMode, "standalone");
+    assert.equal(turnBoundaryContracts.intentRepeatPolicy, "once");
+    assert.equal(turnBoundaryContracts.standaloneObjectiveStayedExact, true);
+    assert.equal(turnBoundaryContracts.resolverSawFailedPriorRun, true);
+    assert.equal(turnBoundaryContracts.plannerExcludedRawConversation, true);
+    assert.equal(turnBoundaryContracts.malformedRawHidden, true);
+    assert.equal(turnBoundaryContracts.internalJsonRejected, true);
+    assert.equal(turnBoundaryContracts.staleElementSearchCleared, true);
+    assert.equal(turnBoundaryContracts.repeatBlockedAfterOneSuccess, true);
+    assert.equal(turnBoundaryContracts.stateChangingToolRepeatBlocked, true);
+    assert.equal(turnBoundaryContracts.readOnlyToolRepeatAllowed, true);
+    assert.equal(turnBoundaryContracts.runtimeErrorStoppedSession, true);
+    assert.equal(turnBoundaryContracts.runtimeErrorJsonHidden, true);
 
     const transitionContracts = await exerciseTabTransitionContracts({ cdp, panelSessionId });
     assert.equal(transitionContracts.preservedRunningSession, true);
@@ -1182,7 +1202,7 @@ try {
     assert.equal(visualCompletion.status, "ready");
     assert.match(visualCompletion.page.visibleText, /Visual apply complete/);
     const visualModelStats = await (await fetch(`${origin}/mock-visual-ai-stats`)).json();
-    assert.deepEqual(visualModelStats, { locator: 2, verifier: 2, imageInputs: 4 });
+    assert.deepEqual(visualModelStats, { intent: 1, locator: 2, verifier: 2, imageInputs: 4 });
     const closedVisualSession = toolData(await mcpClient.callTool({
       name: "browser_end",
       arguments: {}
@@ -1294,7 +1314,7 @@ async function resolveChromePath() {
 }
 
 async function startFixtureServer() {
-  visualAiCallCounts = { locator: 0, verifier: 0, imageInputs: 0 };
+  visualAiCallCounts = { intent: 0, locator: 0, verifier: 0, imageInputs: 0 };
   frameServer = createServer((request, response) => {
     response.setHeader("content-type", "text/html; charset=utf-8");
     if (request.url?.startsWith("/hidden-cross-frame")) {
@@ -1341,7 +1361,19 @@ async function startFixtureServer() {
       }
 
       let payload;
-      if (instructions.includes("visual target locator")) {
+      if (instructions.includes("immutable repetition boundary")) {
+        visualAiCallCounts.intent += 1;
+        payload = {
+          version: "1.0",
+          mode: "standalone",
+          objective: "Click the visible Apply target once.",
+          contextSummary: "",
+          repeatPolicy: "once",
+          repeatLimit: 1,
+          completionCriteria: ["The visible Apply target has been clicked once."],
+          reason: "The goal requests one complete visual action."
+        };
+      } else if (instructions.includes("visual target locator")) {
         visualAiCallCounts.locator += 1;
         payload = {
           version: "1.0",
@@ -1371,7 +1403,7 @@ async function startFixtureServer() {
 
       response.setHeader("content-type", "application/json; charset=utf-8");
       response.end(JSON.stringify({
-        id: `resp-e2e-visual-${visualAiCallCounts.locator + visualAiCallCounts.verifier}`,
+        id: `resp-e2e-visual-${visualAiCallCounts.intent + visualAiCallCounts.locator + visualAiCallCounts.verifier}`,
         status: "completed",
         model: "e2e-visual-model",
         output: [{
@@ -2354,6 +2386,298 @@ async function exerciseInternalElementDiscoveryContract({ cdp, panelSessionId, t
   })()`);
 }
 
+async function exerciseTurnBoundaryContracts({ cdp, panelSessionId, tabId, context }) {
+  return evaluate(cdp, panelSessionId, `(async () => {
+    const original = {
+      requestAiDecision,
+      settings: structuredClone(state.settings),
+      runtimeSettings: structuredClone(state.runtimeSettings),
+      activeTab: state.activeTab ? structuredClone(state.activeTab) : null,
+      lastContext: state.lastContext ? structuredClone(state.lastContext) : null,
+      agentSession: state.agentSession,
+      agentRunUi: state.agentRunUi,
+      currentPlan: state.currentPlan,
+      conversation: structuredClone(state.conversation),
+      evaluationLogs: structuredClone(state.evaluationLogs)
+    };
+    try {
+      state.runtimeSettings = {
+        ...state.settings,
+        includeScreenshot: false,
+        mcpEnabled: false,
+        maxNoProgressSteps: 2,
+        maxActionsPerTurn: 3
+      };
+      state.activeTab = {
+        id: ${JSON.stringify(tabId)},
+        title: ${JSON.stringify(context.title)},
+        url: ${JSON.stringify(context.url)}
+      };
+      const currentContext = {
+        ...structuredClone(${JSON.stringify(context)}),
+        interactiveElements: [{
+          ref: "e1",
+          scope: "main",
+          tag: "button",
+          role: "button",
+          type: "button",
+          label: "Dense grid next page",
+          selector: "#dense-next-page",
+          disabled: false,
+          actionability: "interactive"
+        }]
+      };
+      state.lastContext = currentContext;
+      state.conversation = [
+        {
+          role: "user",
+          text: "다음 페이지로 넘겨서 내용을 확인해줘.",
+          tone: "",
+          kind: "",
+          taskStatus: ""
+        },
+        {
+          role: "assistant",
+          text: "이전 작업 중 오류가 발생했습니다.",
+          tone: "error",
+          kind: "run-error",
+          taskStatus: "failed"
+        },
+        {
+          role: "user",
+          text: "현재 페이지에서 다음 페이지로 한 번 이동해줘.",
+          tone: "",
+          kind: "",
+          taskStatus: ""
+        }
+      ];
+      state.evaluationLogs = [];
+      state.agentRunUi = null;
+      createAgentSession("현재 페이지에서 다음 페이지로 한 번 이동해줘.");
+      const session = state.agentSession;
+      let intentRequest = null;
+      requestAiDecision = async (_activeSession, request) => {
+        intentRequest = request;
+        return {
+          text: JSON.stringify({
+            version: "1.0",
+            mode: "standalone",
+            objective: "이전 요청까지 합쳐 다음 페이지 이동을 계속 반복한다.",
+            contextSummary: "",
+            repeatPolicy: "once",
+            repeatLimit: 1,
+            completionCriteria: ["요청 시작 시점보다 한 페이지 앞으로 이동한 현재 화면이 관찰된다."],
+            reason: "최신 메시지는 자체로 완결된 새 명령이며 한 번이라는 범위를 명시한다."
+          })
+        };
+      };
+      const intent = await resolveAgentTurnIntent(session);
+      const plannerPrompt = buildChatAgentPrompt(
+        session,
+        currentContext,
+        { enabled: false, tools: [], error: "" },
+        1
+      );
+
+      const malformed = normalizeAiDecisionResponse('{"status": "continue"', 1);
+      const malformedValidation = validateChatDecision(
+        malformed,
+        currentContext,
+        { enabled: false, tools: [] }
+      );
+      const malformedText = buildDecisionText(malformed);
+
+      const internalJsonDecision = normalizeAiDecisionResponse(JSON.stringify({
+        version: "1.0",
+        status: "answer",
+        message: "Internal response follows:\\n" + JSON.stringify({
+          status: "continue",
+          actions: [{ type: "click", ref: "e1" }],
+          elementSearch: { query: "next", roles: ["button"], nearText: "", reason: "find" }
+        }),
+        summary: "internal payload",
+        progress: "",
+        doneReason: "",
+        completionEvidence: [],
+        needsUserApproval: false,
+        plan: [],
+        elementSearch: { query: "", roles: [], nearText: "", reason: "" },
+        toolCalls: [],
+        actions: [],
+        verification: { required: false, expectedChange: "", successCriteria: [] }
+      }), 1);
+      const internalJsonValidation = validateChatDecision(
+        internalJsonDecision,
+        currentContext,
+        { enabled: false, tools: [] }
+      );
+
+      const firstAction = normalizeAiDecisionResponse(JSON.stringify({
+        version: "1.0",
+        status: "continue",
+        message: "다음 페이지로 이동합니다.",
+        summary: "다음 페이지 이동",
+        progress: "",
+        doneReason: "",
+        completionEvidence: [],
+        needsUserApproval: false,
+        plan: ["한 번 이동", "결과 확인"],
+        elementSearch: {
+          query: "next page",
+          roles: ["button"],
+          nearText: "issue grid",
+          reason: "이전 검색 메타데이터가 액션 응답에 남음"
+        },
+        toolCalls: [],
+        actions: [{
+          id: "next-once",
+          type: "click",
+          ref: "e1",
+          reason: "한 페이지 이동"
+        }],
+        verification: {
+          required: true,
+          expectedChange: "페이지 인덱스가 한 번 증가",
+          successCriteria: ["한 페이지 앞으로 이동"]
+        }
+      }), 1);
+      const firstValidation = validateChatDecision(
+        firstAction,
+        currentContext,
+        { enabled: false, tools: [] }
+      );
+      enforceTurnEffectBoundary(session, firstAction, currentContext);
+      recordSuccessfulEffects(session, firstAction, [], [{
+        ok: true,
+        action: firstAction.actions[0],
+        result: { changed: true }
+      }]);
+
+      const repeatedAction = normalizeAiDecisionResponse(JSON.stringify({
+        version: "1.0",
+        status: "continue",
+        message: "다음 페이지로 다시 이동합니다.",
+        summary: "다음 페이지 재이동",
+        progress: "한 페이지 이동 완료",
+        doneReason: "",
+        completionEvidence: [],
+        needsUserApproval: false,
+        plan: ["같은 버튼 다시 클릭"],
+        elementSearch: { query: "", roles: [], nearText: "", reason: "" },
+        toolCalls: [],
+        actions: [{
+          id: "next-again",
+          type: "click",
+          ref: "e1",
+          reason: "다음 페이지가 계속 보임"
+        }],
+        verification: {
+          required: true,
+          expectedChange: "페이지가 다시 변경",
+          successCriteria: ["다음 페이지 표시"]
+        }
+      }), 2);
+      enforceTurnEffectBoundary(session, repeatedAction, currentContext);
+
+      const writeToolContext = {
+        tools: [{
+          name: "fixture.update",
+          kind: "tool",
+          sourceName: "update",
+          annotations: { readOnlyHint: false }
+        }]
+      };
+      const writeToolDecision = {
+        status: "continue",
+        toolCalls: [{
+          toolName: "fixture.update",
+          arguments: { record: "visible-row", value: "updated" }
+        }],
+        actions: [],
+        mcpContext: writeToolContext
+      };
+      enforceTurnEffectBoundary(session, writeToolDecision, currentContext);
+      recordSuccessfulEffects(session, writeToolDecision, [{ ok: true }], []);
+      const repeatedWriteToolDecision = structuredClone(writeToolDecision);
+      enforceTurnEffectBoundary(session, repeatedWriteToolDecision, currentContext);
+
+      const readToolContext = {
+        tools: [{
+          name: "fixture.read",
+          kind: "tool",
+          sourceName: "read",
+          annotations: { readOnlyHint: true }
+        }]
+      };
+      const readToolDecision = {
+        status: "continue",
+        toolCalls: [{
+          toolName: "fixture.read",
+          arguments: { record: "visible-row" }
+        }],
+        actions: [],
+        mcpContext: readToolContext
+      };
+      enforceTurnEffectBoundary(session, readToolDecision, currentContext);
+      recordSuccessfulEffects(session, readToolDecision, [{ ok: true }], []);
+      const repeatedReadToolDecision = structuredClone(readToolDecision);
+      enforceTurnEffectBoundary(session, repeatedReadToolDecision, currentContext);
+
+      await runBusy(async () => {
+        throw new Error(JSON.stringify({
+          error: { message: "Provider request failed without exposing its JSON envelope." }
+        }));
+      });
+      const lastConversation = state.conversation.at(-1);
+
+      return {
+        intentMode: intent.mode,
+        intentRepeatPolicy: intent.repeatPolicy,
+        standaloneObjectiveStayedExact: intent.objective
+          === "현재 페이지에서 다음 페이지로 한 번 이동해줘.",
+        resolverSawFailedPriorRun: intentRequest?.system.includes("earlier error")
+          && intentRequest?.user.includes('"taskStatus": "failed"'),
+        plannerExcludedRawConversation: plannerPrompt.includes("Resolved turn intent JSON")
+          && !plannerPrompt.includes("다음 페이지로 넘겨서 내용을 확인해줘."),
+        malformedRawHidden: !malformedText.includes('{"status"')
+          && malformedValidation.valid === false,
+        internalJsonRejected: internalJsonValidation.valid === false,
+        staleElementSearchCleared: firstValidation.valid === true
+          && firstAction.elementSearch.query === "",
+        repeatBlockedAfterOneSuccess: repeatedAction.status === "blocked"
+          && repeatedAction.actions.length === 0,
+        stateChangingToolRepeatBlocked: repeatedWriteToolDecision.status === "blocked"
+          && repeatedWriteToolDecision.toolCalls.length === 0,
+        readOnlyToolRepeatAllowed: repeatedReadToolDecision.status === "continue"
+          && repeatedReadToolDecision.toolCalls.length === 1,
+        runtimeErrorStoppedSession: session.status === "failed" && session.stopRequested === true,
+        runtimeErrorJsonHidden: lastConversation?.kind === "run-error"
+          && !lastConversation.text.includes("{")
+          && lastConversation.text.includes("Provider request failed")
+      };
+    } finally {
+      requestAiDecision = original.requestAiDecision;
+      state.settings = original.settings;
+      state.runtimeSettings = original.runtimeSettings;
+      state.activeTab = original.activeTab;
+      state.lastContext = original.lastContext;
+      state.agentSession = original.agentSession;
+      state.agentRunUi = original.agentRunUi;
+      state.currentPlan = original.currentPlan;
+      state.conversation = original.conversation;
+      state.evaluationLogs = original.evaluationLogs;
+      elements.messageList.replaceChildren();
+      for (const message of state.conversation) {
+        appendChatMessage(message.role, message.text, {
+          tone: message.tone || "",
+          record: false
+        });
+      }
+      updateAgentButtons();
+    }
+  })()`);
+}
+
 async function exerciseAgentVerificationContracts({ cdp, panelSessionId, tabId, context }) {
   return evaluate(cdp, panelSessionId, `(async () => {
     const original = {
@@ -2387,11 +2711,21 @@ async function exerciseAgentVerificationContracts({ cdp, panelSessionId, tabId, 
       ];
       createAgentSession("계속해줘");
       const session = state.agentSession;
+      session.turnIntent = AgentCore.normalizeTurnIntent({
+        version: "1.0",
+        mode: "continue_prior",
+        objective: "현재 화면을 확인하고 상태 정보를 정리해서 전달한다.",
+        contextSummary: "직전 답변에서 상태 정보를 정리해 전달하기로 했고 사용자가 그 작업을 계속하라고 했다.",
+        repeatPolicy: "once",
+        repeatLimit: 1,
+        completionCriteria: ["현재 화면 상태 정보가 최종 답변에 실제로 포함된다."],
+        reason: "최신 메시지는 직전의 구체적인 미완료 전달 약속을 명시적으로 이어 간다."
+      });
       const purposes = [];
       const screenshotChecks = [];
       let groundingCallCount = 0;
-      let completionVerifierSawConversation = false;
-      let groundingVerifierSawConversation = false;
+      let completionVerifierSawTurnIntent = false;
+      let groundingVerifierSawTurnIntent = false;
       collectDecisionObservation = async () => ({
         context: ${JSON.stringify(context)},
         screenshotDataUrl: coherentScreenshot
@@ -2408,12 +2742,12 @@ async function exerciseAgentVerificationContracts({ cdp, panelSessionId, tabId, 
           screenshotChecks.push(request.screenshotDataUrl === coherentScreenshot);
         }
         if (request.purpose.startsWith("verifier-")) {
-          completionVerifierSawConversation = request.user.includes("상태 정보를 정리해서 전달하겠습니다.")
-            && request.user.includes("계속해줘");
+          completionVerifierSawTurnIntent = request.user.includes("Resolved turn intent JSON")
+            && request.user.includes("현재 화면을 확인하고 상태 정보를 정리해서 전달한다.");
         }
         if (request.purpose.startsWith("answer-grounding-") && request.purpose !== "answer-grounding-repair") {
-          groundingVerifierSawConversation = request.user.includes("상태 정보를 정리해서 전달하겠습니다.")
-            && request.user.includes("계속해줘");
+          groundingVerifierSawTurnIntent = request.user.includes("Resolved turn intent JSON")
+            && request.user.includes("현재 화면을 확인하고 상태 정보를 정리해서 전달한다.");
         }
         let payload;
         if (request.purpose === "decision") {
@@ -2492,6 +2826,16 @@ async function exerciseAgentVerificationContracts({ cdp, panelSessionId, tabId, 
       ];
       createAgentSession("좋아요");
       const promiseSession = state.agentSession;
+      promiseSession.turnIntent = AgentCore.normalizeTurnIntent({
+        version: "1.0",
+        mode: "continue_prior",
+        objective: "확인한 상태 정보를 최종 답변에 정리해 전달한다.",
+        contextSummary: "직전 답변에서 확인한 정보를 다음 답변에 정리해 주겠다고 약속했고 사용자가 수락했다.",
+        repeatPolicy: "once",
+        repeatLimit: 1,
+        completionCriteria: ["확인한 상태 정보가 최종 답변 본문에 포함된다."],
+        reason: "최신 메시지는 직전의 구체적인 미완료 결과 전달을 수락한다."
+      });
       const promisePurposes = [];
       let completionVerifierCalls = 0;
       requestAiDecision = async (activeSession, request) => {
@@ -2714,8 +3058,8 @@ async function exerciseAgentVerificationContracts({ cdp, panelSessionId, tabId, 
         repairedStatus: repairedDecision.status,
         completionVerified: repairedDecision.verifier?.status === "verified",
         terminalGroundingVerified: repairedDecision.grounding?.status === "verified",
-        completionVerifierSawConversation,
-        groundingVerifierSawConversation,
+        completionVerifierSawTurnIntent,
+        groundingVerifierSawTurnIntent,
         promiseReplanOccurred: promisePurposes.includes("verification-replan"),
         promiseCompletionVerifierCalls: completionVerifierCalls,
         promiseFinalMessage: promiseRepairedDecision.message,

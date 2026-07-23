@@ -4,7 +4,7 @@ A Manifest V3 browser extension that turns a configured language model into a bo
 
 ![Agent side panel](docs/assets/agent-panel.png)
 
-Version `0.9.0` with Bridge protocol `2.2` targets Chromium-based browsers version 116 or later. This repository contains a source-loaded development build rather than a store package. The screenshots in this README were regenerated from the current version with a temporary browser profile and local fixtures.
+Version `0.9.1` with Bridge protocol `2.3` targets Chromium-based browsers version 116 or later. This repository contains a source-loaded development build rather than a store package. The screenshots in this README were regenerated from the current version with a temporary browser profile and local fixtures.
 
 ## Choose the workflow
 
@@ -34,7 +34,7 @@ flowchart LR
     V -->|"Evidence is sufficient"| R["Return the result"]
 ```
 
-Completion is not accepted from model prose alone. The runtime issues evidence identifiers, and separate verifiers check both the completion claim and the exact user-facing result against that evidence. Brief follow-ups are resolved from recent user/assistant context, so accepting an unfinished promised deliverable carries that obligation into the next turn. A terminal response must contain the requested result rather than announce future work or merely say that a summary was produced. When the same decision repeats without observable progress, the agent tries an alternative approach and eventually stops with a concrete blocker instead of looping indefinitely.
+Completion is not accepted from model prose alone. Before any page effect, the runtime resolves one immutable intent for the latest message. A complete command starts a new standalone task even when it resembles an earlier failed request; only a semantically incomplete follow-up that explicitly resumes one unfinished deliverable carries prior context forward. The runtime also resolves whether the same semantic effect is allowed once, an explicit number of times, or until an explicit condition. A successful effect cannot be repeated beyond that boundary merely because the same control remains visible. Runtime-issued evidence and separate verifiers then check both the completion claim and the exact user-facing result. A terminal response must contain the requested result rather than announce future work or merely say that a summary was produced.
 
 ## Capabilities
 
@@ -54,9 +54,11 @@ Completion is not accepted from model prose alone. The runtime issues evidence i
 - Supports Streamable HTTP MCP tools, resources, prompts, protocol negotiation, and session recovery
 - Supports MCP OAuth 2.1 Authorization Code with PKCE S256 and refresh-token rotation
 - Exposes one explicitly shared tab to MCP-capable development tools through an authenticated loopback companion
+- Freezes each latest request into a standalone or explicit-continuation intent and prevents successful effects from exceeding its resolved repetition boundary
 - Restores conversations by tab and URL and exports traces as Markdown, JSON, or CSV
 - Records privacy-preserving AI request audit metadata
 - Treats an HTTP success with no usable output as an explicit failure
+- Repairs malformed structured decisions without exposing model JSON or internal validation details in the conversation
 
 The **Context** inspector shows what the current browser observation actually contains: visible text and controls, mapped frames, nested scroll regions, visual surfaces, automation constraints, selection, and recent logs. It is useful for distinguishing a model-planning problem from a browser-permission or page-structure boundary.
 
@@ -131,6 +133,8 @@ Authentication values are session-only by default and are persisted only when th
 
 The agent can dynamically request another visible-control window with a `discover` decision. It searches accessible labels, roles, safe attributes, and nearby table/row/form/dialog/region text locally, similar to using a targeted source search instead of loading an entire file. Only matched control descriptors are sent to the model. If the target is outside the viewport, the agent must scroll and observe again; local search does not expose offscreen or hidden content.
 
+Write a numeric count or an observable stopping condition when an action genuinely needs repetition, for example “apply this to the next three rows” or “continue until no pending rows remain.” Without that explicit scope, the same successful state-changing effect is limited to one occurrence in the request. If a task ends with an error, rejection, or cancellation, send the next complete request as a new task; the failed run is retained as context but is not treated as permission to replay its actions.
+
 ## Settings and workspace placement
 
 The settings dialog starts with a live overview of the model, automation mode, external integrations, and workspace placement. Fields continue to save automatically, and the header reports completed saves or validation errors without requiring a separate global save button.
@@ -157,7 +161,7 @@ The panel keeps only the current page, element picker, settings, and request com
 
 Global settings are saved when a field changes, so there is no separate global save button; site-specific profiles still use their own apply action. The full reset action is under **Settings → 고급**. While a local action plan is waiting for approval, the new-request composer is hidden because the running task cannot accept another request; rejecting or completing the approval restores the unchanged draft. External Bridge approvals do not hide the composer.
 
-The **작업 흐름** card summarizes the complete run rather than only the final turn, so an earlier tool call or page action is not replaced with “none” when the terminal turn needs no further effect. Successful low-level result payloads stay in the internal evidence and trace instead of appearing as raw JSON chat messages; failures remain visible as concise warnings.
+The **작업 흐름** card summarizes the complete run rather than only the final turn, so an earlier tool call or page action is not replaced with “none” when the terminal turn needs no further effect. Successful low-level result payloads stay in the internal evidence and trace instead of appearing as raw JSON chat messages. Malformed decision objects and provider error envelopes are repaired or reduced to concise user-facing errors; internal schema messages such as an invalid `elementSearch` placement remain in diagnostics instead of the conversation.
 
 **Settings → 사이트별** is an agent-behavior profile for the exact origin shown in the panel; it does not change browser permissions. Enable the profile only when that site needs different behavior. Each field can independently inherit the global setting or override the action mode, screenshot use, and MCP use for that origin. The effective values are shown before saving, and **기본 설정으로 되돌리기** removes the origin-specific profile.
 
@@ -251,7 +255,7 @@ The default MCP surface keeps protocol bookkeeping inside the companion:
 
 | Tool | When to use it |
 | --- | --- |
-| `browser_begin` | Start or safely resume one complete browser goal and receive the first redacted page snapshot |
+| `browser_begin` | Start or safely resume one complete browser goal, receive its immutable `intent`, and receive the first redacted page snapshot |
 | `browser_elements` | Retrieve visible controls by label terms, roles, and nearby context, or continue an opaque result cursor |
 | `browser_act` | Propose a bounded DOM action or small action group using refs from the latest snapshot |
 | `browser_continue` | Read an approval result and receive the refreshed page; use `refresh: true` after an out-of-band page change |
@@ -262,14 +266,17 @@ The default MCP surface keeps protocol bookkeeping inside the companion:
 A reliable client loop is:
 
 1. Call `browser_begin` once with the user's full browser goal.
-2. Inspect the returned visible page state and use only refs from that result.
+2. Inspect the returned `intent` and visible page state. Use only refs from that result and stay within its repetition policy.
 3. If a visible target is absent, call `browser_elements` with a focused search before paging blindly or asking the user to click.
 4. Propose the next required effect with `browser_act`, then always call `browser_continue`.
 5. If the response is `approval_required`, let the user approve or reject it in the extension and call `browser_continue` again. Do not submit a duplicate action.
 6. Re-observe after scrolling, navigation, approval, or any other page change and use only the new refs.
 7. Verify the requested result in the refreshed page state, then call `browser_end`.
+8. If an operation is `failed`, `blocked`, `rejected`, `cancelled`, or `unknown_after_restart`, treat that task as terminal and call `browser_end` before beginning a new user request.
 
 The caller does not need to preserve session, observation, operation, or retry identifiers in guided mode. Those identifiers, deterministic retry protection, and page-state bindings remain inside the companion and extension.
+
+`browser_begin` defaults a standalone goal to one successful occurrence of each semantic state-changing effect. It returns `repeatPolicy: "bounded"` only when the goal explicitly supplies a count, and `repeatPolicy: "until_condition"` only when the goal supplies an observable stopping condition. The extension records successful semantic effects independently of volatile element refs, so a next-page button that receives a new ref after navigation is still recognized as the same requested effect. To authorize more work after a terminal result, close the task and begin another complete goal.
 
 ### Finding controls on dense pages
 
@@ -328,6 +335,9 @@ Never put the token in the URL or commit it to the repository. The exact HTTP tr
 | Connected, but the wrong tab is shared | Focus the intended web page and select **현재 탭으로 변경** in the Bridge settings. |
 | Operation remains `approval_required` | Approve or reject it in the extension, then call `browser_continue`; do not call `browser_act` again for the same proposal. |
 | A ref or proposal becomes `stale` | Refresh with `browser_continue` and plan from the latest refs. |
+| A response is `failed`, `blocked`, `rejected`, `cancelled`, or `unknown_after_restart` | Call `browser_end`; do not send another action in that task. Start a new complete goal if the user wants to proceed. |
+| The same action is stopped after it already succeeded | The resolved intent reached its repetition boundary. End the task and state an explicit count or stopping condition in a new goal if more repetitions are required. |
+| Raw JSON or an internal decision-contract error appears | Reload the extension after updating to `0.9.1` or later. The current runtime keeps malformed decision payloads and validation details in diagnostics and shows only a concise user-facing error. |
 | A visible control is missing | Use a focused `browser_elements` query and its cursor; scroll and re-observe if the target is outside the viewport. |
 | Canvas target has no ref | Use `browser_visual_act` with the current visual-surface ref and description; screenshot input must be enabled and supported by the configured model. |
 | `uv_spawn`, `ENOENT`, or a stop-hook spawn error appears | This normally comes from the development tool's local hook process, not from the Bridge protocol. Check that hook's executable and `PATH`, or disable the broken hook; verify the Bridge separately from the extension's connected/shared indicators and actual MCP call log. |
@@ -368,6 +378,7 @@ The production manifest does not require `<all_urls>`. Site and endpoint origins
 - Search continuations are bound to the complete query/role/context filter and page state. Approval-time revalidation reconstructs that same observation window, so a searched ref cannot silently rebind to an unrelated control.
 - The local companion binds only to loopback, requires independent MCP and extension credentials, and never puts either credential in a URL.
 - URL, document identity, and target preconditions are checked again immediately before an approved effect.
+- The latest message is resolved once into an immutable task intent; failed prior runs cannot silently authorize retries, and successful semantic effects cannot exceed the explicit repetition policy.
 - Submission, external navigation, upload, tab changes, downloads, and destructive MCP tools require approval even in automatic mode.
 - A visual-coordinate action always requires a fresh screenshot, explicit approval, stable surface identity, and an independent verifier result. Bridge callers can describe a target but cannot submit coordinates, screenshot bindings, policy results, or approval claims.
 - Passwords, tokens, card data, verification codes, and sensitive URL parameters are blocked or masked by policy.
@@ -414,7 +425,7 @@ Run the local panel harness with:
 npm run serve:test
 ```
 
-The command reports the temporary development address. The E2E suite exercises the Manifest V3 service worker, document replacement, viewport-scoped deep DOM observation, contextual element retrieval, structured-search cursor binding, approval-time search-window reconstruction, dense-control pagination, cursor invalidation after DOM changes, internal-model `discover` continuation, visible cross-origin frame routing, hidden-frame exclusion, nested scroll regions, guarded visual-surface clicks, extension-owned Bridge visual targeting, occlusion and clipping filters, file handoff, tab lifecycle, worker restart, and empty-response protection. The opt-in local-harness scenario additionally launches a compatible CLI, loads a temporary secret-protected MCP configuration, confirms that every assistant turn reports the local `default` model alias, and requires the model to complete the guided begin → act → approval/continue → verification → end workflow against a temporary browser profile.
+The command reports the temporary development address. The E2E suite exercises the Manifest V3 service worker, document replacement, viewport-scoped deep DOM observation, contextual element retrieval, structured-search cursor binding, approval-time search-window reconstruction, dense-control pagination, cursor invalidation after DOM changes, internal-model `discover` continuation, immutable turn resolution after a failed run, semantic page and MCP-tool repetition boundaries, malformed-response containment, visible cross-origin frame routing, hidden-frame exclusion, nested scroll regions, guarded visual-surface clicks, extension-owned Bridge visual targeting, terminal Bridge failures, occlusion and clipping filters, file handoff, tab lifecycle, worker restart, and empty-response protection. The opt-in local-harness scenario additionally launches a compatible CLI, loads a temporary secret-protected MCP configuration, confirms that every assistant turn reports the local `default` model alias, and requires the model to complete the guided begin → act → approval/continue → verification → end workflow against a temporary browser profile.
 
 ## Public-release audit
 
