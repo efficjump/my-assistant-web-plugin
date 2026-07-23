@@ -392,8 +392,14 @@ try {
       context: firstContext.data
     });
     assert.equal(internalDiscovery.decisionStatus, "continue");
-    assert.equal(internalDiscovery.actionRef, "e121");
-    assert.deepEqual(internalDiscovery.requestedCursors, ["", "cursor-window-2"]);
+    assert.equal(internalDiscovery.actionRef, "e1");
+    assert.deepEqual(internalDiscovery.requestedCursors, ["", ""]);
+    assert.deepEqual(internalDiscovery.requestedSearches, ["", "Dense grid next page"]);
+    assert.deepEqual(internalDiscovery.boundObservationSearch, {
+      query: "Dense grid next page",
+      roles: ["button"],
+      nearText: "Dense issue grid"
+    });
     assert.equal(internalDiscovery.modelCalls, 2);
     assert.equal(internalDiscovery.userHandoffSuppressed, true);
 
@@ -512,6 +518,8 @@ try {
         maxTextChars: 8000,
         maxElements: 20,
         elementQuery: "Dense grid next page",
+        elementRoles: ["button"],
+        elementNearText: "Dense issue grid",
         redactSensitiveData: true
       }
     });
@@ -522,6 +530,66 @@ try {
     assert.ok(
       queriedElements.data.elementDiscovery.availableTotal > queriedElements.data.elementDiscovery.total
     );
+    assert.deepEqual(queriedElements.data.elementDiscovery.search, {
+      query: "Dense grid next page",
+      roles: ["button"],
+      nearText: "Dense issue grid"
+    });
+    const searchedPaginator = queriedElements.data.interactiveElements.find(
+      (element) => element.label === "Dense grid next page"
+    );
+    assert.ok(searchedPaginator.searchMatch.matchedFields.includes("context"));
+    assert.match(searchedPaginator.searchMatch.contextSnippet, /Dense issue grid/);
+
+    const broadSearch = await extensionMessage(cdp, panelSessionId, {
+      type: "COLLECT_PAGE_CONTEXT",
+      targetTabId: firstTabId,
+      options: {
+        maxTextChars: 8000,
+        maxElements: 20,
+        elementQuery: "Dense grid",
+        elementRoles: ["button"],
+        elementNearText: "Dense issue grid",
+        redactSensitiveData: true
+      }
+    });
+    assert.equal(broadSearch.data.elementDiscovery.hasMore, true);
+    const continuedSearch = await extensionMessage(cdp, panelSessionId, {
+      type: "COLLECT_PAGE_CONTEXT",
+      targetTabId: firstTabId,
+      options: {
+        maxTextChars: 8000,
+        maxElements: 20,
+        elementCursor: broadSearch.data.elementDiscovery.nextCursor,
+        elementQuery: "Dense grid",
+        elementRoles: ["button"],
+        elementNearText: "Dense issue grid",
+        redactSensitiveData: true
+      }
+    });
+    assert.ok(
+      continuedSearch.data.elementDiscovery.visited > broadSearch.data.elementDiscovery.visited
+    );
+    assert.ok(
+      continuedSearch.data.elementDiscovery.visited
+        <= broadSearch.data.elementDiscovery.visited + 20
+    );
+    assert.deepEqual(continuedSearch.data.elementDiscovery.search, broadSearch.data.elementDiscovery.search);
+    const mismatchedSearchCursor = await extensionMessage(cdp, panelSessionId, {
+      type: "COLLECT_PAGE_CONTEXT",
+      targetTabId: firstTabId,
+      options: {
+        maxTextChars: 8000,
+        maxElements: 20,
+        elementCursor: broadSearch.data.elementDiscovery.nextCursor,
+        elementQuery: "Dense grid",
+        elementRoles: ["link"],
+        elementNearText: "Dense issue grid",
+        redactSensitiveData: true
+      }
+    });
+    assert.equal(mismatchedSearchCursor.data.elementDiscovery.cursorReset, true);
+    assert.equal(mismatchedSearchCursor.data.elementDiscovery.returned, 0);
     await evaluate(cdp, panelSessionId, `(async () => {
       await chrome.scripting.executeScript({
         target: { tabId: ${JSON.stringify(firstTabId)} },
@@ -2134,6 +2202,7 @@ async function exerciseInternalElementDiscoveryContract({ cdp, panelSessionId, t
         elementDiscovery: {
           scope: "current-visual-viewport",
           query: "",
+          search: { query: "", roles: [], nearText: "" },
           pageSize: 80,
           returned: 80,
           total: 121,
@@ -2147,39 +2216,51 @@ async function exerciseInternalElementDiscoveryContract({ cdp, panelSessionId, t
       const secondContext = {
         ...structuredClone(firstContext),
         interactiveElements: [{
-          ref: "e121",
+          ref: "e1",
           tag: "button",
           role: "button",
           type: "button",
           label: "Dense grid next page",
           selector: "#dense-next-page",
-          actionability: "interactive"
+          actionability: "interactive",
+          searchMatch: {
+            score: 2040,
+            matchedFields: ["label", "role", "context"],
+            contextSnippet: "collection: Dense issue grid"
+          }
         }],
         interactiveElementStats: {
-          total: 121,
+          total: 1,
           availableTotal: 121,
-          included: 41,
-          visited: 121,
+          included: 1,
+          visited: 1,
           truncated: false
         },
         elementDiscovery: {
           scope: "current-visual-viewport",
-          query: "",
+          query: "Dense grid next page",
+          search: {
+            query: "Dense grid next page",
+            roles: ["button"],
+            nearText: "Dense issue grid"
+          },
           pageSize: 80,
-          returned: 41,
-          total: 121,
+          returned: 1,
+          total: 1,
           availableTotal: 121,
-          visited: 121,
+          visited: 1,
           remaining: 0,
           hasMore: false,
           nextCursor: ""
         }
       };
       const requestedCursors = [];
+      const requestedSearches = [];
       let modelCalls = 0;
       collectDecisionObservation = async (discovery = {}) => {
         requestedCursors.push(discovery.elementCursor || "");
-        const observed = discovery.elementCursor ? secondContext : firstContext;
+        requestedSearches.push(discovery.elementQuery || "");
+        const observed = discovery.elementQuery ? secondContext : firstContext;
         state.lastContext = observed;
         return { context: observed, screenshotDataUrl: "" };
       };
@@ -2190,14 +2271,20 @@ async function exerciseInternalElementDiscoveryContract({ cdp, panelSessionId, t
         const payload = modelCalls === 1
           ? {
               version: "1.0",
-              status: "blocked",
-              message: "현재 요소 묶음에는 다음 페이지 버튼 ref가 없습니다.",
-              summary: "대상 ref 누락",
+              status: "discover",
+              message: "",
+              summary: "현재 화면에서 관련 페이지 이동 버튼 검색",
               progress: "첫 요소 묶음을 확인했습니다.",
-              doneReason: "현재 요소 묶음에서 대상 누락",
+              doneReason: "",
               completionEvidence: [],
               needsUserApproval: false,
               plan: ["다음 페이지 버튼 찾기"],
+              elementSearch: {
+                query: "Dense grid next page",
+                roles: ["button"],
+                nearText: "Dense issue grid",
+                reason: "현재 관찰에 대상 ref가 없어 관련 컨트롤만 로컬 검색"
+              },
               toolCalls: [],
               actions: [],
               verification: { required: false, expectedChange: "", successCriteria: [] }
@@ -2212,11 +2299,17 @@ async function exerciseInternalElementDiscoveryContract({ cdp, panelSessionId, t
               completionEvidence: [],
               needsUserApproval: false,
               plan: ["다음 페이지 버튼 클릭", "결과 재확인"],
+              elementSearch: {
+                query: "",
+                roles: [],
+                nearText: "",
+                reason: ""
+              },
               toolCalls: [],
               actions: [{
                 id: "click-next-page",
                 type: "click",
-                ref: "e121",
+                ref: "e1",
                 reason: "문제점 조회 그리드의 다음 페이지로 이동"
               }],
               verification: {
@@ -2233,6 +2326,12 @@ async function exerciseInternalElementDiscoveryContract({ cdp, panelSessionId, t
         decisionStatus: decision.status,
         actionRef: decision.actions[0]?.ref || "",
         requestedCursors,
+        requestedSearches,
+        boundObservationSearch: {
+          query: decision.observationRequest?.elementQuery || "",
+          roles: decision.observationRequest?.elementRoles || [],
+          nearText: decision.observationRequest?.elementNearText || ""
+        },
         modelCalls,
         userHandoffSuppressed: !state.conversation.some(
           (message) => message.role === "assistant" && /직접|수동/.test(message.text || "")

@@ -200,13 +200,20 @@ async function collectPageContextFromFrames(targetTabId, options = {}) {
   assertInjectableTab(tab);
   const pageSize = Math.floor(clampNumber(options.maxElements, 1, 500, 80));
   const decodedCursor = decodeElementCursor(options.elementCursor);
-  const requestedQuery = String(options.elementQuery || "").trim().slice(0, 500);
+  const requestedSearch = normalizeElementDiscoverySearch(options);
+  const requestedSearchActive = isElementDiscoverySearchActive(requestedSearch);
   const cursorState = decodedCursor.valid
-    && (!requestedQuery || requestedQuery === decodedCursor.value.query)
+    && (
+      !requestedSearchActive
+      || globalThis.WebAgentCore.stableStringify(requestedSearch)
+        === globalThis.WebAgentCore.stableStringify(decodedCursor.value.search)
+    )
     && decodedCursor.value.pageSize === pageSize
     ? decodedCursor.value
     : null;
-  const elementQuery = requestedQuery || cursorState?.query || "";
+  const elementSearch = requestedSearchActive
+    ? requestedSearch
+    : cursorState?.search || normalizeElementDiscoverySearch();
   const initialCursorResetReason = options.elementCursor && !cursorState
     ? decodedCursor.reason || "The element cursor did not match the requested discovery window."
     : String(options._cursorResetReason || "");
@@ -220,7 +227,9 @@ async function collectPageContextFromFrames(targetTabId, options = {}) {
           maxTextChars: options.maxTextChars,
           maxElements: pageSize,
           elementOffset: cursorState?.offsets?.[String(frame.frameId)] || 0,
-          elementQuery,
+          elementQuery: elementSearch.query,
+          elementRoles: elementSearch.roles,
+          elementNearText: elementSearch.nearText,
           redactSensitiveData: options.redactSensitiveData,
           includeChildFrames: frameRecords.length === 1
         }
@@ -250,14 +259,19 @@ async function collectPageContextFromFrames(targetTabId, options = {}) {
     return collectPageContextFromFrames(targetTabId, {
       ...options,
       elementCursor: "",
-      elementQuery,
+      elementQuery: elementSearch.query,
+      elementRoles: elementSearch.roles,
+      elementNearText: elementSearch.nearText,
       _cursorResetReason: "The page changed while visible elements were being paged, so discovery restarted from the first window."
     });
   }
   return mergeFrameContexts(attempts, {
     ...options,
     maxElements: pageSize,
-    elementQuery,
+    elementQuery: elementSearch.query,
+    elementRoles: elementSearch.roles,
+    elementNearText: elementSearch.nearText,
+    _elementSearch: elementSearch,
     _elementCursorState: cursorState,
     _elementCursorBinding: cursorBinding,
     _cursorResetReason: initialCursorResetReason
@@ -501,6 +515,10 @@ async function collectExternalObservation(tabId, observationOptions = {}) {
         maxElements: clampNumber(settings.maxElements, 20, 500, 80),
         elementCursor: String(observationOptions.elementCursor || ""),
         elementQuery: String(observationOptions.elementQuery || ""),
+        elementRoles: Array.isArray(observationOptions.elementRoles)
+          ? observationOptions.elementRoles
+          : [],
+        elementNearText: String(observationOptions.elementNearText || ""),
         redactSensitiveData: true
     }),
     getBrowserContext(tabId).catch(() => ({ tabs: [], downloads: [] }))
@@ -1529,6 +1547,8 @@ function mergeFrameContexts(attempts, options = {}) {
   const { frameBoundaries: _internalFrameBoundaries, ...publicTopContext } = topContext;
   const maxTextChars = clampNumber(options.maxTextChars, 4000, 100000, 16000);
   const maxElements = Math.floor(clampNumber(options.maxElements, 1, 500, 80));
+  const elementSearch = options._elementSearch || normalizeElementDiscoverySearch(options);
+  const elementSearchActive = isElementDiscoverySearchActive(elementSearch);
 
   const decorate = (attempt, item) => decorateFrameContextItem(
     item,
@@ -1542,7 +1562,7 @@ function mergeFrameContexts(attempts, options = {}) {
     .slice(0, limit);
   const interactiveCandidates = visibleAttempts
     .flatMap((attempt) => (attempt.context.interactiveElements || []).map((item) => decorate(attempt, item)))
-    .sort(compareMergedContextItems);
+    .sort((left, right) => compareMergedInteractiveElements(left, right, elementSearchActive));
   const interactiveElements = interactiveCandidates.slice(0, maxElements);
   const cursorOffsets = Object.fromEntries(
     visibleAttempts.map((attempt) => [
@@ -1573,9 +1593,9 @@ function mergeFrameContexts(attempts, options = {}) {
   const hasMoreElements = visitedElementCount < interactiveTotal;
   const nextElementCursor = hasMoreElements
     ? encodeElementCursor({
-        version: 1,
+        version: 2,
         pageSize: maxElements,
-        query: String(options.elementQuery || ""),
+        search: elementSearch,
         offsets: cursorOffsets,
         binding: options._elementCursorBinding || buildElementCursorBinding(attempts)
       })
@@ -1682,12 +1702,14 @@ function mergeFrameContexts(attempts, options = {}) {
       availableTotal: interactiveAvailableTotal,
       included: interactiveElements.length,
       visited: visitedElementCount,
-      query: String(options.elementQuery || ""),
+      query: elementSearch.query,
+      search: elementSearch,
       truncated: hasMoreElements
     },
     elementDiscovery: {
       scope: "current-visual-viewport",
-      query: String(options.elementQuery || ""),
+      query: elementSearch.query,
+      search: elementSearch,
       pageSize: maxElements,
       returned: interactiveElements.length,
       total: interactiveTotal,
@@ -1901,6 +1923,37 @@ function compareMergedContextItems(left, right) {
   return 0;
 }
 
+function compareMergedInteractiveElements(left, right, searchActive) {
+  if (searchActive) {
+    const scoreDifference = Number(right?.searchMatch?.score || 0) - Number(left?.searchMatch?.score || 0);
+    if (scoreDifference) {
+      return scoreDifference;
+    }
+  }
+  return compareMergedContextItems(left, right);
+}
+
+function normalizeElementDiscoverySearch(options = {}) {
+  const normalized = globalThis.WebAgentCore.normalizeElementSearch({
+    query: options.elementQuery ?? options.query,
+    roles: options.elementRoles ?? options.roles,
+    nearText: options.elementNearText ?? options.nearText ?? options.near_text
+  });
+  return {
+    query: normalized.query,
+    roles: normalized.roles,
+    nearText: normalized.nearText
+  };
+}
+
+function isElementDiscoverySearchActive(search) {
+  return Boolean(
+    String(search?.query || "").trim()
+    || String(search?.nearText || "").trim()
+    || (Array.isArray(search?.roles) && search.roles.length)
+  );
+}
+
 function buildElementCursorBinding(attempts) {
   const observed = (attempts || []).filter((attempt) => attempt?.context);
   const contextByFrameId = new Map(
@@ -1971,13 +2024,24 @@ function decodeElementCursor(cursor) {
         && Number.isSafeInteger(Number(offset))
         && Number(offset) >= 0
       ));
+    const version = Number(value?.version);
+    const search = version === 1
+      ? normalizeElementDiscoverySearch({ elementQuery: value?.query })
+      : normalizeElementDiscoverySearch(value?.search || {});
+    const searchValid = version === 1
+      ? typeof value?.query === "string" && value.query.length <= 500
+      : version === 2
+        && value?.search
+        && typeof value.search === "object"
+        && !Array.isArray(value.search)
+        && globalThis.WebAgentCore.stableStringify(value.search)
+          === globalThis.WebAgentCore.stableStringify(search);
     if (
-      value?.version !== 1
+      ![1, 2].includes(version)
       || !Number.isInteger(Number(value.pageSize))
       || Number(value.pageSize) < 1
       || Number(value.pageSize) > 500
-      || typeof value.query !== "string"
-      || value.query.length > 500
+      || !searchValid
       || !offsetsValid
       || !Array.isArray(value.binding)
     ) {
@@ -1987,7 +2051,15 @@ function decodeElementCursor(cursor) {
     if (envelope.checksum !== globalThis.WebAgentCore.hashString(canonical)) {
       return { valid: false, value: null, reason: "The element cursor integrity check failed." };
     }
-    return { valid: true, value, reason: "" };
+    return {
+      valid: true,
+      value: {
+        ...value,
+        version: 2,
+        search
+      },
+      reason: ""
+    };
   } catch {
     return { valid: false, value: null, reason: "The element cursor could not be decoded." };
   }

@@ -400,6 +400,11 @@ test("guided element discovery pages through every visible control and supports 
         interactiveElementStats: { total: 1, availableTotal: 121, included: 1, visited: 1, truncated: false },
         elementDiscovery: {
           query: "next page",
+          search: {
+            query: "next page",
+            roles: ["button"],
+            nearText: "issue grid"
+          },
           pageSize: 80,
           returned: 1,
           total: 1,
@@ -425,12 +430,34 @@ test("guided element discovery pages through every visible control and supports 
   assert.equal(second.page.elementDiscovery.hasMore, false);
   assert.equal(driver.observeCalls[1].options.elementCursor, "cursor-page-2");
 
-  const searched = await runtime.dispatch("browser_elements", { query: "next page" }, client);
+  const searched = await runtime.dispatch("browser_elements", {
+    query: "next page",
+    roles: ["button"],
+    near_text: "issue grid"
+  }, client);
   assert.equal(searched.page.elementDiscovery.query, "next page");
   assert.equal(driver.observeCalls[2].options.elementQuery, "next page");
+  assert.deepEqual(driver.observeCalls[2].options.elementRoles, ["button"]);
+  assert.equal(driver.observeCalls[2].options.elementNearText, "issue grid");
   await assert.rejects(
     runtime.dispatch("browser_elements", { cursor: "forged-cursor" }, client),
     /must use nextCursor|No additional visible-element window/
+  );
+
+  const proposed = await runtime.dispatch("browser_act", {
+    actions: [clickAction({ reason: "Open the searched next-page control" })]
+  }, client);
+  assert.equal(proposed.status, "approval_required");
+  const operationId = runtime.getStatus().pendingOperationIds[0];
+  const approved = await runtime.approveOperation(operationId);
+  assert.equal(approved.status, "completed");
+  assert.equal(driver.observeCalls[3].options.elementQuery, "next page");
+  assert.deepEqual(driver.observeCalls[3].options.elementRoles, ["button"]);
+  assert.equal(driver.observeCalls[3].options.elementNearText, "issue grid");
+  assert.equal(
+    driver.observeCalls[4].options.elementQuery,
+    "",
+    "post-action outcome observation should return to the complete viewport"
   );
 });
 

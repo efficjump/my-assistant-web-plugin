@@ -111,7 +111,7 @@ test("screenshot-disabled mode gates both AI input and approval previews", () =>
     "the effective setting must be checked before requesting a screenshot"
   );
   assert.match(script, /previewToken !== state\.approvalPreviewToken/);
-  assert.match(annotationFunction, /collectContextWithRetry\(\)/);
+  assert.match(annotationFunction, /collectContextWithRetry\(decision\.observationRequest \|\| \{\}\)/);
   assert.match(annotationFunction, /isSameVisualObservation\(annotationContext, confirmedContext\)/);
   assert.match(annotationFunction, /areAnnotationTargetsStable\(decision, annotationContext, confirmedContext\)/);
 });

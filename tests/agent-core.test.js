@@ -13,6 +13,12 @@ function baseDecision(overrides = {}) {
     completionEvidence: [],
     needsUserApproval: false,
     plan: ["검색어 입력", "결과 확인"],
+    elementSearch: {
+      query: "",
+      roles: [],
+      nearText: "",
+      reason: ""
+    },
     toolCalls: [],
     actions: [{
       id: "a1",
@@ -105,6 +111,43 @@ test("decision contract distinguishes the visual viewport from hidden DOM metada
   const contract = Core.buildDecisionContractText();
   assert.match(contract, /visual viewport/i);
   assert.match(contract, /offscreen, clipped, occluded, or hidden DOM/i);
+});
+
+test("accepts a bounded local element-search decision and rejects mixed effects", () => {
+  const discovery = Core.normalizeDecision(baseDecision({
+    status: "discover",
+    message: "",
+    summary: "관련 페이지 이동 버튼 검색",
+    actions: [],
+    elementSearch: {
+      query: "next page",
+      roles: ["BUTTON", "button"],
+      nearText: "issue grid",
+      reason: "현재 요소 묶음에 대상 ref가 없음"
+    },
+    verification: {
+      required: false,
+      expectedChange: "",
+      successCriteria: []
+    }
+  }));
+  assert.deepEqual(discovery.elementSearch.roles, ["button"]);
+  assert.equal(Core.validateDecision(discovery, { context }).valid, true);
+
+  const mixed = Core.normalizeDecision(baseDecision({
+    status: "discover",
+    elementSearch: discovery.elementSearch
+  }));
+  const mixedValidation = Core.validateDecision(mixed, { context });
+  assert.equal(mixedValidation.valid, false);
+  assert.match(mixedValidation.errors.join(" "), /discover/);
+
+  const empty = Core.normalizeDecision(baseDecision({
+    status: "discover",
+    actions: [],
+    elementSearch: { query: "", roles: [], nearText: "", reason: "" }
+  }));
+  assert.equal(Core.validateDecision(empty, { context }).valid, false);
 });
 
 test("visual actions are bound to one current screenshot and an observed visual surface", () => {

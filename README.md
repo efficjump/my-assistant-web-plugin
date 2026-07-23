@@ -4,7 +4,7 @@ A Manifest V3 browser extension that observes the active page, plans the next ac
 
 ![Agent side panel](docs/assets/agent-panel.png)
 
-Version `0.8.0` targets Chromium-based browsers version 116 or later. This repository contains a source-loaded development build rather than a store package.
+Version `0.9.0` targets Chromium-based browsers version 116 or later. This repository contains a source-loaded development build rather than a store package.
 
 ## Why this project exists
 
@@ -140,7 +140,7 @@ npm run bridge:config
 
 Merge the printed server entry into the development tool's documented MCP configuration and restart that tool. On first use, the companion prints one short-lived `Extension setup` value. Paste that value into **Settings → Bridge** and select **연결하고 현재 탭 공유**. The extension strips the one-time code before saving the endpoint, and the companion remembers its selected loopback port so later launches normally reconnect without configuration changes while the browser-side credential remains available.
 
-The default MCP surface is intentionally guided: `browser_begin` returns the first redacted snapshot, `browser_elements` searches or pages through additional visible controls, `browser_act` submits DOM actions, `browser_visual_act` requests extension-owned targeting for a canvas or application surface, `browser_continue` handles approval polling and refreshed observations, and `browser_end` releases the tab. Existing identifier-based tools remain available with `--advanced-tools`. Actions that need approval still appear in the extension, which re-observes the page and validates target preconditions immediately before an approved effect.
+The default MCP surface is intentionally guided: `browser_begin` returns the first redacted snapshot, `browser_elements` retrieves relevant visible controls with `query`, `roles`, and `near_text` before falling back to an opaque cursor, `browser_act` submits DOM actions, `browser_visual_act` requests extension-owned targeting for a canvas or application surface, `browser_continue` handles approval polling and refreshed observations, and `browser_end` releases the tab. The built-in model uses the same local retrieval layer through a structured `discover` decision. Existing identifier-based tools remain available with `--advanced-tools`. Actions that need approval still appear in the extension, which reconstructs the exact search window and validates target preconditions immediately before an approved effect.
 
 Clients that support only Streamable HTTP can run `npm run bridge` and use the printed endpoint and bearer token. This remains the advanced fallback, not the default setup.
 
@@ -179,7 +179,8 @@ The production manifest does not require `<all_urls>`. Site and endpoint origins
 - The model can use only element references and tools present in the current observation.
 - Each run is pinned to an exact tab and document identity.
 - External development tools can access only the tab explicitly shared in the Bridge panel, and detaching it closes their active sessions.
-- A partial interactive-element window is never reported as a page capability limit; internal runs continue discovery automatically, while Bridge clients receive an opaque next cursor and search tool.
+- A partial interactive-element window is never reported as a page capability limit. Internal runs and Bridge clients first search accessible labels, roles, safe attributes, and nearby row/table/form/region context locally; only matching control descriptors receive fresh refs and cross the model boundary.
+- Search continuations are bound to the complete query/role/context filter and page state. Approval-time revalidation reconstructs that same observation window, so a searched ref cannot silently rebind to an unrelated control.
 - The local companion binds only to loopback, requires independent MCP and extension credentials, and never puts either credential in a URL.
 - URL, document identity, and target preconditions are checked again immediately before an approved effect.
 - Submission, external navigation, upload, tab changes, downloads, and destructive MCP tools require approval even in automatic mode.
@@ -228,7 +229,7 @@ Run the local panel harness with:
 npm run serve:test
 ```
 
-The command reports the temporary development address. The E2E suite exercises the Manifest V3 service worker, document replacement, viewport-scoped deep DOM observation, dense-control pagination and search, cursor invalidation after DOM changes, internal-model discovery continuation, visible cross-origin frame routing, hidden-frame exclusion, nested scroll regions, guarded visual-surface clicks, extension-owned Bridge visual targeting, occlusion and clipping filters, file handoff, tab lifecycle, worker restart, and empty-response protection. The opt-in local-harness scenario additionally launches a compatible CLI, loads a temporary secret-protected MCP configuration, confirms that every assistant turn reports the local `default` model alias, and requires the model to complete the guided begin → act → approval/continue → verification → end workflow against a temporary browser profile.
+The command reports the temporary development address. The E2E suite exercises the Manifest V3 service worker, document replacement, viewport-scoped deep DOM observation, contextual element retrieval, structured-search cursor binding, approval-time search-window reconstruction, dense-control pagination, cursor invalidation after DOM changes, internal-model `discover` continuation, visible cross-origin frame routing, hidden-frame exclusion, nested scroll regions, guarded visual-surface clicks, extension-owned Bridge visual targeting, occlusion and clipping filters, file handoff, tab lifecycle, worker restart, and empty-response protection. The opt-in local-harness scenario additionally launches a compatible CLI, loads a temporary secret-protected MCP configuration, confirms that every assistant turn reports the local `default` model alias, and requires the model to complete the guided begin → act → approval/continue → verification → end workflow against a temporary browser profile.
 
 ## Public-release audit
 

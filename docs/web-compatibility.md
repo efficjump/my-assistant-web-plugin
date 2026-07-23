@@ -17,13 +17,27 @@ The extension combines DOM evidence with screenshot evidence instead of assuming
 
 Hidden, clipped, or covered frames are not merged merely because their scripts can be injected. The parent frame checks the complete iframe box for viewport clipping and occlusion before accepting a child observation. If multiple frames use the same navigation URL and the runtime cannot prove which fully exposed iframe owns which document, their contents are withheld and reported as `frame_visibility_unverified`. This is deliberately conservative: missing evidence is preferable to presenting hidden DOM as visible page content.
 
-## Dense visible controls and observation windows
+## Contextual element retrieval and observation windows
 
 The element setting is a response-window size, not a limit on what the page can expose. Each frame gathers all currently visible interactive candidates before ordering them. The background merges those candidates by their top-viewport geometry, returns one bounded window, and includes `elementDiscovery` metadata with an opaque continuation cursor.
 
-The cursor retains per-frame offsets and is bound to the document IDs, DOM revisions, frame visibility, viewport, and an ordered-candidate digest. If the page changes between windows, discovery restarts instead of applying old offsets to a new layout. A goal-derived query can rank and filter controls from accessible names, roles, element types, titles, ARIA descriptions, names, and test identifiers; no site or framework-specific selector is embedded in the runtime.
+When the first window does not contain the required ref, the built-in planner can return `status: "discover"` with `elementSearch`. The Bridge exposes the same retrieval operation through `browser_elements`:
 
-The built-in agent automatically requests the next window when its planner reports a missing-target blocker while `hasMore` is true. External MCP clients receive the same state through `browser_elements`. Only after relevant visible windows are exhausted should the runtime consider scrolling or a precise capability blocker. This prevents a lower grid pager or action button from being mistaken for an inaccessible control merely because it appeared after the first configured window.
+```json
+{
+  "query": "next page",
+  "roles": ["button"],
+  "nearText": "issue grid"
+}
+```
+
+The content script builds a bounded local search record for each exposed control. Identity fields include accessible name, semantic role, tag, input type, placeholder, title, ARIA description, name, and common test identifiers. Context fields come from generic semantic ancestors such as the nearest cell, row, table/grid/list collection, form, dialog, group, region, and nearby heading. Query and context matches are scored locally; only matching full control descriptors and their fresh refs are returned. `searchMatch` explains the matched fields and includes a short redacted context snippet. No site name, framework, symbol, or selector is embedded in the retrieval logic.
+
+The built-in planner may try a bounded number of distinct searches in the same agent turn. A repeated or empty search falls back to a remaining cursor rather than looping. If a targeted search returns no result, the runtime can resume the original unfiltered cursor. Scrolling remains necessary for virtualized or offscreen content because retrieval deliberately stays inside the current visual viewport.
+
+Search result ordering is preserved across frames. The cursor retains per-frame offsets and is bound to the normalized query, roles, nearby text, document IDs, DOM revisions, frame visibility, viewport, and ranked-candidate digest. If any binding changes, discovery restarts instead of applying old offsets to a different result set.
+
+Refs from a search window remain observation-scoped. The built-in approval path and external Bridge privately retain the exact search request and cursor used to produce the plan. Immediately before an approved action, they reconstruct that same window and compare the complete target fingerprint. This prevents a compact search result such as `e1` from being mistaken for the unrelated `e1` in the default window.
 
 ## How model-assisted visual targeting works
 
@@ -87,9 +101,11 @@ The real-browser E2E fixture checks that:
 - a hidden cross-origin frame is absent from visible text and actions;
 - child-frame rectangles are transformed into top-viewport coordinates;
 - a nested scroll region reveals a previously clipped control only after scrolling and re-observation;
-- a 121st dense-grid control is found through both opaque cursor paging and dynamic query without a user handoff;
+- a 121st dense-grid control is found through both opaque cursor paging and structured query/role/nearby-context retrieval without a user handoff;
+- search results expose their matched context, multi-window search cursors preserve the complete filter, and a mismatched role invalidates the cursor;
 - changing the DOM invalidates an old element cursor and safely restarts discovery;
-- the built-in model loop continues from a missing-target decision into the next visible-element window;
+- the built-in model loop issues `discover` and obtains the target without blindly advancing the unfiltered cursor;
+- approval-time validation reconstructs the search observation instead of rebinding its ref in the default window;
 - a canvas surface accepts a normalized visual point and produces an observable state change;
 - the independent visual verifier receives the current screenshot, can approve a grounded target, and fails closed on rejection;
 - the authenticated Bridge performs locator and verifier calls both before approval and again before executing a visual action;

@@ -277,24 +277,38 @@
     #resolveElementDiscoveryRequest(session, args) {
       const currentDiscovery = session.observation?.context?.elementDiscovery || null;
       const suppliedCursor = boundedOptionalString(args.cursor, 24000);
-      const suppliedQuery = boundedOptionalString(args.query, 500);
+      const suppliedSearch = normalizeElementDiscoverySearch({
+        query: args.query,
+        roles: args.roles,
+        nearText: args.near_text
+      });
+      const suppliedSearchActive = isElementDiscoverySearchActive(suppliedSearch);
+      const currentSearch = normalizeElementDiscoverySearch(
+        currentDiscovery?.search || { query: currentDiscovery?.query }
+      );
       let cursor = suppliedCursor;
       if (cursor) {
         if (!currentDiscovery?.nextCursor || cursor !== currentDiscovery.nextCursor) {
           throw new Error("browser_elements must use nextCursor from the latest elementDiscovery result.");
         }
-        if (suppliedQuery && suppliedQuery !== String(currentDiscovery.query || "")) {
-          throw new Error("A continued element cursor must keep the query from the latest discovery result.");
+        if (
+          suppliedSearchActive
+          && JSON.stringify(suppliedSearch) !== JSON.stringify(currentSearch)
+        ) {
+          throw new Error("A continued element cursor must keep the query, roles, and nearby text from the latest discovery result.");
         }
-      } else if (!suppliedQuery) {
+      } else if (!suppliedSearchActive) {
         cursor = String(currentDiscovery?.nextCursor || "");
         if (!cursor) {
-          throw new Error("No additional visible-element window is available. Supply a new query or continue with a page action.");
+          throw new Error("No additional visible-element window is available. Supply a new query, role, or nearby-text search, or continue with a page action.");
         }
       }
+      const search = suppliedSearchActive ? suppliedSearch : cursor ? currentSearch : suppliedSearch;
       return {
         elementCursor: cursor,
-        elementQuery: suppliedQuery || (cursor ? String(currentDiscovery?.query || "") : "")
+        elementQuery: search.query,
+        elementRoles: search.roles,
+        elementNearText: search.nearText
       };
     }
 
@@ -439,7 +453,7 @@
     #guidedReadyResponse(session, observation, options = {}) {
       const discovery = observation.context?.elementDiscovery || null;
       const discoveryNext = discovery?.hasMore
-        ? " If the needed visible ref is absent, call browser_elements with page.elementDiscovery.nextCursor before reporting a blocker."
+        ? " If the needed visible ref is absent, prefer browser_elements with a goal-derived query, roles, and near_text; continue page.elementDiscovery.nextCursor only when more matches are needed."
         : "";
       return {
         status: "ready",
@@ -547,6 +561,7 @@
         id: observationId,
         observedAt: now,
         settingsDigest,
+        discoveryRequest: normalizeObservationDiscoveryRequest(options),
         context
       };
       this.#touchSession(session, now);
@@ -658,6 +673,7 @@
         observationId,
         observedDocumentId: stringValue(session.observation.context.documentId),
         observedPageUrl: stringValue(session.observation.context.url),
+        discoveryRequest: cloneJson(session.observation.discoveryRequest || {}),
         targetTabId: session.targetTabId,
         goal,
         effectDigest: digest,
@@ -792,7 +808,10 @@
           actionsForExecution = validation.actions;
           operation.visualAttestation = cloneJson(resolved.attestation || operation.visualAttestation);
         } else {
-          freshContext = await this.#collectObservation(operation.targetTabId);
+          freshContext = await this.#collectObservation(
+            operation.targetTabId,
+            operation.discoveryRequest || {}
+          );
           const preconditionResult = Contract.validateActionPreconditions({
             actions: operation.actions,
             preconditions: operation.preconditions,
@@ -891,7 +910,9 @@
       const context = await this.driver.observe(tabId, {
         redactSensitiveData: true,
         elementCursor: boundedOptionalString(options.elementCursor, 24000),
-        elementQuery: boundedOptionalString(options.elementQuery, 500)
+        elementQuery: boundedOptionalString(options.elementQuery, 500),
+        elementRoles: normalizeElementDiscoveryRoles(options.elementRoles),
+        elementNearText: boundedOptionalString(options.elementNearText, 500)
       });
       return sanitizeObservationForStorage(context);
     }
@@ -1332,6 +1353,41 @@
       label: stringValue(target.label),
       actionability: stringValue(target.actionability)
     };
+  }
+
+  function normalizeElementDiscoverySearch(value = {}) {
+    const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+    return {
+      query: boundedOptionalString(source.query, 500),
+      roles: normalizeElementDiscoveryRoles(source.roles),
+      nearText: boundedOptionalString(source.nearText ?? source.near_text, 500)
+    };
+  }
+
+  function normalizeObservationDiscoveryRequest(value = {}) {
+    const search = normalizeElementDiscoverySearch({
+      query: value.elementQuery,
+      roles: value.elementRoles,
+      nearText: value.elementNearText
+    });
+    return {
+      elementCursor: boundedOptionalString(value.elementCursor, 24000),
+      elementQuery: search.query,
+      elementRoles: search.roles,
+      elementNearText: search.nearText
+    };
+  }
+
+  function normalizeElementDiscoveryRoles(value) {
+    return Array.from(new Set(
+      (Array.isArray(value) ? value : [])
+        .map((role) => boundedOptionalString(role, 80).toLowerCase())
+        .filter(Boolean)
+    )).slice(0, 12);
+  }
+
+  function isElementDiscoverySearchActive(search) {
+    return Boolean(search.query || search.nearText || search.roles.length);
   }
 
   function boundedString(value, maxLength, name) {

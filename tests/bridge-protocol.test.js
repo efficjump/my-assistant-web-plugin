@@ -17,6 +17,7 @@ function getAdvancedTools() {
 }
 
 test("bridge publishes the guided browser MCP tool surface by default", () => {
+  assert.equal(Protocol.protocolVersion, "2.2");
   const names = getTools().map((tool) => tool.name).sort();
   assert.deepEqual(names, [
     "browser_act",
@@ -58,6 +59,7 @@ test("bridge instructions keep multi-step clients working until the session is c
   assert.match(Protocol.instructions, /browser_end before the final answer/i);
   assert.match(Protocol.instructions, /never submit a duplicate proposal/i);
   assert.match(Protocol.instructions, /element-count limit is never by itself a blocker/i);
+  assert.match(Protocol.instructions, /semantic roles, and nearby visible text/i);
   assert.match(Protocol.instructions, /browser_visual_act/i);
   assert.match(Protocol.getInstructions({ advanced: true }), /browser_session_start/i);
 });
@@ -70,6 +72,8 @@ test("bridge exposes observation paging and refresh without accepting visual coo
 
   assert.ok(guidedElements.inputSchema.properties.cursor);
   assert.ok(guidedElements.inputSchema.properties.query);
+  assert.equal(guidedElements.inputSchema.properties.roles.items.type, "string");
+  assert.equal(guidedElements.inputSchema.properties.near_text.type, "string");
   assert.ok(advancedElements.inputSchema.required.includes("session_id"));
   assert.equal(continueTool.inputSchema.properties.refresh.type, "boolean");
   assert.deepEqual(visualTool.inputSchema.required, ["surface_ref", "target_description"]);
@@ -82,6 +86,20 @@ test("bridge exposes observation paging and refresh without accepting visual coo
   assert.equal(
     Protocol.validateToolArguments("browser_elements", { cursor: "cursor-1" }, { advanced: false }).valid,
     true
+  );
+  assert.equal(
+    Protocol.validateToolArguments("browser_elements", {
+      query: "next page",
+      roles: ["button"],
+      near_text: "issue grid"
+    }, { advanced: false }).valid,
+    true
+  );
+  assert.equal(
+    Protocol.validateToolArguments("browser_elements", {
+      roles: ["button or link"]
+    }, { advanced: false }).valid,
+    false
   );
 });
 

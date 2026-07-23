@@ -75,7 +75,7 @@ The default tool surface is deliberately small:
 | Tool | Purpose |
 | --- | --- |
 | `browser_begin` | Start or resume the caller's task and return the current redacted page snapshot |
-| `browser_elements` | Continue an opaque visible-control cursor or dynamically search visible controls |
+| `browser_elements` | Retrieve relevant visible controls by label terms, roles, and nearby context, or continue its opaque cursor |
 | `browser_act` | Propose the next bounded actions using refs from that snapshot |
 | `browser_continue` | Read approval status or return a refreshed snapshot; `refresh: true` forces a new observation |
 | `browser_screenshot` | Capture visible pixels only when visual evidence is necessary |
@@ -86,7 +86,7 @@ A development tool should follow this loop:
 
 1. Call `browser_begin` once with the user's complete goal.
 2. Plan only from the returned `page` snapshot and its current element refs.
-3. If `page.elementDiscovery.hasMore` is true and the needed visible control is absent, call `browser_elements` with `nextCursor`. A concise goal-derived `query` can start a ranked search instead.
+3. If the needed visible control is absent, first call `browser_elements` with a goal-derived `query`, optional `roles`, and optional `near_text`. Continue its `nextCursor` only when more matching results are needed.
 4. Use a `scroll` action and observe again when the target is outside the current viewport; element paging covers only controls already visible in that viewport.
 5. Call `browser_act` with the next required DOM action or small action group. For an exposed canvas or application surface without a DOM ref, call `browser_visual_act` with only its surface ref and visible target description.
 6. Call `browser_continue` after every proposal.
@@ -100,7 +100,19 @@ Calling `browser_begin` again with the same goal and MCP client resumes the curr
 
 Element refs remain observation-scoped. A refreshed snapshot or element window can assign different refs, so every new action must use only the latest `page` result.
 
-`page.elementDiscovery` reports the current query, returned and visited counts, matching `total`, unfiltered `availableTotal`, `hasMore`, and an opaque `nextCursor`. The cursor is bound to document IDs, DOM revisions, frame visibility, viewport position, and the ordered visible-control digest. If any of those change, the runtime discards the old offsets and returns a first window with `cursorReset: true`. A client must not treat the configured element-window size as an accessibility boundary or ask the user to click until relevant visible windows have been searched or exhausted.
+`browser_elements` accepts a structured local search:
+
+```json
+{
+  "query": "next page",
+  "roles": ["button"],
+  "near_text": "issue grid"
+}
+```
+
+The extension evaluates this against currently exposed controls without sending the unfiltered control list back to the caller. It searches accessible names, semantic roles, tags, input types, placeholders, titles, ARIA descriptions, names, test identifiers, and bounded context from the nearest visible cell, row, collection, form, dialog, or region. Each returned control includes `searchMatch` with its score, matched fields, and a redacted context snippet so the caller can check why it was retrieved.
+
+`page.elementDiscovery.search` reports the normalized `query`, `roles`, and `nearText`, along with returned and visited counts, matching `total`, unfiltered `availableTotal`, `hasMore`, and an opaque `nextCursor`. The cursor is bound to the complete search filter, document IDs, DOM revisions, frame visibility, viewport position, and the ranked visible-control digest. If any of those change, the runtime discards the old offsets and returns a first window with `cursorReset: true`. A client must not treat the configured element-window size as an accessibility boundary or ask the user to click until relevant searches and visible windows have been exhausted.
 
 Visible same-origin and permission-granted cross-origin frames can appear with frame-scoped refs. The extension merges their candidates into one visually ordered window, routes actions to the bound child document, and rejects stale frame identities. Hidden or ambiguously mapped frame contents are withheld.
 
@@ -118,7 +130,7 @@ When `browser_act` returns `approval_required`:
 4. Continue the same development-tool conversation.
 5. Call `browser_continue`; it reads the existing operation and refreshes the page after a completed or rejected proposal.
 
-The extension re-observes the document and compares target fingerprints immediately before an approved effect. A changed page or control becomes `stale` instead of executing an outdated action. The next `browser_continue` returns a fresh snapshot so the client can reconsider the plan.
+The extension re-observes the document and compares target fingerprints immediately before an approved effect. For a target returned by `browser_elements`, it privately retains and reconstructs the exact search filter and cursor window before checking the ref. A changed page, reordered result set, changed filter binding, or changed control becomes `stale` instead of executing an outdated or rebound action. The next `browser_continue` returns a fresh snapshot so the client can reconsider the plan.
 
 The same approval behavior applies to `browser_visual_act`. The approval describes the visible target rather than trusting caller-provided coordinates, because the caller is not allowed to provide them.
 
@@ -251,7 +263,7 @@ Call `browser_continue` to get a fresh snapshot, then plan again using only its 
 
 ### A visible control is missing from `interactiveElements`
 
-Inspect `page.elementDiscovery`. If `hasMore` is true, call `browser_elements` with its `nextCursor`, or start a dynamic search with a short label/role description in `query`. Use scrolling only when the target is outside the current viewport. Do not ask the user to click merely because the first bounded window omitted the control.
+Start with `browser_elements` using the best available semantic evidence, for example `{ "query": "next page", "roles": ["button"], "near_text": "issue grid" }`. If the search result reports `hasMore`, continue its `nextCursor` with the same filters. Use an unfiltered cursor only when targeted retrieval cannot identify the control, and use scrolling when the target is outside the current viewport. Do not ask the user to click merely because the first bounded window omitted the control.
 
 ### A canvas target has no DOM ref
 

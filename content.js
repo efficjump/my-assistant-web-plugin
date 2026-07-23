@@ -85,12 +85,16 @@ function collectPageContext(options) {
   const maxTextChars = clampNumber(options.maxTextChars, 4000, 50000, 16000);
   const maxElements = clampNumber(options.maxElements, 1, 500, 80);
   const elementOffset = Math.floor(clampNumber(options.elementOffset, 0, Number.MAX_SAFE_INTEGER, 0));
-  const elementQuery = normalizeWhitespace(options.elementQuery || "").slice(0, 500);
+  const elementSearch = normalizeLocalElementSearch({
+    query: options.elementQuery,
+    roles: options.elementRoles,
+    nearText: options.elementNearText
+  });
   const redactSensitiveData = options.redactSensitiveData !== false;
   const interactiveElementCollection = collectInteractiveElements({
     limit: maxElements,
     offset: elementOffset,
-    query: elementQuery,
+    search: elementSearch,
     redactSensitiveData
   });
   const interactiveElements = interactiveElementCollection.elements;
@@ -287,10 +291,12 @@ function isDomInstance(element, constructorName) {
 function collectInteractiveElements(options) {
   const limit = Math.floor(clampNumber(options?.limit, 1, 500, 80));
   const offset = Math.floor(clampNumber(options?.offset, 0, Number.MAX_SAFE_INTEGER, 0));
-  const query = normalizeWhitespace(options?.query || "").slice(0, 500);
+  const search = normalizeLocalElementSearch(options?.search || { query: options?.query });
+  const searchActive = isLocalElementSearchActive(search);
   const redactSensitiveData = options?.redactSensitiveData !== false;
   const seen = new Set();
   const candidates = [];
+  const contextCache = new WeakMap();
   for (const [discoveryIndex, rawElement] of queryAllDom("*").entries()) {
     if (!isPotentiallyInteractive(rawElement)) {
       continue;
@@ -308,21 +314,28 @@ function collectInteractiveElements(options) {
       continue;
     }
     seen.add(element);
+    const searchRecord = searchActive
+      ? buildInteractiveSearchRecord(element, contextCache)
+      : null;
+    const searchMatch = searchActive
+      ? scoreInteractiveCandidateForSearch(searchRecord, search)
+      : null;
     candidates.push({
       element,
       hitPoint,
       scope: findScopeForElement(element),
       rect: getGlobalRect(element),
       discoveryIndex,
-      searchScore: query ? scoreInteractiveCandidateForQuery(element, query) : 0
+      searchRecord,
+      searchMatch
     });
   }
 
-  const matchingCandidates = query
+  const matchingCandidates = searchActive
     ? candidates
-      .filter((candidate) => candidate.searchScore > 0)
+      .filter((candidate) => candidate.searchMatch?.matched)
       .sort((left, right) => (
-        right.searchScore - left.searchScore
+        right.searchMatch.score - left.searchMatch.score
         || compareInteractiveCandidatesByVisualPosition(left, right)
       ))
     : candidates.sort(compareInteractiveCandidatesByVisualPosition);
@@ -336,6 +349,9 @@ function collectInteractiveElements(options) {
       hitPoint: candidate.hitPoint,
       rect: candidate.rect
     });
+    if (searchActive) {
+      info.searchMatch = buildPublicSearchMatch(candidate, redactSensitiveData);
+    }
     assistantPageState.elementsByRef.set(ref, {
       element,
       selector: info.selector,
@@ -351,7 +367,8 @@ function collectInteractiveElements(options) {
       availableTotal: candidates.length,
       included: elements.length,
       offset,
-      query,
+      query: search.query,
+      search,
       orderDigest: digestInteractiveCandidateOrder(matchingCandidates),
       truncated: offset + elements.length < matchingCandidates.length
     }
@@ -366,7 +383,8 @@ function digestInteractiveCandidateOrder(candidates) {
     Math.round(candidate.rect.left),
     Math.round(candidate.rect.top),
     Math.round(candidate.rect.width),
-    Math.round(candidate.rect.height)
+    Math.round(candidate.rect.height),
+    Math.round(candidate.searchMatch?.score || 0)
   ]);
   let hash = 2166136261;
   const text = JSON.stringify(source);
@@ -377,45 +395,269 @@ function digestInteractiveCandidateOrder(candidates) {
   return (hash >>> 0).toString(16).padStart(8, "0");
 }
 
-function scoreInteractiveCandidateForQuery(element, query) {
-  const normalizedQuery = normalizeSearchText(query);
-  if (!normalizedQuery) {
-    return 0;
-  }
+function normalizeLocalElementSearch(value) {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  return {
+    query: normalizeWhitespace(source.query || "").slice(0, 500),
+    roles: Array.from(new Set(
+      (Array.isArray(source.roles) ? source.roles : [])
+        .map((role) => normalizeSearchText(role).slice(0, 80))
+        .filter(Boolean)
+    )).slice(0, 12),
+    nearText: normalizeWhitespace(source.nearText ?? source.near_text ?? "").slice(0, 500)
+  };
+}
+
+function isLocalElementSearchActive(search) {
+  return Boolean(search.query || search.nearText || search.roles.length);
+}
+
+function buildInteractiveSearchRecord(element, contextCache) {
   const tag = element.tagName?.toLowerCase() || "";
   const inputType = tag === "input" ? String(element.type || "").toLowerCase() : "";
-  const role = element.getAttribute("role") || inferredRole(element, inputType);
-  const label = getAccessibleName(element);
-  const descriptor = normalizeSearchText([
-    label,
+  const controlType = "type" in element
+    ? String(element.getAttribute("type") || element.type || "").toLowerCase()
+    : "";
+  const role = normalizeSearchText(element.getAttribute("role") || inferredRole(element, inputType));
+  const fields = {
+    label: getAccessibleName(element),
     role,
     tag,
-    inputType,
-    element.getAttribute("name"),
+    type: inputType || controlType,
+    name: element.getAttribute("name") || "",
+    placeholder: element.getAttribute("placeholder") || "",
+    title: element.getAttribute("title") || "",
+    description: element.getAttribute("aria-description") || "",
+    testId: element.getAttribute("data-testid")
+      || element.getAttribute("data-test")
+      || element.getAttribute("data-cy")
+      || ""
+  };
+  const contextParts = collectInteractiveSearchContext(element, contextCache);
+  return {
+    fields,
+    normalizedFields: Object.fromEntries(
+      Object.entries(fields).map(([name, value]) => [name, normalizeSearchText(value)])
+    ),
+    contextParts,
+    normalizedContext: normalizeSearchText(contextParts.map((part) => part.text).join(" "))
+  };
+}
+
+function collectInteractiveSearchContext(element, contextCache) {
+  const parts = [];
+  const seenText = new Set();
+  const append = (kind, source, maxChars, options = {}) => {
+    if (!source) {
+      return;
+    }
+    let text = contextCache.get(source)?.[options.cacheKey || kind];
+    if (text === undefined) {
+      text = options.accessibleOnly
+        ? getSemanticContainerName(source)
+        : collectVisibleTextWithin(source, maxChars);
+      const cached = contextCache.get(source) || {};
+      cached[options.cacheKey || kind] = text;
+      contextCache.set(source, cached);
+    }
+    const normalized = normalizeWhitespace(text).slice(0, maxChars);
+    const key = normalizeSearchText(normalized);
+    if (!normalized || seenText.has(key)) {
+      return;
+    }
+    seenText.add(key);
+    parts.push({ kind, text: normalized });
+  };
+
+  const cell = element.closest?.("td,th,[role='cell'],[role='gridcell'],[role='columnheader'],[role='rowheader']");
+  const row = element.closest?.("tr,[role='row']");
+  const semanticContainer = element.closest?.(
+    "fieldset,form,[role='dialog'],[role='region'],[role='group'],[role='tabpanel'],nav,section,main,aside,article"
+  );
+  const collection = element.closest?.("table,[role='table'],[role='grid'],[role='tree'],[role='listbox'],[role='menu']");
+
+  append("cell", cell, 240, { cacheKey: "visible-240" });
+  append("row", row, 560, { cacheKey: "visible-560" });
+  append("collection", collection, 260, { cacheKey: "semantic", accessibleOnly: true });
+  append("region", semanticContainer, 260, { cacheKey: "semantic", accessibleOnly: true });
+
+  const heading = findNearestContextHeading(element, semanticContainer);
+  append("heading", heading, 220, { cacheKey: "visible-220" });
+  return parts.slice(0, 5);
+}
+
+function getSemanticContainerName(element) {
+  if (!element) {
+    return "";
+  }
+  const tag = element.tagName?.toLowerCase() || "";
+  const caption = tag === "table"
+    ? element.querySelector?.(":scope > caption")
+    : tag === "fieldset"
+      ? element.querySelector?.(":scope > legend")
+      : null;
+  const heading = element.querySelector?.(
+    ":scope > h1,:scope > h2,:scope > h3,:scope > h4,:scope > h5,:scope > h6"
+  );
+  const labelledBy = String(element.getAttribute("aria-labelledby") || "")
+    .split(/\s+/)
+    .map((id) => element.getRootNode?.().getElementById?.(id)?.textContent || element.ownerDocument?.getElementById(id)?.textContent || "")
+    .join(" ");
+  return normalizeWhitespace([
+    element.getAttribute("aria-label"),
+    labelledBy,
     element.getAttribute("title"),
-    element.getAttribute("aria-description"),
-    element.getAttribute("data-testid")
+    caption ? getAccessibleName(caption) : "",
+    collectVisibleTextWithin(heading, 180)
   ].filter(Boolean).join(" "));
-  if (!descriptor) {
-    return 0;
+}
+
+function findNearestContextHeading(element, container) {
+  if (!container || !element) {
+    return null;
+  }
+  const headings = Array.from(container.querySelectorAll?.("h1,h2,h3,h4,h5,h6,[role='heading']") || [])
+    .filter((heading) => isElementVisuallyExposed(heading));
+  if (!headings.length) {
+    return null;
+  }
+  const elementRect = element.getBoundingClientRect();
+  const preceding = headings
+    .filter((heading) => heading.getBoundingClientRect().top <= elementRect.top + 1)
+    .sort((left, right) => right.getBoundingClientRect().top - left.getBoundingClientRect().top);
+  return preceding[0] || headings[0];
+}
+
+function scoreInteractiveCandidateForSearch(record, search) {
+  if (!record) {
+    return { matched: false, score: 0, matchedFields: [], contextSnippet: "" };
+  }
+  const roleValues = new Set([
+    record.normalizedFields.role,
+    record.normalizedFields.tag,
+    record.normalizedFields.type
+  ].filter(Boolean));
+  const roleMatched = !search.roles.length || search.roles.some((role) => roleValues.has(normalizeSearchText(role)));
+  if (!roleMatched) {
+    return { matched: false, score: 0, matchedFields: [], contextSnippet: "" };
   }
 
-  let score = 0;
-  if (descriptor === normalizedQuery) {
-    score += 1000;
-  } else if (descriptor.includes(normalizedQuery) || normalizedQuery.includes(descriptor)) {
-    score += 500;
+  const queryMatch = scoreSearchTerms(search.query, record, {
+    label: 360,
+    role: 180,
+    tag: 120,
+    type: 150,
+    name: 170,
+    placeholder: 220,
+    title: 220,
+    description: 180,
+    testId: 130,
+    context: 75
+  });
+  if (search.query && !queryMatch.matched) {
+    return { matched: false, score: 0, matchedFields: [], contextSnippet: "" };
+  }
+
+  const nearMatch = scoreSearchTerms(search.nearText, record, {
+    label: 35,
+    role: 15,
+    tag: 10,
+    type: 10,
+    name: 15,
+    placeholder: 25,
+    title: 35,
+    description: 35,
+    testId: 10,
+    context: 320
+  });
+  if (search.nearText && !nearMatch.matched) {
+    return { matched: false, score: 0, matchedFields: [], contextSnippet: "" };
+  }
+
+  const matchedFields = Array.from(new Set([
+    ...(search.roles.length ? ["role"] : []),
+    ...queryMatch.matchedFields,
+    ...nearMatch.matchedFields
+  ]));
+  const contextSnippet = findBestSearchContextSnippet(record, [
+    search.nearText,
+    search.query
+  ]);
+  return {
+    matched: true,
+    score: (search.roles.length ? 120 : 0) + queryMatch.score + nearMatch.score,
+    matchedFields,
+    contextSnippet
+  };
+}
+
+function scoreSearchTerms(value, record, weights) {
+  const normalizedQuery = normalizeSearchText(value);
+  if (!normalizedQuery) {
+    return { matched: true, score: 0, matchedFields: [] };
   }
   const tokens = tokenizeSearchText(normalizedQuery);
-  for (const token of tokens) {
-    if (descriptor.includes(token)) {
-      score += Math.max(8, Math.min(80, token.length * 8));
+  const matchedFields = [];
+  const matchedTokens = new Set();
+  let score = 0;
+  for (const [field, fieldValue] of Object.entries({
+    ...record.normalizedFields,
+    context: record.normalizedContext
+  })) {
+    if (!fieldValue) {
+      continue;
     }
-    if (normalizeSearchText(label).includes(token)) {
-      score += 40;
+    const weight = Number(weights[field] || 0);
+    if (!weight) {
+      continue;
+    }
+    let fieldScore = 0;
+    if (fieldValue === normalizedQuery) {
+      fieldScore += weight * 3;
+    } else if (fieldValue.includes(normalizedQuery) || normalizedQuery.includes(fieldValue)) {
+      fieldScore += weight * 2;
+    }
+    let fieldTokenMatches = 0;
+    for (const token of tokens) {
+      if (fieldValue.includes(token)) {
+        fieldTokenMatches += 1;
+        matchedTokens.add(token);
+        fieldScore += weight + Math.min(60, token.length * 6);
+      }
+    }
+    if (fieldScore) {
+      matchedFields.push(field);
+      score += fieldScore;
     }
   }
-  return score;
+  const requiredTokenMatches = tokens.length > 2 ? Math.ceil(tokens.length / 2) : 1;
+  const matched = score > 0 && matchedTokens.size >= requiredTokenMatches;
+  return {
+    matched,
+    score: matched ? score : 0,
+    matchedFields: matched ? matchedFields : []
+  };
+}
+
+function findBestSearchContextSnippet(record, searchValues) {
+  const tokens = searchValues.flatMap(tokenizeSearchText);
+  const matchingPart = record.contextParts.find((part) => {
+    const text = normalizeSearchText(part.text);
+    return tokens.some((token) => text.includes(token));
+  }) || record.contextParts[0];
+  return matchingPart ? `${matchingPart.kind}: ${matchingPart.text}` : "";
+}
+
+function buildPublicSearchMatch(candidate, redactSensitiveData) {
+  const snippet = candidate.searchMatch?.contextSnippet || "";
+  return removeEmptyValues({
+    score: Math.round(candidate.searchMatch?.score || 0),
+    matchedFields: candidate.searchMatch?.matchedFields || [],
+    contextSnippet: truncate(
+      redactSensitiveData ? redactSensitiveText(snippet) : snippet,
+      360
+    )
+  });
 }
 
 function normalizeSearchText(value) {
