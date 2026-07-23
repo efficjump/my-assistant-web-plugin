@@ -363,6 +363,15 @@ try {
     });
     assert.equal(verificationContracts.repairedStatus, "completed");
     assert.equal(verificationContracts.completionVerified, true);
+    assert.equal(verificationContracts.terminalGroundingVerified, true);
+    assert.equal(verificationContracts.completionVerifierSawConversation, true);
+    assert.equal(verificationContracts.groundingVerifierSawConversation, true);
+    assert.equal(verificationContracts.promiseReplanOccurred, true);
+    assert.equal(verificationContracts.promiseCompletionVerifierCalls, 2);
+    assert.equal(verificationContracts.promiseFinalStatus, "completed");
+    assert.match(verificationContracts.promiseFinalMessage, /다음과 같습니다/);
+    assert.equal(verificationContracts.timelinePreservedEarlierAction, true);
+    assert.equal(verificationContracts.successPayloadHiddenFromChat, true);
     assert.ok(
       verificationContracts.purposes.findIndex((purpose) => purpose === "answer-grounding-repair")
         < verificationContracts.purposes.findIndex((purpose) => purpose.startsWith("verifier-"))
@@ -1827,10 +1836,17 @@ async function exerciseAgentVerificationContracts({ cdp, panelSessionId, tabId, 
         maxNoProgressSteps: 2,
         maxActionsPerTurn: 3
       };
-      createAgentSession("현재 화면을 근거로 확인해줘");
+      state.conversation = [
+        { role: "assistant", text: "현재 화면을 확인한 뒤 상태 정보를 정리해서 전달하겠습니다." },
+        { role: "user", text: "계속해줘" }
+      ];
+      createAgentSession("계속해줘");
       const session = state.agentSession;
       const purposes = [];
       const screenshotChecks = [];
+      let groundingCallCount = 0;
+      let completionVerifierSawConversation = false;
+      let groundingVerifierSawConversation = false;
       collectDecisionObservation = async () => ({
         context: ${JSON.stringify(context)},
         screenshotDataUrl: coherentScreenshot
@@ -1845,6 +1861,14 @@ async function exerciseAgentVerificationContracts({ cdp, panelSessionId, tabId, 
           || request.purpose.startsWith("verifier-")
         ) {
           screenshotChecks.push(request.screenshotDataUrl === coherentScreenshot);
+        }
+        if (request.purpose.startsWith("verifier-")) {
+          completionVerifierSawConversation = request.user.includes("상태 정보를 정리해서 전달하겠습니다.")
+            && request.user.includes("계속해줘");
+        }
+        if (request.purpose.startsWith("answer-grounding-") && request.purpose !== "answer-grounding-repair") {
+          groundingVerifierSawConversation = request.user.includes("상태 정보를 정리해서 전달하겠습니다.")
+            && request.user.includes("계속해줘");
         }
         let payload;
         if (request.purpose === "decision") {
@@ -1863,14 +1887,24 @@ async function exerciseAgentVerificationContracts({ cdp, panelSessionId, tabId, 
             verification: { required: false, expectedChange: "", successCriteria: [] }
           };
         } else if (request.purpose.startsWith("answer-grounding-") && request.purpose !== "answer-grounding-repair") {
-          payload = {
-            version: "1.0",
-            status: "needs_more_evidence",
-            message: "답변을 현재 화면 근거에 맞춰 다시 작성해야 합니다.",
-            evidenceIds: [],
-            missingEvidence: ["현재 화면과 직접 연결된 표현"],
-            confidence: 0.3
-          };
+          groundingCallCount += 1;
+          payload = groundingCallCount === 1
+            ? {
+                version: "1.0",
+                status: "needs_more_evidence",
+                message: "답변을 현재 화면 근거에 맞춰 다시 작성해야 합니다.",
+                evidenceIds: [],
+                missingEvidence: ["현재 화면과 직접 연결된 표현"],
+                confidence: 0.3
+              }
+            : {
+                version: "1.0",
+                status: "verified",
+                message: "최종 답변이 현재 화면 근거와 대화상 요청을 충족합니다.",
+                evidenceIds: [activeSession.currentPageEvidenceId],
+                missingEvidence: [],
+                confidence: 0.98
+              };
         } else if (request.purpose === "answer-grounding-repair") {
           payload = {
             version: "1.0",
@@ -1906,6 +1940,90 @@ async function exerciseAgentVerificationContracts({ cdp, panelSessionId, tabId, 
       };
 
       const repairedDecision = await requestChatDecision(session);
+
+      state.conversation = [
+        { role: "assistant", text: "확인한 상태 정보를 다음 답변에서 정리해 드리겠습니다." },
+        { role: "user", text: "좋아요" }
+      ];
+      createAgentSession("좋아요");
+      const promiseSession = state.agentSession;
+      const promisePurposes = [];
+      let completionVerifierCalls = 0;
+      requestAiDecision = async (activeSession, request) => {
+        promisePurposes.push(request.purpose);
+        let payload;
+        if (request.purpose === "decision") {
+          payload = {
+            version: "1.0",
+            status: "completed",
+            message: "상태 정보를 확인했습니다. 이제 정리해 드리겠습니다.",
+            summary: "상태 확인",
+            progress: "현재 화면을 확인했습니다.",
+            doneReason: "화면 관찰 완료",
+            completionEvidence: [activeSession.currentPageEvidenceId],
+            needsUserApproval: false,
+            plan: ["현재 화면 확인", "결과 전달"],
+            toolCalls: [],
+            actions: [],
+            verification: {
+              required: true,
+              expectedChange: "현재 화면 관찰",
+              successCriteria: ["상태 정보 확인", "사용자에게 결과 전달"]
+            }
+          };
+        } else if (request.purpose.startsWith("verifier-")) {
+          completionVerifierCalls += 1;
+          payload = completionVerifierCalls === 1
+            ? {
+                version: "1.0",
+                status: "needs_more_evidence",
+                message: "후속 대화에서 약속한 결과가 최종 답변에 포함되지 않았습니다.",
+                evidenceIds: [],
+                missingEvidence: ["사용자에게 전달할 실제 상태 정보"],
+                confidence: 0.99
+              }
+            : {
+                version: "1.0",
+                status: "verified",
+                message: "근거와 최종 결과 전달을 모두 확인했습니다.",
+                evidenceIds: [activeSession.currentPageEvidenceId],
+                missingEvidence: [],
+                confidence: 0.99
+              };
+        } else if (request.purpose === "verification-replan") {
+          payload = {
+            version: "1.0",
+            status: "completed",
+            message: "현재 화면에서 확인한 상태 정보는 다음과 같습니다: 준비됨.",
+            summary: "상태 정보 전달",
+            progress: "현재 화면의 상태 정보를 답변에 포함했습니다.",
+            doneReason: "요청한 상태 정보를 근거와 함께 전달함",
+            completionEvidence: [activeSession.currentPageEvidenceId],
+            needsUserApproval: false,
+            plan: ["현재 화면 확인", "결과 전달"],
+            toolCalls: [],
+            actions: [],
+            verification: {
+              required: true,
+              expectedChange: "현재 화면 관찰",
+              successCriteria: ["상태 정보 확인", "사용자에게 결과 전달"]
+            }
+          };
+        } else if (request.purpose.startsWith("answer-grounding-")) {
+          payload = {
+            version: "1.0",
+            status: "verified",
+            message: "최종 답변의 상태 정보가 현재 화면 근거와 일치합니다.",
+            evidenceIds: [activeSession.currentPageEvidenceId],
+            missingEvidence: [],
+            confidence: 0.99
+          };
+        } else {
+          throw new Error(\`Unexpected promise-delivery verification purpose: \${request.purpose}\`);
+        }
+        return { text: JSON.stringify(payload), audit: null };
+      };
+      const promiseRepairedDecision = await requestChatDecision(promiseSession);
 
       const evidenceSession = {
         ...session,
@@ -2030,9 +2148,35 @@ async function exerciseAgentVerificationContracts({ cdp, panelSessionId, tabId, 
         screenshotDataUrl: coherentScreenshot
       });
 
+      elements.messageList.replaceChildren();
+      startRunTimeline("누적 작업 흐름 검증");
+      updateRunTimeline("actions", "done", "2개 액션 완료");
+      markUnusedTimelineEffectsSkipped();
+      const actionTimeline = state.agentRunUi.phaseElements.actions;
+      const timelinePreservedEarlierAction = actionTimeline.item.dataset.status === "done"
+        && actionTimeline.detail.textContent === "2개 액션 완료";
+      const messageCountBeforeSuccess = elements.messageList.children.length;
+      appendExecutionResultMessage([{
+        ok: true,
+        index: 0,
+        action: { type: "click" },
+        result: { internal: "raw-payload-must-stay-hidden" }
+      }]);
+      const successPayloadHiddenFromChat = elements.messageList.children.length === messageCountBeforeSuccess
+        && !elements.messageList.textContent.includes("raw-payload-must-stay-hidden");
+
       return {
         repairedStatus: repairedDecision.status,
         completionVerified: repairedDecision.verifier?.status === "verified",
+        terminalGroundingVerified: repairedDecision.grounding?.status === "verified",
+        completionVerifierSawConversation,
+        groundingVerifierSawConversation,
+        promiseReplanOccurred: promisePurposes.includes("verification-replan"),
+        promiseCompletionVerifierCalls: completionVerifierCalls,
+        promiseFinalMessage: promiseRepairedDecision.message,
+        promiseFinalStatus: promiseRepairedDecision.status,
+        timelinePreservedEarlierAction,
+        successPayloadHiddenFromChat,
         purposes,
         allVisualVerificationCallsReceivedScreenshot: screenshotChecks.length >= 4 && screenshotChecks.every(Boolean),
         previousViewportEvidenceStatus: previousViewportEvidence.status,

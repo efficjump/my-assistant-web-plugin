@@ -157,19 +157,33 @@ test("visual actions are bound to one current screenshot and an observed visual 
   assert.equal(Core.validateDecision(bypass, { context: visualContext }).valid, false);
 });
 
-test("rejects a syntactically valid but blank user-facing decision", () => {
-  const decision = Core.normalizeDecision({
-    version: "1.0",
-    status: "answer",
-    message: "",
-    summary: "",
-    doneReason: "",
-    toolCalls: [],
-    actions: []
-  });
-  const validation = Core.validateDecision(decision, { context, availableTools: [] });
-  assert.equal(validation.valid, false);
-  assert.match(validation.errors.join("\n"), /사용자에게 표시할/);
+test("rejects terminal decisions without an exact user-facing message", () => {
+  for (const status of ["answer", "clarify", "completed", "blocked"]) {
+    const decision = Core.normalizeDecision({
+      version: "1.0",
+      status,
+      message: "",
+      summary: "내부 요약만 있음",
+      doneReason: "내부 완료 사유만 있음",
+      completionEvidence: status === "completed" ? ["ev-terminal"] : [],
+      toolCalls: [],
+      actions: []
+    });
+    const validation = Core.validateDecision(decision, {
+      context,
+      availableTools: [],
+      availableEvidenceIds: ["ev-terminal"]
+    });
+    assert.equal(validation.valid, false, `${status} should require a message`);
+    assert.match(validation.errors.join("\n"), /message/);
+  }
+});
+
+test("decision contract requires terminal responses to deliver accepted conversational work", () => {
+  const contract = Core.buildDecisionContractText();
+  assert.match(contract, /short follow-ups from the recent conversation/i);
+  assert.match(contract, /include the requested result itself/i);
+  assert.match(contract, /never end with a promise/i);
 });
 
 test("accepts only runtime-issued completion evidence IDs", () => {

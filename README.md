@@ -22,7 +22,7 @@ flowchart LR
     V -->|"Evidence is sufficient"| R["Return the result"]
 ```
 
-Completion is not accepted from model prose alone. The runtime issues evidence identifiers, and a separate verifier checks the completion claim against that evidence. When the same decision repeats without observable progress, the agent tries an alternative approach and eventually stops with a concrete blocker instead of looping indefinitely.
+Completion is not accepted from model prose alone. The runtime issues evidence identifiers, and separate verifiers check both the completion claim and the exact user-facing result against that evidence. Brief follow-ups are resolved from recent user/assistant context, so accepting an unfinished promised deliverable carries that obligation into the next turn. A terminal response must contain the requested result rather than announce future work or merely say that a summary was produced. When the same decision repeats without observable progress, the agent tries an alternative approach and eventually stops with a concrete blocker instead of looping indefinitely.
 
 ## Capabilities
 
@@ -106,6 +106,8 @@ The panel keeps only the current page, element picker, settings, and request com
 ![Template editor with a selected personal template](docs/assets/template-manager.png)
 
 Global settings are saved when a field changes, so there is no separate global save button; site-specific profiles still use their own apply action. The full reset action is under **Settings → 고급**. While a local action plan is waiting for approval, the new-request composer is hidden because the running task cannot accept another request; rejecting or completing the approval restores the unchanged draft. External Bridge approvals do not hide the composer.
+
+The **작업 흐름** card summarizes the complete run rather than only the final turn, so an earlier tool call or page action is not replaced with “none” when the terminal turn needs no further effect. Successful low-level result payloads stay in the internal evidence and trace instead of appearing as raw JSON chat messages; failures remain visible as concise warnings.
 
 **Settings → 사이트별** is an agent-behavior profile for the exact origin shown in the panel; it does not change browser permissions. Enable the profile only when that site needs different behavior. Each field can independently inherit the global setting or override the action mode, screenshot use, and MCP use for that origin. The effective values are shown before saving, and **기본 설정으로 되돌리기** removes the origin-specific profile.
 

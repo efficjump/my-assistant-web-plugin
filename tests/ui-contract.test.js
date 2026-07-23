@@ -253,16 +253,43 @@ test("tab changes are deferred without losing or clearing a running session", ()
   assert.match(script, /queueMicrotask\(resumeActiveTabTransition\)/);
 });
 
-test("answer grounding accepts only the current visual observation and preserves coherent screenshots", () => {
+test("terminal response verification carries conversational obligations and current visual evidence", () => {
   const script = fs.readFileSync(path.join(root, "panel.js"), "utf8");
+  const completionStart = script.indexOf("async function requestCompletionVerification");
   const groundingStart = script.indexOf("async function requestAnswerGroundingVerification");
   const groundingEnd = script.indexOf("async function requestExecutionPolicy", groundingStart);
+  const completionFunction = script.slice(completionStart, groundingStart);
   const groundingFunction = script.slice(groundingStart, groundingEnd);
+  assert.match(completionFunction, /formatConversationObjectiveContext\(\)/);
+  assert.match(completionFunction, /actually delivers every requested result/);
   assert.match(groundingFunction, /session\.currentPageEvidenceId/);
   assert.match(groundingFunction, /entry\.id === currentPageEvidenceId/);
+  assert.match(groundingFunction, /formatConversationObjectiveContext\(\)/);
+  assert.match(groundingFunction, /merely promising future work/);
   assert.doesNotMatch(groundingFunction, /slice\(-2\)/);
   assert.match(groundingFunction, /screenshotDataUrl,/);
+  assert.match(script, /\["answer", "completed"\]\.includes\(decision\.status\)/);
   assert.match(script, /decision\.status === "completed"[\s\S]*decision\.verifier\?\.status !== "verified"/);
+});
+
+test("the run timeline preserves earlier effects and successful raw payloads stay out of chat", () => {
+  const script = fs.readFileSync(path.join(root, "panel.js"), "utf8");
+  const skippedStart = script.indexOf("function markUnusedTimelineEffectsSkipped");
+  const skippedEnd = script.indexOf("function getTimelineStatusLabel", skippedStart);
+  const skippedFunctions = script.slice(skippedStart, skippedEnd);
+  assert.match(skippedFunctions, /markTimelinePhaseSkippedIfUnused\("actions"/);
+  assert.match(skippedFunctions, /\["pending", "active"\]\.includes\(status\)/);
+  const effectsStart = script.indexOf("async function executeDecisionEffects");
+  const effectsEnd = script.indexOf("async function executeMcpCapability", effectsStart);
+  const effectsFunction = script.slice(effectsStart, effectsEnd);
+  assert.match(effectsFunction, /markTimelinePhaseSkippedIfUnused\("tools"/);
+  assert.match(effectsFunction, /markTimelinePhaseSkippedIfUnused\("actions"/);
+
+  const executionStart = script.indexOf("function appendExecutionResultMessage");
+  const executionEnd = script.indexOf("function appendToolResultMessage", executionStart);
+  const executionFunction = script.slice(executionStart, executionEnd);
+  assert.match(executionFunction, /results\.filter\(\(result\) => !result\.ok\)/);
+  assert.doesNotMatch(executionFunction, /JSON\.stringify\(result\.result/);
 });
 
 test("legacy sessions are consumed once and resetting settings refreshes the site profile form", () => {
