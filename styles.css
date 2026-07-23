@@ -895,38 +895,9 @@ h2 {
   line-height: 1.45;
 }
 
-.goal-state {
-  display: inline-flex;
-  align-items: center;
-  width: fit-content;
-  padding: 1px 5px;
-  border-radius: 999px;
-  background: var(--teal-soft);
-  color: #0f5f58;
-  font-size: 9px;
-  font-weight: 760;
-}
-
-.goal-state.editing {
-  background: var(--amber-soft);
-  color: #854d0e;
-}
-
-.goal-controls {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
-  gap: 7px;
-}
-
-.goal-panel input,
 .template-panel select,
 .template-panel input {
   min-height: 34px;
-}
-
-.goal-panel input.pinned {
-  border-color: rgba(15, 118, 110, 0.34);
-  background: var(--teal-soft);
 }
 
 .template-editor {

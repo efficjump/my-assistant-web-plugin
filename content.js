@@ -66,6 +66,8 @@ async function handleContentMessage(message) {
       return collectPageContext(message.options || {});
     case "EXECUTE_PAGE_ACTIONS":
       return executePageActions(message.actions || []);
+    case "VERIFY_PAGE_ACTION_EFFECT":
+      return verifyPageActionEffect(message.action || {}, message.beforeFingerprint || "");
     case "UNDO_PAGE_ACTIONS":
       return undoPageActions(message.undoActions || []);
     case "START_ELEMENT_PICKER":
@@ -455,12 +457,16 @@ function collectInteractiveSearchContext(element, contextCache) {
     if (text === undefined) {
       text = options.accessibleOnly
         ? getSemanticContainerName(source)
-        : collectVisibleTextWithin(source, maxChars);
+        : collectVisibleTextWithin(source, options.rejectTruncated ? maxChars + 1 : maxChars);
       const cached = contextCache.get(source) || {};
       cached[options.cacheKey || kind] = text;
       contextCache.set(source, cached);
     }
-    const normalized = normalizeWhitespace(text).slice(0, maxChars);
+    const completeText = normalizeWhitespace(text);
+    if (options.rejectTruncated && completeText.length > maxChars) {
+      return;
+    }
+    const normalized = completeText.slice(0, maxChars);
     const key = normalizeSearchText(normalized);
     if (!normalized || seenText.has(key)) {
       return;
@@ -483,6 +489,19 @@ function collectInteractiveSearchContext(element, contextCache) {
 
   const heading = findNearestContextHeading(element, semanticContainer);
   append("heading", heading, 220, { cacheKey: "visible-220" });
+
+  let ancestor = element.parentElement;
+  for (let depth = 1; ancestor && depth <= 5; depth += 1) {
+    const tag = ancestor.tagName?.toLowerCase() || "";
+    if (["html", "body"].includes(tag)) {
+      break;
+    }
+    append(`ancestor-${depth}`, ancestor, 520, {
+      cacheKey: "bounded-visible-520",
+      rejectTruncated: true
+    });
+    ancestor = ancestor.parentElement;
+  }
   return parts.slice(0, 5);
 }
 
@@ -552,7 +571,7 @@ function scoreInteractiveCandidateForSearch(record, search) {
     title: 220,
     description: 180,
     testId: 130,
-    context: 75
+    context: search.nearText ? 0 : 75
   });
   if (search.query && !queryMatch.matched) {
     return { matched: false, score: 0, matchedFields: [], contextSnippet: "" };
@@ -640,11 +659,29 @@ function scoreSearchTerms(value, record, weights) {
 }
 
 function findBestSearchContextSnippet(record, searchValues) {
-  const tokens = searchValues.flatMap(tokenizeSearchText);
-  const matchingPart = record.contextParts.find((part) => {
+  const queries = searchValues
+    .map(normalizeSearchText)
+    .filter(Boolean);
+  const rankedParts = record.contextParts.map((part, partIndex) => {
     const text = normalizeSearchText(part.text);
-    return tokens.some((token) => text.includes(token));
-  }) || record.contextParts[0];
+    let score = 0;
+    for (const [queryIndex, query] of queries.entries()) {
+      const priority = queries.length - queryIndex;
+      const tokens = tokenizeSearchText(query);
+      const matchedTokens = tokens.filter((token) => text.includes(token));
+      if (text.includes(query)) {
+        score += priority * 1000;
+      }
+      if (tokens.length) {
+        score += priority * Math.round((matchedTokens.length / tokens.length) * 100);
+      }
+    }
+    return { part, partIndex, score };
+  });
+  const matchingPart = rankedParts
+    .filter((entry) => entry.score > 0)
+    .sort((left, right) => right.score - left.score || left.partIndex - right.partIndex)[0]
+    ?.part || record.contextParts[0];
   return matchingPart ? `${matchingPart.kind}: ${matchingPart.text}` : "";
 }
 
@@ -1781,6 +1818,16 @@ function clickElement(action) {
     );
   }
   dispatchPointerSequence(element, point, { activate: true });
+  const mainWorldActivation = buildMainWorldAnchorActivation(element, point);
+  if (mainWorldActivation) {
+    return {
+      clicked: getAccessibleName(element) || element.tagName.toLowerCase(),
+      mayNavigate: false,
+      point: { x: Math.round(point.globalX), y: Math.round(point.globalY) },
+      inputSequence: "pointer-mouse-click",
+      mainWorldActivation
+    };
+  }
   const activate = () => activateDeepestHitTarget(element, point);
   if (mayNavigate) {
     window.setTimeout(activate, 80);
@@ -1792,6 +1839,24 @@ function clickElement(action) {
     mayNavigate,
     point: { x: Math.round(point.globalX), y: Math.round(point.globalY) },
     inputSequence: "pointer-mouse-click"
+  };
+}
+
+function buildMainWorldAnchorActivation(element, point) {
+  if (!isDomInstance(element, "HTMLAnchorElement")) {
+    return null;
+  }
+  const declaredHref = String(element.getAttribute("href") || "").trim();
+  if (!/^javascript:/i.test(declaredHref)) {
+    return null;
+  }
+  return {
+    selector: buildCssSelector(element),
+    declaredHref,
+    point: {
+      x: Math.round(point.x),
+      y: Math.round(point.y)
+    }
   };
 }
 
@@ -2247,6 +2312,10 @@ function activateDeepestHitTarget(element, point) {
 
 function actionMayUnloadPage(element) {
   if (isDomInstance(element, "HTMLAnchorElement") && element.href) {
+    const declaredHref = String(element.getAttribute("href") || "").trim();
+    if (/^javascript:/i.test(declaredHref) || declaredHref.startsWith("#")) {
+      return false;
+    }
     return true;
   }
 
@@ -2326,6 +2395,17 @@ function compareActionStates(before, after, result) {
     urlChanged: before?.url !== after.url,
     domChanged: before?.domRevision !== after.domRevision,
     targetChanged: JSON.stringify(before?.target || null) !== JSON.stringify(after.target || null)
+  };
+}
+
+function verifyPageActionEffect(action, beforeFingerprint) {
+  const after = captureActionState(normalizeAction(action));
+  const changed = Boolean(beforeFingerprint) && beforeFingerprint !== after.fingerprint;
+  return {
+    changed,
+    reason: changed ? "observable page state changed" : "no observable page state change",
+    beforeFingerprint: String(beforeFingerprint || ""),
+    afterFingerprint: after.fingerprint
   };
 }
 
@@ -2745,7 +2825,13 @@ function clipLocalRectForElement(element, sourceRect, options = {}) {
     const style = ownerWindow.getComputedStyle(ancestor);
     const clipsX = clipsOverflow(style.overflowX) || String(style.contain || "").includes("paint");
     const clipsY = clipsOverflow(style.overflowY) || String(style.contain || "").includes("paint");
-    if (clipsX || clipsY) {
+    const ownerDocument = element.ownerDocument;
+    const isViewportScroller = (
+      ancestor === ownerDocument.documentElement
+      || ancestor === ownerDocument.body
+      || ancestor === ownerDocument.scrollingElement
+    );
+    if ((clipsX || clipsY) && !isViewportScroller) {
       const ancestorRect = normalizeRect(ancestor.getBoundingClientRect());
       clipped = intersectRects(clipped, {
         left: clipsX ? ancestorRect.left + ancestor.clientLeft : clipped.left,

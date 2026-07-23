@@ -103,8 +103,6 @@ const state = {
   activeTab: null,
   lastContext: null,
   pickedElement: null,
-  pinnedGoal: "",
-  goalEditing: false,
   currentPlan: null,
   agentSession: null,
   agentRunUi: null,
@@ -150,10 +148,6 @@ const elements = {
   restrictedTitle: document.getElementById("restrictedTitle"),
   restrictedMessage: document.getElementById("restrictedMessage"),
   restrictedRefreshButton: document.getElementById("restrictedRefreshButton"),
-  goalInput: document.getElementById("goalInput"),
-  goalState: document.getElementById("goalState"),
-  pinGoalButton: document.getElementById("pinGoalButton"),
-  clearGoalButton: document.getElementById("clearGoalButton"),
   conversationWorkspace: document.getElementById("conversationWorkspace"),
   messageList: document.getElementById("messageList"),
   approvalStack: document.getElementById("approvalStack"),
@@ -177,7 +171,6 @@ const elements = {
   rejectExternalActionButton: document.getElementById("rejectExternalActionButton"),
   chatInput: document.getElementById("chatInput"),
   composer: document.getElementById("composer"),
-  goalPopover: document.getElementById("goalPopover"),
   templatePopover: document.getElementById("templatePopover"),
   templateSelect: document.getElementById("templateSelect"),
   templateTitleInput: document.getElementById("templateTitleInput"),
@@ -323,7 +316,6 @@ async function initialize() {
   renderSettingsOverview();
   renderTemplateSelect();
   resizeComposerInput();
-  updateGoalUi();
   updateStatusBadges();
   updateAgentButtons();
   await refreshActiveTabSummary();
@@ -367,7 +359,7 @@ function bindEvents() {
       closeComposerPopovers();
     }
   });
-  [elements.goalPopover, elements.templatePopover].forEach((popover) => {
+  [elements.templatePopover].forEach((popover) => {
     popover.addEventListener("toggle", () => {
       if (!popover.open) {
         if (popover === elements.templatePopover) {
@@ -391,14 +383,6 @@ function bindEvents() {
     tab.addEventListener("keydown", handleSettingsTabKeydown);
   });
   elements.openPreferredSurfaceButton.addEventListener("click", openPreferredSurface);
-  elements.pinGoalButton.addEventListener("click", pinGoalFromInput);
-  elements.clearGoalButton.addEventListener("click", clearPinnedGoal);
-  elements.goalInput.addEventListener("keydown", (event) => {
-    if (event.key === "Enter") {
-      event.preventDefault();
-      pinGoalFromInput();
-    }
-  });
   elements.templateSelect.addEventListener("change", () => {
     state.templateDeleteConfirmationId = "";
     renderTemplateEditor();
@@ -470,8 +454,7 @@ function bindEvents() {
       closeUtilityMenu();
     }
     if (
-      (elements.goalPopover.open || elements.templatePopover.open)
-      && !elements.goalPopover.contains(event.target)
+      elements.templatePopover.open
       && !elements.templatePopover.contains(event.target)
     ) {
       closeComposerPopovers();
@@ -541,7 +524,7 @@ function closeUtilityMenu(options = {}) {
 function closeComposerPopovers(except = null, options = {}) {
   let closed = false;
   let focusTarget = null;
-  for (const popover of [elements.goalPopover, elements.templatePopover]) {
+  for (const popover of [elements.templatePopover]) {
     if (popover === except || !popover.open) continue;
     popover.open = false;
     closed = true;
@@ -808,20 +791,20 @@ async function restoreConversationForActiveTab() {
   const stored = await chrome.storage.local.get(SESSION_STORAGE_KEY);
   const sessions = stored[SESSION_STORAGE_KEY] || {};
   const legacyKey = getLegacySessionKey();
-  const savedSession = sessions[sessionKey] || (legacyKey ? sessions[legacyKey] : null);
+  const hasCurrentSession = Boolean(sessions[sessionKey]);
+  const rawSavedSession = sessions[sessionKey] || (legacyKey ? sessions[legacyKey] : null);
   resetTabScopedState();
-  if (!savedSession) {
+  if (!rawSavedSession) {
     return false;
   }
+  const savedSession = { ...rawSavedSession };
+  const removedLegacyGoal = Object.hasOwn(savedSession, "pinnedGoal");
+  delete savedSession.pinnedGoal;
 
   state.conversation = Array.isArray(savedSession.messages) ? savedSession.messages.slice(-24) : [];
-  state.pinnedGoal = savedSession.pinnedGoal || "";
-  state.goalEditing = false;
   state.pickedElement = savedSession.pickedElement || null;
   state.undoStack = Array.isArray(savedSession.undoStack) ? savedSession.undoStack.slice(-MAX_UNDO_ITEMS) : [];
   state.evaluationLogs = Array.isArray(savedSession.evaluationLogs) ? savedSession.evaluationLogs.slice(-80) : [];
-  elements.goalInput.value = state.pinnedGoal;
-  updateGoalUi();
   updatePickedElementBadge();
   updateAgentButtons();
   for (const message of state.conversation) {
@@ -830,13 +813,21 @@ async function restoreConversationForActiveTab() {
       record: false
     });
   }
-  if (state.conversation.length || state.pinnedGoal) {
-    setStatusLine(state.conversation.length ? "이전 대화 복원됨" : "고정 목표 복원됨");
+  if (state.conversation.length) {
+    setStatusLine("이전 대화 복원됨");
   }
 
-  if (!sessions[sessionKey] && legacyKey && sessions[legacyKey]) {
+  let sessionsChanged = false;
+  if (hasCurrentSession && removedLegacyGoal) {
+    sessions[sessionKey] = savedSession;
+    sessionsChanged = true;
+  }
+  if (!hasCurrentSession && legacyKey && sessions[legacyKey]) {
     sessions[sessionKey] = { ...savedSession, updatedAt: new Date().toISOString() };
     delete sessions[legacyKey];
+    sessionsChanged = true;
+  }
+  if (sessionsChanged) {
     await chrome.storage.local.set({ [SESSION_STORAGE_KEY]: sessions });
   }
   return true;
@@ -871,7 +862,6 @@ function buildCurrentSessionSnapshot() {
     url: state.lastContext?.url || state.activeTab?.url || "",
     updatedAt: new Date().toISOString(),
     messages: state.conversation.slice(-24),
-    pinnedGoal: state.pinnedGoal,
     pickedElement: state.pickedElement,
     undoStack: state.undoStack.slice(-MAX_UNDO_ITEMS),
     evaluationLogs: state.evaluationLogs.slice(-80),
@@ -929,8 +919,6 @@ function canonicalSessionUrl(url) {
 
 function resetTabScopedState() {
   state.conversation = [];
-  state.pinnedGoal = "";
-  state.goalEditing = false;
   state.currentPlan = null;
   state.agentSession = null;
   state.agentRunUi = null;
@@ -939,9 +927,7 @@ function resetTabScopedState() {
   state.undoStack = [];
   state.evaluationLogs = [];
   elements.messageList.replaceChildren();
-  elements.goalInput.value = "";
   hideApprovalPanel();
-  updateGoalUi();
   updatePickedElementBadge();
   updateAgentButtons();
 }
@@ -1256,53 +1242,6 @@ function insertSelectedTemplate() {
   resizeComposerInput();
   elements.chatInput.focus();
   setStatusLine("템플릿을 입력창에 불러왔습니다. 확인하거나 수정한 뒤 보내세요.");
-}
-
-function pinGoalFromInput() {
-  if (state.pinnedGoal && !state.goalEditing) {
-    state.goalEditing = true;
-    updateGoalUi();
-    elements.goalInput.focus();
-    elements.goalInput.setSelectionRange?.(elements.goalInput.value.length, elements.goalInput.value.length);
-    setStatusLine("목표를 수정한 뒤 적용을 누르세요.");
-    return;
-  }
-  const value = elements.goalInput.value.trim();
-  if (!value) {
-    setStatusLine("고정할 작업 목표를 입력해 주세요.");
-    return;
-  }
-  state.pinnedGoal = value;
-  state.goalEditing = false;
-  elements.goalInput.value = value;
-  updateGoalUi();
-  persistCurrentSession();
-  elements.goalPopover.open = false;
-  elements.chatInput.focus();
-  setStatusLine("목표가 이후 요청에 적용됩니다. 아직 작업은 시작하지 않았습니다.");
-}
-
-function clearPinnedGoal() {
-  state.pinnedGoal = "";
-  state.goalEditing = false;
-  elements.goalInput.value = "";
-  updateGoalUi();
-  persistCurrentSession();
-  elements.goalPopover.open = false;
-  elements.chatInput.focus();
-  setStatusLine("목표 해제됨");
-}
-
-function updateGoalUi() {
-  const hasGoal = Boolean(state.pinnedGoal);
-  const editing = hasGoal && state.goalEditing;
-  elements.goalInput.readOnly = hasGoal && !editing;
-  elements.goalInput.classList.toggle("pinned", hasGoal && !editing);
-  elements.pinGoalButton.textContent = hasGoal ? (editing ? "적용" : "수정") : "고정";
-  elements.clearGoalButton.disabled = !hasGoal;
-  elements.goalState.hidden = !hasGoal;
-  elements.goalState.textContent = editing ? "수정 중" : "적용 중";
-  elements.goalState.classList.toggle("editing", editing);
 }
 
 function getCurrentSiteScope() {
@@ -2885,8 +2824,7 @@ function createAgentSession(latestUserMessage) {
     targetTabId,
     documentId: "",
     latestUserMessage,
-    pinnedGoal: String(state.pinnedGoal || "").trim(),
-    turnIntent: createFallbackTurnIntent(latestUserMessage, state.pinnedGoal),
+    turnIntent: createFallbackTurnIntent(latestUserMessage),
     successfulEffects: [],
     effectKeySalt: crypto.randomUUID(),
     step: 0,
@@ -2905,8 +2843,8 @@ function createAgentSession(latestUserMessage) {
   updateAgentButtons();
 }
 
-function createFallbackTurnIntent(latestUserMessage, pinnedGoal = "") {
-  const intent = AgentCore.normalizeTurnIntent({
+function createFallbackTurnIntent(latestUserMessage) {
+  return AgentCore.normalizeTurnIntent({
     version: "1.0",
     mode: "standalone",
     objective: String(latestUserMessage || "").trim(),
@@ -2918,17 +2856,13 @@ function createFallbackTurnIntent(latestUserMessage, pinnedGoal = "") {
     ],
     reason: "Safe standalone fallback when turn-intent resolution is unavailable."
   }, { latestUserMessage });
-  return {
-    ...intent,
-    pinnedGoal: String(pinnedGoal || "").trim().slice(0, 8000)
-  };
 }
 
 async function resolveAgentTurnIntent(session) {
   if (!session) {
     throw new Error("에이전트 세션이 없습니다.");
   }
-  const fallback = createFallbackTurnIntent(session.latestUserMessage, session.pinnedGoal);
+  const fallback = createFallbackTurnIntent(session.latestUserMessage);
   updateRunTimeline("think", "active", "현재 요청의 범위와 완료 조건을 확인 중");
   try {
     const response = await requestAiDecision(session, {
@@ -2938,8 +2872,8 @@ async function resolveAgentTurnIntent(session) {
 The latest user message is authoritative. Classify it as continue_prior only when it is semantically incomplete on its own and explicitly accepts, resumes, or refers to one concrete unfinished prior deliverable. A complete new imperative is standalone even when it resembles a failed earlier request.
 An earlier error, rejected action, or stopped run is context, not authorization to retry or broaden that run. Never silently add actions from a failed request.
 Use repeatPolicy once unless the latest message explicitly requests a numeric repetition, or explicitly asks to continue until a named condition covers every/all remaining item. Use bounded only for an explicit count and until_condition only for an explicit stopping condition. Do not infer repeated permission merely because the same control remains visible after an effect.
-The pinned goal may constrain the latest request but cannot override it. Return only the supplied turn-intent JSON schema with a concise reason and no chain-of-thought.`,
-      user: `Latest user message:\n${session.latestUserMessage}\n\nPinned goal:\n${state.pinnedGoal || ""}\n\nPrior conversation context JSON:\n${JSON.stringify(
+Return only the supplied turn-intent JSON schema with a concise reason and no chain-of-thought.`,
+      user: `Latest user message:\n${session.latestUserMessage}\n\nPrior conversation context JSON:\n${JSON.stringify(
         formatConversationObjectiveContext({ excludeLatestUser: true }),
         null,
         2
@@ -2962,10 +2896,7 @@ The pinned goal may constrain the latest request but cannot override it. Return 
     if (!validation.valid) {
       throw new Error(validation.errors.join(" "));
     }
-    session.turnIntent = {
-      ...validation.intent,
-      pinnedGoal: String(session.pinnedGoal || "").trim().slice(0, 8000)
-    };
+    session.turnIntent = validation.intent;
     appendEvaluationLog({
       kind: "turn-intent",
       source: "model",
@@ -5095,10 +5026,7 @@ function formatEvidenceLedger(session) {
 }
 
 function getEffectiveTurnIntent(session) {
-  return session?.turnIntent || createFallbackTurnIntent(
-    session?.latestUserMessage || "",
-    session?.pinnedGoal || ""
-  );
+  return session?.turnIntent || createFallbackTurnIntent(session?.latestUserMessage || "");
 }
 
 function formatSuccessfulEffects(session) {
@@ -5391,7 +5319,6 @@ function buildContextSnapshot(context = state.lastContext) {
     visualSurfaces: (context.visualSurfaces || []).slice(0, 12),
     automationCapabilities: context.automationCapabilities || null,
     pickedElement: state.pickedElement,
-    pinnedGoal: state.pinnedGoal,
     undoCount: state.undoStack.length,
     evaluationLogCount: state.evaluationLogs.length,
     aiUsage: buildAiUsageSummary(),
@@ -5786,28 +5713,19 @@ function clearConversation() {
     return;
   }
 
-  const pinnedGoal = state.pinnedGoal;
   state.conversation = [];
   state.currentPlan = null;
   state.agentSession = null;
   state.agentRunUi = null;
   state.pickedElement = null;
-  state.pinnedGoal = pinnedGoal;
-  state.goalEditing = false;
   state.undoStack = [];
   state.evaluationLogs = [];
-  elements.goalInput.value = pinnedGoal;
-  updateGoalUi();
   updatePickedElementBadge();
   elements.messageList.replaceChildren();
   hideApprovalPanel();
-  setStatusLine(pinnedGoal ? "대화만 비웠습니다. 고정 목표는 유지됩니다." : "대화를 비웠습니다.");
+  setStatusLine("대화를 비웠습니다.");
   updateAgentButtons();
-  if (pinnedGoal) {
-    persistCurrentSession();
-  } else {
-    void removeCurrentSavedSession();
-  }
+  void removeCurrentSavedSession();
 }
 
 function appendChatMessage(role, text, options = {}) {

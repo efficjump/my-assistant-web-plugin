@@ -296,11 +296,14 @@ async function executePageActionsInFrames(targetTabId, actions) {
       type: "EXECUTE_PAGE_ACTIONS",
       actions: [routed.action]
     }, { frameId: routed.frameId });
-    const result = response?.results?.[0] || {
+    let result = response?.results?.[0] || {
       ok: false,
       action: routed.action,
       error: "The target frame returned no action result."
     };
+    if (result.ok && result.result?.mainWorldActivation) {
+      result = await completeMainWorldAnchorActivation(tab.id, routed.frameId, routed.action, result);
+    }
     results.push(decorateFrameActionResult(result, {
       frameId: routed.frameId,
       originalAction: action,
@@ -311,6 +314,102 @@ async function executePageActionsInFrames(targetTabId, actions) {
     }
   }
   return { results };
+}
+
+async function completeMainWorldAnchorActivation(tabId, frameId, action, result) {
+  const request = result.result.mainWorldActivation;
+  const publicResult = { ...result.result };
+  delete publicResult.mainWorldActivation;
+  let execution;
+  try {
+    [execution] = await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [frameId] },
+      world: "MAIN",
+      func: activateBoundJavascriptAnchor,
+      args: [request]
+    });
+  } catch (error) {
+    return {
+      ...result,
+      ok: false,
+      result: publicResult,
+      error: `The page-owned legacy action could not be activated: ${error.message || String(error)}`,
+      code: "main_world_activation_failed"
+    };
+  }
+
+  const activation = execution?.result;
+  if (!activation?.activated) {
+    return {
+      ...result,
+      ok: false,
+      result: publicResult,
+      error: activation?.error || "The page-owned legacy action target changed before activation.",
+      code: "main_world_target_changed"
+    };
+  }
+
+  await new Promise((resolve) => setTimeout(resolve, 260));
+  let verification;
+  try {
+    await ensureContentScript(tabId, frameId);
+    verification = await sendTabMessage(tabId, {
+      type: "VERIFY_PAGE_ACTION_EFFECT",
+      action,
+      beforeFingerprint: result.verification?.beforeFingerprint || ""
+    }, { frameId });
+  } catch (error) {
+    return {
+      ...result,
+      ok: false,
+      result: publicResult,
+      error: `The legacy action ran, but its visible result could not be verified: ${error.message || String(error)}`,
+      code: "main_world_verification_failed"
+    };
+  }
+
+  if (!verification?.changed) {
+    return {
+      ...result,
+      ok: false,
+      result: publicResult,
+      verification: verification || result.verification,
+      error: "The page-owned legacy action produced no observable page change.",
+      code: "main_world_no_effect"
+    };
+  }
+  return {
+    ...result,
+    result: {
+      ...publicResult,
+      activation: "page-owned-legacy-handler"
+    },
+    verification
+  };
+}
+
+function activateBoundJavascriptAnchor(request) {
+  const selector = String(request?.selector || "");
+  const declaredHref = String(request?.declaredHref || "");
+  const point = request?.point && typeof request.point === "object" ? request.point : {};
+  let target = null;
+  try {
+    target = selector ? document.querySelector(selector) : null;
+  } catch {
+    target = null;
+  }
+  if (!target && Number.isFinite(point.x) && Number.isFinite(point.y)) {
+    const hit = document.elementFromPoint(point.x, point.y);
+    target = hit?.closest?.("a") || null;
+  }
+  if (!(target instanceof HTMLAnchorElement)) {
+    return { activated: false, error: "The bound legacy link is no longer present." };
+  }
+  if (String(target.getAttribute("href") || "").trim() !== declaredHref) {
+    return { activated: false, error: "The bound legacy link changed before activation." };
+  }
+  target.click();
+  return { activated: true };
 }
 
 async function executeUndoActionsInFrames(targetTabId, undoActions) {

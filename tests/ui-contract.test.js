@@ -116,10 +116,9 @@ test("screenshot-disabled mode gates both AI input and approval previews", () =>
   assert.match(annotationFunction, /areAnnotationTargetsStable\(decision, annotationContext, confirmedContext\)/);
 });
 
-test("goal and template tools are closed popovers above a single-row composer", () => {
+test("template tool is a closed popover above a single-row composer", () => {
   const html = fs.readFileSync(path.join(root, "panel.html"), "utf8");
   const script = fs.readFileSync(path.join(root, "panel.js"), "utf8");
-  const goalTag = readOpeningTag(html, "details", "goalPopover");
   const templateTag = readOpeningTag(html, "details", "templatePopover");
   const composerStart = html.search(/<section\b[^>]*\bid=["']composer["']/i);
   const settingsStart = html.search(/<[^>]+\bid=["']settingsModal["']/i);
@@ -127,17 +126,14 @@ test("goal and template tools are closed popovers above a single-row composer", 
     ? html.slice(composerStart, settingsStart)
     : "";
 
-  assert.ok(goalTag);
   assert.ok(templateTag);
-  assert.doesNotMatch(goalTag, /\sopen(?:\s|=|>)/i);
   assert.doesNotMatch(templateTag, /\sopen(?:\s|=|>)/i);
-  assert.equal(hasElementId(composerMarkup, "goalPopover"), true);
   assert.equal(hasElementId(composerMarkup, "templatePopover"), true);
   assert.match(composerMarkup, /class=["'][^"']*\bcomposer-input-row\b[^"']*["']/);
   assert.equal(hasElementId(composerMarkup, "chatInput"), true);
   assert.equal(hasElementId(composerMarkup, "sendButton"), true);
-  assert.match(html, /id="goalHelp"/);
   assert.match(html, /id="templateHelp"/);
+  assert.doesNotMatch(composerMarkup, /id=["']goal(?:Popover|Input|State)["']/);
   for (const id of [
     "templateTitleInput",
     "templatePromptInput",
@@ -163,7 +159,7 @@ test("site-specific settings explain their scope", () => {
   assert.match(html, /id="siteProfileTarget"/);
   assert.match(html, /기본 설정 따르기/);
   assert.match(script, /buildSessionKey\(tabId, url\)/);
-  assert.match(script, /state\.goalEditing/);
+  assert.doesNotMatch(script, /state\.(?:pinnedGoal|goalEditing)/);
   assert.match(script, /requestAnswerGroundingVerification/);
 });
 
@@ -317,6 +313,7 @@ test("the run timeline preserves earlier effects and successful raw payloads sta
 test("legacy sessions are consumed once and resetting settings refreshes the site profile form", () => {
   const script = fs.readFileSync(path.join(root, "panel.js"), "utf8");
   assert.match(script, /delete sessions\[legacyKey\]/);
+  assert.match(script, /delete savedSession\.pinnedGoal/);
   const resetStart = script.indexOf("async function resetSettings()");
   const resetEnd = script.indexOf("function updateCustomVisibility", resetStart);
   const resetFunction = script.slice(resetStart, resetEnd);

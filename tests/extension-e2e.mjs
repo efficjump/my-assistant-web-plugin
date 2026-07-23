@@ -272,7 +272,6 @@ try {
       assert.ok(layout.externalApprovalHeight >= 120, `${viewportLabel} approval viewport was only ${layout.externalApprovalHeight}px tall`);
       assert.equal(layout.composerVisible, true, `${viewportLabel} composer should remain available for external approval`);
       assert.equal(layout.composerInputSingleRow, true, `${viewportLabel} composer input and send control should share a row`);
-      assert.equal(layout.goalPopoverClosed, true);
       assert.equal(layout.templatePopoverClosed, true);
       assert.equal(layout.externalPickerHidden, true, "a single external approval does not need a request picker");
       assert.equal(layout.settingsTabsSingleRow, true, `${viewportLabel} settings tabs should stay on one row`);
@@ -342,14 +341,6 @@ try {
       screenshotField: "off",
       mcpField: "inherit"
     });
-    assert.deepEqual(panelContracts.goal, {
-      restored: "화면 상태를 확인하고 근거를 남기기",
-      readOnly: true,
-      otherTabGoal: "",
-      retainedAfterClear: "화면 상태를 확인하고 근거를 남기기",
-      popoverClosedAfterPin: true
-    });
-
     if (process.argv.includes("--capture-docs")) {
       await captureAgentPanelDocs(cdp, panelSessionId);
       await captureSettingsOverviewDocs(cdp, panelSessionId);
@@ -482,6 +473,52 @@ try {
     });
     assert.match(delegatedContext.data.visibleText, /Delegated target delegated-child/);
     assert.match(delegatedContext.data.visibleText, /Delegated native activation revealed/);
+
+    const legacyPaginationSearch = await extensionMessage(cdp, panelSessionId, {
+      type: "COLLECT_PAGE_CONTEXT",
+      targetTabId: firstTabId,
+      options: {
+        maxTextChars: 8000,
+        maxElements: 20,
+        elementQuery: "2",
+        elementRoles: ["link"],
+        elementNearText: "[1/5] [총 478건]",
+        redactSensitiveData: true
+      }
+    });
+    const legacyPageTwo = legacyPaginationSearch.data.interactiveElements.find(
+      (element) => element.label === "2"
+    );
+    assert.deepEqual(
+      legacyPaginationSearch.data.interactiveElements.map((element) => element.label),
+      ["2"],
+      "nearby text should filter context while the primary query stays bound to control identity"
+    );
+    assert.ok(
+      legacyPageTwo?.ref,
+      "numeric legacy paginator links should be found from bounded nearby context instead of date-like table rows"
+    );
+    assert.match(legacyPageTwo.searchMatch.contextSnippet, /\[1\/5\].*478건/);
+    const legacyPageResult = await extensionMessage(cdp, panelSessionId, {
+      type: "EXECUTE_PAGE_ACTIONS",
+      targetTabId: firstTabId,
+      actions: [{
+        id: "legacy-page-two",
+        type: "click",
+        ref: legacyPageTwo.ref,
+        reason: "exercise a legacy javascript paginator without treating it as a document navigation"
+      }]
+    });
+    assert.equal(legacyPageResult.ok, true);
+    assert.equal(legacyPageResult.data.results[0].ok, true);
+    assert.equal(legacyPageResult.data.results[0].result.mayNavigate, false);
+    assert.equal(legacyPageResult.data.results[0].verification.changed, true);
+    const legacyPageContext = await extensionMessage(cdp, panelSessionId, {
+      type: "COLLECT_PAGE_CONTEXT",
+      targetTabId: firstTabId,
+      options: { maxTextChars: 8000, maxElements: 40, redactSensitiveData: true }
+    });
+    assert.match(legacyPageContext.data.visibleText, /Legacy page 2 loaded/);
 
     const limitedContext = await extensionMessage(cdp, panelSessionId, {
       type: "COLLECT_PAGE_CONTEXT",
@@ -1462,6 +1499,7 @@ async function startFixtureServer() {
       `<button type="button" aria-label="Dense grid cell ${index + 1}">${index + 1}</button>`
     )).join("");
     response.end(`<!doctype html><html><head><title>${second ? "Second" : "First"} tab</title><style>
+      body { overflow-y: scroll; }
       #interaction-lab { position: relative; width: 520px; height: 96px; margin-top: 12px; }
       #covered-action { position: absolute; inset: 0 auto auto 0; width: 130px; height: 34px; }
       #action-cover { position: absolute; inset: 0 auto auto 0; width: 130px; height: 34px; z-index: 2; background: white; pointer-events: none; }
@@ -1483,6 +1521,8 @@ async function startFixtureServer() {
       #nested-scroll-content { height: 280px; padding-top: 210px; box-sizing: border-box; }
       #visual-canvas { display: block; width: 240px; height: 80px; margin-top: 8px; }
       #advanced-structure-lab { position: fixed; right: 8px; bottom: 8px; z-index: 4; width: 270px; padding: 4px; background: white; }
+      #legacy-pagination { position: fixed; left: 300px; top: 82px; z-index: 5; width: 220px; padding: 4px; background: white; font: 12px sans-serif; }
+      #legacy-pagination ul { display: flex; gap: 8px; margin: 2px 0; padding: 0; list-style: none; }
       #hidden-cross-frame { display: none; }
       #covered-frame-shell { position: fixed; left: 300px; bottom: 8px; z-index: 3; width: 180px; height: 70px; }
       #covered-frame-shell iframe { position: absolute; inset: 0; margin: 0; }
@@ -1503,6 +1543,17 @@ async function startFixtureServer() {
         <div id="clipped-shell"><button id="clipped-action" type="button">Clipped action</button></div>
       </div>
       <div id="pointer-status" role="status">Pointer idle</div>
+      <div id="legacy-pagination">
+        <div>[1/5] [총 478건]</div>
+        <div class="pageSkip">
+          <ul>
+            <li><span>1</span></li>
+            <li><a href="javascript:legacySearch(2);">2</a></li>
+            <li><a href="javascript:legacySearch(3);">3</a></li>
+          </ul>
+        </div>
+        <div id="legacy-page-status" role="status">Legacy page 1 loaded</div>
+      </div>
       <div id="robustness-lab">
         <div id="display-contents-copy">Display contents direct visible fact</div>
         <svg id="svg-action" role="button" tabindex="0" aria-label="SVG action" viewBox="0 0 130 32">
@@ -1552,6 +1603,9 @@ async function startFixtureServer() {
       <script>
         const root = document.querySelector('#shadow-host').attachShadow({mode:'open'});
         root.innerHTML = '<label for="shadow-name">Shadow Name</label><input id="shadow-name">';
+        window.legacySearch = (page) => {
+          document.querySelector('#legacy-page-status').textContent = 'Legacy page ' + page + ' loaded';
+        };
         document.querySelector('#async').addEventListener('click', () => {
           setTimeout(() => { document.querySelector('#async-status').textContent = 'Async complete'; }, 180);
         });
@@ -1668,8 +1722,6 @@ async function exercisePanelContracts({ cdp, panelSessionId, tabId, context }) {
         activeTab: state.activeTab ? { ...state.activeTab } : null,
         lastContext: state.lastContext ? structuredClone(state.lastContext) : null,
         conversation: structuredClone(state.conversation),
-        pinnedGoal: state.pinnedGoal,
-        goalEditing: state.goalEditing,
         pickedElement: state.pickedElement ? structuredClone(state.pickedElement) : null,
         undoStack: structuredClone(state.undoStack),
         evaluationLogs: structuredClone(state.evaluationLogs),
@@ -1677,7 +1729,6 @@ async function exercisePanelContracts({ cdp, panelSessionId, tabId, context }) {
         externalApprovals: structuredClone(state.externalApprovals),
         selectedExternalOperationId: state.selectedExternalOperationId,
         utilityMenuOpen: elements.utilityMenu.open,
-        goalPopoverOpen: elements.goalPopover.open,
         templatePopoverOpen: elements.templatePopover.open
       };
       resetTabScopedState();
@@ -1774,17 +1825,13 @@ async function exercisePanelContracts({ cdp, panelSessionId, tabId, context }) {
             && composerRect.top >= 0
             && composerRect.bottom <= innerHeight + 1,
           composerInputSingleRow: Math.min(inputRect.bottom, sendRect.bottom) - Math.max(inputRect.top, sendRect.top) > 0,
-          goalPopoverClosed: !elements.goalPopover.open,
           templatePopoverClosed: !elements.templatePopover.open,
           externalPickerHidden: elements.externalApprovalPicker.hidden
         };
 
         const stressSnapshot = {
           statusText: elements.statusLine.textContent,
-          goalStateText: elements.goalState.textContent,
-          goalStateHidden: elements.goalState.hidden,
           utilityMenuOpen: elements.utilityMenu.open,
-          goalPopoverOpen: elements.goalPopover.open,
           templatePopoverOpen: elements.templatePopover.open
         };
         try {
@@ -1823,11 +1870,8 @@ async function exercisePanelContracts({ cdp, panelSessionId, tabId, context }) {
             clientWidth: element.clientWidth
           });
 
-          elements.statusLine.textContent = "목표가 이후 요청에 계속 적용됩니다. 화면 내용을 확인하고 완료 근거까지 남깁니다.";
-          elements.goalState.textContent = "적용 중";
-          elements.goalState.hidden = false;
+          elements.statusLine.textContent = "현재 요청의 범위를 고정하고 화면 내용을 확인해 완료 근거까지 남깁니다.";
           elements.utilityMenu.open = false;
-          elements.goalPopover.open = false;
           elements.templatePopover.open = false;
           await nextFrame();
 
@@ -1840,8 +1884,6 @@ async function exercisePanelContracts({ cdp, panelSessionId, tabId, context }) {
             ...topbarActions,
             chatInput: measureControl(elements.chatInput),
             sendButton: measureControl(elements.sendButton),
-            goalTrigger: measureControl(elements.goalPopover.querySelector(":scope > summary")),
-            goalState: measureControl(elements.goalState),
             templateTrigger: measureControl(elements.templatePopover.querySelector(":scope > summary"))
           };
           const containers = {
@@ -1851,17 +1893,6 @@ async function exercisePanelContracts({ cdp, panelSessionId, tabId, context }) {
             composerInputRow: measureContainer(document.querySelector(".composer-input-row"))
           };
 
-          elements.goalPopover.open = true;
-          await nextFrame();
-          const goalPanel = elements.goalPopover.querySelector(".composer-popover-panel");
-          controls.goalPanel = measureControl(goalPanel);
-          controls.goalInput = measureControl(elements.goalInput);
-          controls.pinGoalButton = measureControl(elements.pinGoalButton);
-          controls.clearGoalButton = measureControl(elements.clearGoalButton);
-          containers.goalPanel = measureContainer(goalPanel);
-          containers.goalControls = measureContainer(goalPanel.querySelector(".goal-controls"));
-
-          elements.goalPopover.open = false;
           elements.templatePopover.open = true;
           await nextFrame();
           const templatePanel = elements.templatePopover.querySelector(".composer-popover-panel");
@@ -1886,10 +1917,7 @@ async function exercisePanelContracts({ cdp, panelSessionId, tabId, context }) {
           };
         } finally {
           elements.statusLine.textContent = stressSnapshot.statusText;
-          elements.goalState.textContent = stressSnapshot.goalStateText;
-          elements.goalState.hidden = stressSnapshot.goalStateHidden;
           elements.utilityMenu.open = stressSnapshot.utilityMenuOpen;
-          elements.goalPopover.open = stressSnapshot.goalPopoverOpen;
           elements.templatePopover.open = stressSnapshot.templatePopoverOpen;
           await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
         }
@@ -2086,29 +2114,7 @@ async function exercisePanelContracts({ cdp, panelSessionId, tabId, context }) {
           mcpField: elements.siteInputs.mcpEnabled.value
         };
 
-        resetTabScopedState();
-        state.activeTab = { id: ${JSON.stringify(testTabIds[0])}, title: "Goal tab A", url: ${JSON.stringify(testUrl)} };
-        elements.goalInput.value = "화면 상태를 확인하고 근거를 남기기";
-        elements.goalPopover.open = true;
-        pinGoalFromInput();
-        const popoverClosedAfterPin = !elements.goalPopover.open;
-        await persistCurrentSession();
-        await sessionWriteQueue;
-        resetTabScopedState();
-        state.activeTab = { id: ${JSON.stringify(testTabIds[0])}, title: "Goal tab A", url: ${JSON.stringify(testUrl)} };
-        await restoreConversationForActiveTab();
-        const restored = state.pinnedGoal;
-        const readOnly = elements.goalInput.readOnly;
-        state.conversation = [{ role: "user", text: "대화만 비우기 검증" }];
-        clearConversation();
-        await sessionWriteQueue;
-        const retainedAfterClear = state.pinnedGoal;
-        resetTabScopedState();
-        state.activeTab = { id: ${JSON.stringify(testTabIds[1])}, title: "Goal tab B", url: ${JSON.stringify(testUrl)} };
-        await restoreConversationForActiveTab();
-        const otherTabGoal = state.pinnedGoal;
-        const goal = { restored, readOnly, otherTabGoal, retainedAfterClear, popoverClosedAfterPin };
-        return { template, site, goal };
+        return { template, site };
     })()`);
 
     return { layouts, approvalModes, ...functional };
@@ -2128,8 +2134,6 @@ async function exercisePanelContracts({ cdp, panelSessionId, tabId, context }) {
         state.activeTab = original.activeTab;
         state.lastContext = original.lastContext;
         state.conversation = original.conversation;
-        state.pinnedGoal = original.pinnedGoal;
-        state.goalEditing = original.goalEditing;
         state.pickedElement = original.pickedElement;
         state.undoStack = original.undoStack;
         state.evaluationLogs = original.evaluationLogs;
@@ -2140,16 +2144,13 @@ async function exercisePanelContracts({ cdp, panelSessionId, tabId, context }) {
         for (const message of state.conversation) {
           appendChatMessage(message.role, message.text, { tone: message.tone || "", record: false });
         }
-        elements.goalInput.value = state.pinnedGoal;
         elements.chatInput.value = "";
         renderTemplateSelect();
         hideApprovalPanel();
         renderExternalApprovalPanel();
-        updateGoalUi();
         updatePickedElementBadge();
         updateAgentButtons();
         elements.utilityMenu.open = original.utilityMenuOpen;
-        elements.goalPopover.open = original.goalPopoverOpen;
         elements.templatePopover.open = original.templatePopoverOpen;
         delete globalThis.__panelContractSnapshot;
         delete globalThis.__panelContractDecision;
@@ -3271,7 +3272,6 @@ async function captureTemplateManagerDocs(cdp, panelSessionId) {
     elements.statusLine.textContent = "선택한 템플릿 편집 중";
     hideRestrictedPage();
     closeUtilityMenu();
-    elements.goalPopover.open = false;
     renderTemplateSelect("custom-release-check");
     elements.templatePopover.open = true;
     await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));

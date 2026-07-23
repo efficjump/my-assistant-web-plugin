@@ -133,6 +133,8 @@ Element refs remain observation-scoped. A refreshed snapshot or element window c
 
 The extension evaluates this against currently exposed controls without sending the unfiltered control list back to the caller. It searches accessible names, semantic roles, tags, input types, placeholders, titles, ARIA descriptions, names, test identifiers, and bounded context from the nearest visible cell, row, collection, form, dialog, or region. Each returned control includes `searchMatch` with its score, matched fields, and a redacted context snippet so the caller can check why it was retrieved.
 
+When both `query` and `near_text` are supplied, the query must match the control's own identity and the nearby text must match its bounded context. Older pagination markup without semantic containers can contribute a small, complete ancestor group, but large ancestor text is rejected. For example, `{ "query": "2", "roles": ["link"], "near_text": "[1/5] [총 484건]" }` returns the literal page link instead of links whose table rows merely contain dates.
+
 `page.elementDiscovery.search` reports the normalized `query`, `roles`, and `nearText`, along with returned and visited counts, matching `total`, unfiltered `availableTotal`, `hasMore`, and an opaque `nextCursor`. The cursor is bound to the complete search filter, document IDs, DOM revisions, frame visibility, viewport position, and the ranked visible-control digest. If any of those change, the runtime discards the old offsets and returns a first window with `cursorReset: true`. A client must not treat the configured element-window size as an accessibility boundary or ask the user to click until relevant searches and visible windows have been exhausted.
 
 Visible same-origin and permission-granted cross-origin frames can appear with frame-scoped refs. The extension merges their candidates into one visually ordered window, routes actions to the bound child document, and rejects stale frame identities. Hidden or ambiguously mapped frame contents are withheld.
@@ -156,6 +158,25 @@ The extension re-observes the document and compares target fingerprints immediat
 A rejection or execution failure is terminal for the current guided task. `browser_continue` returns that same terminal result with an instruction to call `browser_end`; it does not turn the error into a fresh action opportunity. This prevents a later natural-language message from being merged into the failed task and replaying a relative action such as “next page.”
 
 The same approval behavior applies to `browser_visual_act`. The approval describes the visible target rather than trusting caller-provided coordinates, because the caller is not allowed to provide them.
+
+## Disposable live-page compatibility harness
+
+For a public-page regression outside the synthetic E2E fixture:
+
+```bash
+npm run test:live-bridge -- "https://dart.fss.or.kr/dsac001/mainAll.do"
+```
+
+The harness creates a temporary extension copy with permission only for the supplied origin, an isolated headless browser profile, a local companion, one shared target tab, and a protected temporary `mcp-client.json`. Use the printed configuration in an MCP test client and run the same guided tools described above.
+
+The harness reads four standard-input commands:
+
+- `status` prints the oldest pending proposal's action types, reasons, and bound target labels.
+- `approve` executes that reviewed proposal through the extension.
+- `reject` rejects it.
+- `quit` terminates Chrome and the companion and removes the temporary profile and client token.
+
+The disposable profile turns off the independent model policy request and the blanket approval setting so compatibility failures can be isolated. Deterministic rules still block sensitive input and still require review for consequential links, navigation, submission, uploads, visual actions, and similar effects. Use this harness only with public pages; it is not a shortcut for a signed-in browser session or the production approval UI.
 
 ## Advanced identifier-based workflow
 

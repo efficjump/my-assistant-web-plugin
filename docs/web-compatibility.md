@@ -13,6 +13,8 @@ The extension combines DOM evidence with screenshot evidence instead of assuming
 | Same-origin iframe | Visible child frame is observed separately | Action is routed to the child frame | Child document ID and composed top-viewport geometry |
 | Cross-origin iframe | Available after its visible origin is granted | Action is routed to the granted child frame | One fully exposed iframe boundary must map to exactly one browser frame |
 | Nested scroll container | Visible region and current scroll range | Targeted `scroll` action | Newly revealed content is not described until the next observation |
+| `html` or `body` document scroller | Descendants are clipped to the visual viewport | Normal viewport scroll and ref-based actions | The shifted root box is not applied as a second clipping rectangle |
+| Legacy `javascript:` or AJAX link | Visible link and declared page-owned handler | Exact selector and `href` are rebound in the page's main execution world | Approval, fresh target validation, and an observable post-action fingerprint change |
 | Canvas or `role="application"` surface | Surface bounds plus current screenshot | Internal `visual_click`, or Bridge `browser_visual_act` with no caller coordinates | Screenshot binding, extension-owned normalized point, approval, fresh observation, independent LLM verification |
 
 Hidden, clipped, or covered frames are not merged merely because their scripts can be injected. The parent frame checks the complete iframe box for viewport clipping and occlusion before accepting a child observation. If multiple frames use the same navigation URL and the runtime cannot prove which fully exposed iframe owns which document, their contents are withheld and reported as `frame_visibility_unverified`. This is deliberately conservative: missing evidence is preferable to presenting hidden DOM as visible page content.
@@ -27,11 +29,11 @@ When the first window does not contain the required ref, the built-in planner ca
 {
   "query": "next page",
   "roles": ["button"],
-  "nearText": "issue grid"
+  "near_text": "issue grid"
 }
 ```
 
-The content script builds a bounded local search record for each exposed control. Identity fields include accessible name, semantic role, tag, input type, placeholder, title, ARIA description, name, and common test identifiers. Context fields come from generic semantic ancestors such as the nearest cell, row, table/grid/list collection, form, dialog, group, region, and nearby heading. Query and context matches are scored locally; only matching full control descriptors and their fresh refs are returned. `searchMatch` explains the matched fields and includes a short redacted context snippet. No site name, framework, symbol, or selector is embedded in the retrieval logic.
+The content script builds a bounded local search record for each exposed control. Identity fields include accessible name, semantic role, tag, input type, placeholder, title, ARIA description, name, and common test identifiers. Context fields come from generic semantic ancestors such as the nearest cell, row, table/grid/list collection, form, dialog, group, region, and nearby heading. When an older page has none of those semantics, complete nearby ancestor groups of at most 520 normalized characters are considered; larger groups are discarded rather than partially sampled. With `near_text`, the main query must match control identity while the nearby text is scored against context, so a query such as page `2` does not match every link merely because the surrounding table contains dates. Only matching full control descriptors and their fresh refs are returned. `searchMatch` explains the matched fields and includes the best redacted context snippet. No site name, framework, symbol, or selector is embedded in the retrieval logic.
 
 The built-in planner may try a bounded number of distinct searches in the same agent turn. A repeated or empty search falls back to a remaining cursor rather than looping. If a targeted search returns no result, the runtime can resume the original unfiltered cursor. Scrolling remains necessary for virtualized or offscreen content because retrieval deliberately stays inside the current visual viewport.
 
@@ -54,6 +56,16 @@ Normal DOM refs remain the first choice. A visual action is eligible only when a
 Any missing screenshot, changed geometry, replaced frame document, occluded point, uncertain verifier response, or model/API failure stops the action. The runtime replans from fresh evidence instead of replaying the coordinate.
 
 The authenticated external MCP bridge still does not accept raw `visual_click` actions. Instead, `browser_visual_act` lets the caller provide only a current surface ref and a precise target description. The extension captures and binds the screenshot, obtains and verifies the normalized point with the configured model, applies policy and approval, then resolves and verifies the target again against a fresh screenshot immediately before execution. Coordinates, screenshot tokens, policy results, and approval claims never cross the public input boundary.
+
+## Live legacy-page validation
+
+On 2026-07-23 the public [DART recent-disclosure list](https://dart.fss.or.kr/dsac001/mainAll.do) provided a combined compatibility case: hundreds of live table records, continuous updates, `body { overflow-y: scroll }`, numeric AJAX pagination implemented with `javascript:search(page)`, and a framed report viewer.
+
+The initial run exposed two concrete failures. Treating the shifted `body` rectangle as an ordinary overflow ancestor removed table rows that were visibly painted after scrolling. After that was corrected, the isolated content-script world could dispatch pointer events to page `2` but could not reliably resolve the page-owned `search` function; the action was incorrectly described as navigation even though `[1/5]` remained visible.
+
+The current path clips the document root only once against the viewport. It also identifies `javascript:` anchors generically, binds the exact observed selector and declared `href`, activates that already-approved link in the page's main world, and asks the content layer to compare the post-action fingerprint. No observable change becomes a failed action rather than a success. In the final live run, structured retrieval returned the `2` link first with `[1/5] [총 484건]` as its evidence, execution changed the fingerprint, the next observation showed `[2/5]`, and the first page-2 disclosure opened in the same shared tab.
+
+![DART report detail opened after verified legacy pagination](assets/dart-legacy-agent-loop.jpg)
 
 ## Permission behavior
 
@@ -101,6 +113,8 @@ The real-browser E2E fixture checks that:
 - a hidden cross-origin frame is absent from visible text and actions;
 - child-frame rectangles are transformed into top-viewport coordinates;
 - a nested scroll region reveals a previously clipped control only after scrolling and re-observation;
+- a `body` root scroller does not double-clip descendants after viewport scrolling;
+- a numeric legacy paginator is retrieved from bounded nearby context and its page-owned `javascript:` handler must produce an observable state change;
 - a 121st dense-grid control is found through both opaque cursor paging and structured query/role/nearby-context retrieval without a user handoff;
 - search results expose their matched context, multi-window search cursors preserve the complete filter, and a mismatched role invalidates the cursor;
 - changing the DOM invalidates an old element cursor and safely restarts discovery;

@@ -153,9 +153,9 @@ A toolbar popup is technically possible, but Chrome closes it as soon as focus m
 
 The panel keeps only the current page, element picker, settings, and request composer visible. Less frequent actions such as context inspection, undo, export, and clearing the conversation are under **더보기**. Manual context refresh is available inside the context dialog, where it is relevant, rather than as a duplicate toolbar action. The layout has no fixed desktop minimum width, so browser zoom and narrow side panels keep the primary actions and send control inside the viewport; long page and status labels use an ellipsis while their full text remains available as a tooltip.
 
-**Task goal** is persistent guidance for the current tab and URL, not a command that starts work. Open **목표** above the composer, enter the scope or completion criteria that should carry across several messages, select **고정**, and then send individual requests. A pinned goal becomes read-only until **수정** is selected. Clearing the conversation keeps the pinned goal; **해제** removes it. The latest message still takes priority when it narrows or updates the goal.
-
 **Templates** are reusable request text, not an automatic workflow. Open **템플릿** above the composer to create a template or select an existing one, then edit its title and request text directly. **변경 저장** updates the selected item instead of creating a duplicate. Personal-template deletion and built-in-template restoration both use a two-step confirmation. **현재 입력 가져오기** copies the composer draft into the editor without saving it, and **입력창에 넣기** preserves the existing draft while inserting the edited template at the current cursor or selection.
+
+Each submitted message becomes one immutable agent objective. A complete new request does not inherit unfinished effects from an earlier failed run, while an explicit continuation can reuse only the prior context needed to finish that named task. Reusable instructions belong in **템플릿**, where they remain visible and editable before being inserted into the composer; there is no hidden persistent goal that can silently broaden a later message. The Bridge still retains the explicit `goal` passed to `browser_begin` for the lifetime of that one external browser task because it is the execution and repetition boundary, not cross-message memory.
 
 ![Template editor with a selected personal template](docs/assets/template-manager.png)
 
@@ -294,7 +294,37 @@ The extension searches accessible names, roles, tags, input types, placeholders,
 
 When `hasMore` is true, continue the returned opaque `nextCursor` with the same search. The cursor is bound to the query, role and context filters, document and frame identities, DOM revisions, viewport, and ranked result digest. If page state changes, it resets instead of silently rebinding a ref. A target outside the viewport still requires scrolling and a fresh observation.
 
+Short labels on older pages can be disambiguated with nearby text. For example, a numeric page link can be requested as:
+
+```json
+{
+  "query": "2",
+  "roles": ["link"],
+  "near_text": "[1/5] [총 484건]"
+}
+```
+
+When `near_text` is present, `query` is matched against the control itself while the nearby filter is matched against bounded local context. This prevents dates and unrelated table rows from outranking a literal page-number link. Pages without semantic `nav`, table, form, or ARIA containers can still contribute a small complete ancestor group; large ancestors are rejected instead of being truncated into misleading context.
+
 For a canvas or application surface with no DOM ref, use `browser_visual_act` with a current surface ref and precise visible description. Do not send coordinates. The extension's configured model locates the point, an independent verifier checks the same screenshot evidence, and approval-time re-observation repeats the resolution before execution.
+
+### Legacy Korean page validation
+
+The live Bridge path was exercised on 2026-07-23 against [DART 최근공시](https://dart.fss.or.kr/dsac001/mainAll.do), a Korean public site with a large server-rendered table, a `body` document scroller, an AJAX paginator exposed as `javascript:search(2)`, continuous list updates, and a framed disclosure viewer. At the validation moment the list contained 484 disclosures across five pages.
+
+The complete run observed page 1, reached the paginator through viewport-scoped scrolling, found the literal `2` link with the structured query above, obtained deterministic approval, and executed the page-owned legacy handler. The operation reported `activation: "page-owned-legacy-handler"` only after the visible state fingerprint changed. A fresh observation showed `[2/5]`; the run then opened the first page-2 report in the same shared tab and verified the viewer title `알이씨데이터센터/특수관계인에대한담보제공`. These values are live evidence, not selectors or expected answers embedded in the extension.
+
+![DART disclosure viewer reached through the live Bridge agent loop](docs/assets/dart-legacy-agent-loop.jpg)
+
+For repeatable work on another public page, start the disposable developer harness:
+
+```bash
+npm run test:live-bridge -- "https://dart.fss.or.kr/dsac001/mainAll.do"
+```
+
+It copies the current unpacked extension into a temporary directory, grants only the supplied page origin to that copy, launches an isolated headless browser profile, connects and shares the target tab, and prints a temporary authenticated `mcp-client.json` path. Point a development MCP client at that file, then drive the normal `browser_begin` → `browser_elements`/`browser_act` → `browser_continue` → `browser_end` loop. The harness accepts `status`, `approve`, `reject`, and `quit` on standard input; `status` prints the pending action and bound target so it can be reviewed before `approve`.
+
+This command is for public, disposable compatibility testing only. Its temporary profile disables the independent model policy request so runtime behavior can be isolated, but deterministic sensitive and consequential-action checks still apply. `quit` terminates the browser and companion and deletes the temporary profile and bearer-token file. Do not use the harness for a signed-in or private page.
 
 ### Approval behavior
 

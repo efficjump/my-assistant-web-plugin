@@ -1,15 +1,16 @@
 {
   "name": "my-assistant-web-plugin",
-  "version": "0.9.1",
+  "version": "0.9.2",
   "private": true,
   "license": "UNLICENSED",
   "description": "A verifiable AI browser agent for Chrome and Edge.",
   "scripts": {
-    "check": "node --check agent-core.js && node --check execution-contract.js && node --check bridge-protocol.js && node --check external-control-runtime.js && node --check background.js && node --check content.js && node --check panel.js && node --check bridge/server.mjs && node --check bridge/state.mjs",
+    "check": "node --check agent-core.js && node --check execution-contract.js && node --check bridge-protocol.js && node --check external-control-runtime.js && node --check background.js && node --check content.js && node --check panel.js && node --check bridge/server.mjs && node --check bridge/state.mjs && node --check tests/live-bridge-host.mjs",
     "test": "node --test tests/*.test.js",
     "test:bridge": "node --test tests/bridge-companion.test.mjs",
     "test:e2e": "node tests/extension-e2e.mjs",
     "test:e2e:local-harness": "node tests/extension-e2e.mjs --local-harness",
+    "test:live-bridge": "node tests/live-bridge-host.mjs",
     "capture:docs": "node tests/extension-e2e.mjs --capture-docs",
     "serve:test": "node tests/serve-harness.js",
     "bridge": "node bridge/server.mjs",
