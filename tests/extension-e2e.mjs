@@ -341,6 +341,42 @@ try {
       screenshotField: "off",
       mcpField: "inherit"
     });
+    assert.deepEqual(panelContracts.locale, {
+      english: {
+        lang: "en",
+        preference: "en",
+        storedPreference: "en",
+        settingsTitle: "Settings",
+        generalTab: "General",
+        composerPlaceholder: "What would you like to do?",
+        builtInTemplateTitle: "Summarize page",
+        builtInTemplatePrompt: "Summarize the key points of the current page in a structured way.",
+        personalTemplateTitle: "설정",
+        personalTemplatePrompt: "완료",
+        personalTemplateOption: "설정",
+        runtimeStatus: "Turn 3 · observing page",
+        contextStatus: "Reading the current page.",
+        timelineTitle: "Task flow",
+        timelinePhase: "Page observation",
+        timelineDetail: "Turn 3 · observing page",
+        timelineTaskPreserved: true,
+        pageTitlePreserved: true,
+        userMessage: "이전 대화 1: 승인 화면에서도 확인해야 하는 내용입니다.",
+        systemMessage: "Settings saved.",
+        composerValuePreserved: true
+      },
+      korean: {
+        lang: "ko",
+        settingsTitle: "설정",
+        systemMessage: "설정이 저장되었습니다.",
+        builtInTemplateTitle: "페이지 요약",
+        runtimeStatus: "3번째 턴 · 화면 관찰 중",
+        contextStatus: "현재 화면을 읽는 중입니다.",
+        timelineTitle: "작업 흐름",
+        timelinePhase: "화면 관찰",
+        timelineDetail: "3번째 턴 화면 관찰 중"
+      }
+    });
     if (process.argv.includes("--capture-docs")) {
       await captureAgentPanelDocs(cdp, panelSessionId);
       await captureSettingsOverviewDocs(cdp, panelSessionId);
@@ -1728,9 +1764,14 @@ async function exercisePanelContracts({ cdp, panelSessionId, tabId, context }) {
         currentPlan: state.currentPlan,
         externalApprovals: structuredClone(state.externalApprovals),
         selectedExternalOperationId: state.selectedExternalOperationId,
+        statusText: elements.statusLine.textContent,
+        contextStatus: elements.contextStatus.textContent,
         utilityMenuOpen: elements.utilityMenu.open,
         templatePopoverOpen: elements.templatePopover.open
       };
+      state.settings = { ...state.settings, uiLanguage: "ko" };
+      applySettingsToForm();
+      applyUiLanguage();
       resetTabScopedState();
       applyActiveTabSummary({
         id: ${JSON.stringify(tabId)},
@@ -2114,7 +2155,63 @@ async function exercisePanelContracts({ cdp, panelSessionId, tabId, context }) {
           mcpField: elements.siteInputs.mcpEnabled.value
         };
 
-        return { template, site };
+        const localeInputBefore = elements.chatInput.value;
+        const pageTitleBefore = elements.pageTitle.textContent;
+        state.settings.taskTemplates = [{
+          id: "custom-language-source",
+          title: "설정",
+          prompt: "완료"
+        }];
+        renderTemplateSelect("custom-language-source");
+        startRunTimeline("사용자 작업 원문");
+        updateRunTimeline("observe", "active", "3번째 턴 화면 관찰 중");
+        elements.inputs.uiLanguage.value = "en";
+        await saveSettingsFromForm({ quiet: true });
+        appendChatMessage("system", "설정이 저장되었습니다.", { record: false });
+        setStatusLine("3번째 턴 · 화면 관찰 중");
+        elements.contextStatus.textContent = "현재 화면을 읽는 중입니다.";
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        const englishLocale = {
+          lang: document.documentElement.lang,
+          preference: state.settings.uiLanguage,
+          storedPreference: (await chrome.storage.local.get("settings")).settings?.uiLanguage,
+          settingsTitle: document.getElementById("settingsTitle").textContent,
+          generalTab: document.getElementById("generalTab").textContent,
+          composerPlaceholder: elements.chatInput.placeholder,
+          builtInTemplateTitle: getTaskTemplates().find((item) => item.id === "summarize-page")?.title,
+          builtInTemplatePrompt: getTaskTemplates().find((item) => item.id === "summarize-page")?.prompt,
+          personalTemplateTitle: getSelectedTaskTemplate()?.title,
+          personalTemplatePrompt: getSelectedTaskTemplate()?.prompt,
+          personalTemplateOption: elements.templateSelect.selectedOptions[0]?.textContent,
+          runtimeStatus: elements.statusLine.textContent,
+          contextStatus: elements.contextStatus.textContent,
+          timelineTitle: state.agentRunUi.title.textContent,
+          timelinePhase: state.agentRunUi.phaseElements.observe.name.textContent,
+          timelineDetail: state.agentRunUi.phaseElements.observe.detail.textContent,
+          timelineTaskPreserved: state.agentRunUi.article.querySelector(".activity-summary")?.textContent === "사용자 작업 원문",
+          pageTitlePreserved: elements.pageTitle.textContent === pageTitleBefore,
+          userMessage: elements.messageList.querySelector(".message.user .message-text")?.textContent,
+          systemMessage: elements.messageList.querySelector(".message.system:last-child .message-text")?.textContent,
+          composerValuePreserved: elements.chatInput.value === localeInputBefore
+        };
+
+        elements.inputs.uiLanguage.value = "ko";
+        await saveSettingsFromForm({ quiet: true });
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        const koreanLocale = {
+          lang: document.documentElement.lang,
+          settingsTitle: document.getElementById("settingsTitle").textContent,
+          systemMessage: elements.messageList.querySelector(".message.system:last-child .message-text")?.textContent,
+          builtInTemplateTitle: getTaskTemplates().find((item) => item.id === "summarize-page")?.title,
+          runtimeStatus: elements.statusLine.textContent,
+          contextStatus: elements.contextStatus.textContent,
+          timelineTitle: state.agentRunUi.title.textContent,
+          timelinePhase: state.agentRunUi.phaseElements.observe.name.textContent,
+          timelineDetail: state.agentRunUi.phaseElements.observe.detail.textContent
+        };
+        const locale = { english: englishLocale, korean: koreanLocale };
+
+        return { template, site, locale };
     })()`);
 
     return { layouts, approvalModes, ...functional };
@@ -2138,9 +2235,13 @@ async function exercisePanelContracts({ cdp, panelSessionId, tabId, context }) {
         state.undoStack = original.undoStack;
         state.evaluationLogs = original.evaluationLogs;
         state.currentPlan = original.currentPlan;
+        state.agentRunUi = null;
         state.externalApprovals = original.externalApprovals;
         state.selectedExternalOperationId = original.selectedExternalOperationId;
-        elements.messageList.replaceChildren();
+        applySettingsToForm();
+        applyUiLanguage();
+        await persistSettings();
+        clearRenderedChatMessages();
         for (const message of state.conversation) {
           appendChatMessage(message.role, message.text, { tone: message.tone || "", record: false });
         }
@@ -2150,6 +2251,8 @@ async function exercisePanelContracts({ cdp, panelSessionId, tabId, context }) {
         renderExternalApprovalPanel();
         updatePickedElementBadge();
         updateAgentButtons();
+        setStatusLine(original.statusText);
+        elements.contextStatus.textContent = original.contextStatus;
         elements.utilityMenu.open = original.utilityMenuOpen;
         elements.templatePopover.open = original.templatePopoverOpen;
         delete globalThis.__panelContractSnapshot;
@@ -3379,6 +3482,7 @@ async function captureSettingsOverviewDocs(cdp, panelSessionId) {
     };
     state.settings = {
       ...state.settings,
+      uiLanguage: "ko",
       panelOpenMode: "side-panel",
       apiProfile: "custom-json",
       model: "local-instruct-model",
@@ -3390,6 +3494,7 @@ async function captureSettingsOverviewDocs(cdp, panelSessionId) {
     };
     state.runtimeSettings = { ...state.settings };
     applySettingsToForm();
+    applyUiLanguage();
     openSettings();
     activateSettingsTab("general");
     setSettingsStatus("모든 변경 내용이 저장되었습니다.");
@@ -3400,6 +3505,17 @@ async function captureSettingsOverviewDocs(cdp, panelSessionId) {
   })()`);
   try {
     await capturePanelScreenshot(cdp, panelSessionId, "settings-overview.png");
+    await evaluate(cdp, panelSessionId, `(async () => {
+      state.settings = { ...state.settings, uiLanguage: "en" };
+      state.runtimeSettings = { ...state.runtimeSettings, uiLanguage: "en" };
+      applySettingsToForm();
+      applyUiLanguage();
+      renderSettingsOverview();
+      document.querySelector(".settings-body")?.scrollTo({ top: 0 });
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      return true;
+    })()`);
+    await capturePanelScreenshot(cdp, panelSessionId, "language-settings-en.png");
   } finally {
     await evaluate(cdp, panelSessionId, `(() => {
       const snapshot = globalThis.__settingsCaptureSnapshot;
@@ -3407,6 +3523,7 @@ async function captureSettingsOverviewDocs(cdp, panelSessionId) {
       state.runtimeSettings = snapshot.runtimeSettings;
       state.panelPresentation = snapshot.panelPresentation;
       applySettingsToForm();
+      applyUiLanguage();
       activateSettingsTab(snapshot.activeTab);
       elements.settingsModal.hidden = snapshot.modalHidden;
       document.body.classList.toggle("settings-open", !snapshot.modalHidden);

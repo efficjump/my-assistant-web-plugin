@@ -4,7 +4,7 @@ A Manifest V3 browser extension that turns a configured language model into a bo
 
 ![Agent side panel](docs/assets/agent-panel.png)
 
-Version `0.9.1` with Bridge protocol `2.3` targets Chromium-based browsers version 116 or later. This repository contains a source-loaded development build rather than a store package. The screenshots in this README were regenerated from the current version with a temporary browser profile and local fixtures.
+Version `0.9.3` with Bridge protocol `2.3` targets Chromium-based browsers version 116 or later. This repository contains a source-loaded development build rather than a store package. The screenshots in this README were regenerated from the current version with a temporary browser profile and local fixtures.
 
 ## Choose the workflow
 
@@ -59,6 +59,7 @@ Completion is not accepted from model prose alone. Before any page effect, the r
 - Records privacy-preserving AI request audit metadata
 - Treats an HTTP success with no usable output as an explicit failure
 - Repairs malformed structured decisions without exposing model JSON or internal validation details in the conversation
+- Switches the extension-owned interface between browser-detected language, Korean, and English without a reload
 
 The **Context** inspector shows what the current browser observation actually contains: visible text and controls, mapped frames, nested scroll regions, visual surfaces, automation constraints, selection, and recent logs. It is useful for distinguishing a model-planning problem from a browser-permission or page-structure boundary.
 
@@ -140,6 +141,18 @@ Write a numeric count or an observable stopping condition when an action genuine
 The settings dialog starts with a live overview of the model, automation mode, external integrations, and workspace placement. Fields continue to save automatically, and the header reports completed saves or validation errors without requiring a separate global save button.
 
 ![Settings overview and workspace placement](docs/assets/settings-overview.png)
+
+### Display language
+
+Open **Settings → General → Display language** (`설정 → 일반 → 표시 언어`) and choose:
+
+- **Browser language** to use Korean when the browser's first preferred language is Korean and English otherwise
+- **Korean** to keep the interface in Korean regardless of the browser language
+- **English** to keep the interface in English regardless of the browser language
+
+The selection is saved with the other extension settings and applies immediately to the panel, settings, approval controls, runtime status messages, and built-in task templates. Reloading the extension or target page is not required. Switching the display language does not translate user input, saved personal templates, page titles or content, or model-generated answers; those values remain byte-for-byte user or source content. The model's response language is controlled separately by the request and system instruction.
+
+![English display language selected in the settings overview](docs/assets/language-settings-en.png)
 
 The browser action is not limited to a right-side panel:
 
@@ -367,7 +380,7 @@ Never put the token in the URL or commit it to the repository. The exact HTTP tr
 | A ref or proposal becomes `stale` | Refresh with `browser_continue` and plan from the latest refs. |
 | A response is `failed`, `blocked`, `rejected`, `cancelled`, or `unknown_after_restart` | Call `browser_end`; do not send another action in that task. Start a new complete goal if the user wants to proceed. |
 | The same action is stopped after it already succeeded | The resolved intent reached its repetition boundary. End the task and state an explicit count or stopping condition in a new goal if more repetitions are required. |
-| Raw JSON or an internal decision-contract error appears | Reload the extension after updating to `0.9.1` or later. The current runtime keeps malformed decision payloads and validation details in diagnostics and shows only a concise user-facing error. |
+| Raw JSON or an internal decision-contract error appears | Reload the extension after updating to `0.9.3` or later. The current runtime keeps malformed decision payloads and validation details in diagnostics and shows only a concise user-facing error. |
 | A visible control is missing | Use a focused `browser_elements` query and its cursor; scroll and re-observe if the target is outside the viewport. |
 | Canvas target has no ref | Use `browser_visual_act` with the current visual-surface ref and description; screenshot input must be enabled and supported by the configured model. |
 | `uv_spawn`, `ENOENT`, or a stop-hook spawn error appears | This normally comes from the development tool's local hook process, not from the Bridge protocol. Check that hook's executable and `PATH`, or disable the broken hook; verify the Bridge separately from the extension's connected/shared indicators and actual MCP call log. |

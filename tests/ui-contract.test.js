@@ -24,6 +24,19 @@ test("every panel DOM binding exists in the HTML", () => {
 test("agent core loads before the panel controller", () => {
   const html = fs.readFileSync(path.join(root, "panel.html"), "utf8");
   assert.ok(html.indexOf('src="agent-core.js"') < html.indexOf('src="panel.js"'));
+  assert.ok(html.indexOf('src="ui-locales.js"') < html.indexOf('src="panel.js"'));
+});
+
+test("display language is a persisted immediate setting", () => {
+  const html = fs.readFileSync(path.join(root, "panel.html"), "utf8");
+  const script = fs.readFileSync(path.join(root, "panel.js"), "utf8");
+  const select = readOpeningTag(html, "select", "uiLanguageInput");
+
+  assert.ok(select);
+  assert.match(html, /id="uiLanguageInput"[\s\S]*value="auto"[\s\S]*value="ko"[\s\S]*value="en"/);
+  assert.match(script, /uiLanguage:\s*"auto"/);
+  assert.match(script, /UiI18n\.normalizePreference\(elements\.inputs\.uiLanguage\.value\)/);
+  assert.match(script, /UiI18n\.applyDocument\(document,\s*state\.settings\.uiLanguage\)/);
 });
 
 test("the design does not use a left accent bar", () => {

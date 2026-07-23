@@ -6,9 +6,14 @@ const ExecutionContract = globalThis.WebExecutionContract;
 if (!ExecutionContract) {
   throw new Error("Execution contract failed to load.");
 }
+const UiI18n = globalThis.WebUiI18n;
+if (!UiI18n) {
+  throw new Error("UI locales failed to load.");
+}
 
 const DEFAULT_SETTINGS = {
   panelOpenMode: "side-panel",
+  uiLanguage: "auto",
   apiProfile: "openai-responses",
   apiEndpoint: "",
   model: "",
@@ -82,6 +87,7 @@ const MAX_SAVED_SESSIONS = 20;
 const MAX_UNDO_ITEMS = 20;
 let sessionWriteQueue = Promise.resolve();
 let activeTabTransitionQueue = Promise.resolve();
+const localizedChatMessages = new Map();
 const TIMELINE_PHASES = [
   ["observe", "화면 관찰"],
   ["think", "AI 판단"],
@@ -94,6 +100,7 @@ const TIMELINE_PHASES = [
 const state = {
   settings: { ...DEFAULT_SETTINGS },
   runtimeSettings: { ...DEFAULT_SETTINGS },
+  uiLocale: "ko",
   panelPresentation: {
     isTab: false,
     sidePanelSupported: false,
@@ -249,6 +256,7 @@ const elements = {
   downloadCsvButton: document.getElementById("downloadCsvButton"),
   inputs: {
     panelOpenMode: document.getElementById("panelOpenModeInput"),
+    uiLanguage: document.getElementById("uiLanguageInput"),
     apiProfile: document.getElementById("apiProfileInput"),
     apiEndpoint: document.getElementById("apiEndpointInput"),
     model: document.getElementById("modelInput"),
@@ -311,6 +319,7 @@ async function initialize() {
   bindEvents();
   await loadSettings();
   applySettingsToForm();
+  applyUiLanguage();
   await refreshPanelPresentation();
   updateCustomVisibility();
   renderSettingsOverview();
@@ -926,7 +935,7 @@ function resetTabScopedState() {
   state.pickedElement = null;
   state.undoStack = [];
   state.evaluationLogs = [];
-  elements.messageList.replaceChildren();
+  clearRenderedChatMessages();
   hideApprovalPanel();
   updatePickedElementBadge();
   updateAgentButtons();
@@ -997,29 +1006,39 @@ function getTaskTemplates() {
   const customTemplates = savedTemplates
     .filter((template) => !DEFAULT_TASK_TEMPLATE_IDS.has(template.id))
     .map((template) => ({ ...template, builtIn: false, customized: true }));
-  return [...builtInTemplates, ...customTemplates];
+  return [...builtInTemplates, ...customTemplates].map((template) => (
+    template.builtIn && !template.customized
+      ? {
+          ...template,
+          title: localizeUiText(template.title),
+          prompt: localizeUiText(template.prompt)
+        }
+      : template
+  ));
 }
 
-function renderTemplateSelect(preferredId = elements.templateSelect.value) {
+function renderTemplateSelect(preferredId = elements.templateSelect.value, options = {}) {
   const selectedId = String(preferredId || "");
   const templates = getTaskTemplates();
   elements.templateSelect.replaceChildren();
 
   const placeholder = document.createElement("option");
   placeholder.value = "";
-  placeholder.textContent = "새 템플릿 만들기";
+  placeholder.textContent = localizeUiText("새 템플릿 만들기");
+  placeholder.dataset.i18nIgnore = "true";
   elements.templateSelect.append(placeholder);
 
   const builtInGroup = document.createElement("optgroup");
-  builtInGroup.label = "기본 템플릿";
+  builtInGroup.label = localizeUiText("기본 템플릿");
   const customGroup = document.createElement("optgroup");
-  customGroup.label = "내 템플릿";
+  customGroup.label = localizeUiText("내 템플릿");
   for (const template of templates) {
     const option = document.createElement("option");
     option.value = template.id;
     option.textContent = template.builtIn && template.customized
-      ? `${template.title} · 수정됨`
+      ? `${template.title} · ${localizeUiText("수정됨")}`
       : template.title;
+    option.dataset.i18nIgnore = "true";
     (template.builtIn ? builtInGroup : customGroup).append(option);
   }
   elements.templateSelect.append(builtInGroup);
@@ -1027,7 +1046,9 @@ function renderTemplateSelect(preferredId = elements.templateSelect.value) {
     elements.templateSelect.append(customGroup);
   }
   elements.templateSelect.value = templates.some((template) => template.id === selectedId) ? selectedId : "";
-  renderTemplateEditor();
+  if (!options.preserveEditor) {
+    renderTemplateEditor();
+  }
 }
 
 function getSelectedTaskTemplate() {
@@ -1039,6 +1060,14 @@ function getTemplateEditorDraft() {
     title: elements.templateTitleInput.value.replace(/\s+/g, " ").trim(),
     prompt: elements.templatePromptInput.value.trim()
   };
+}
+
+function hasUnsavedTemplateDraft() {
+  const selectedTemplate = getSelectedTaskTemplate();
+  const draft = getTemplateEditorDraft();
+  return selectedTemplate
+    ? draft.title !== selectedTemplate.title || draft.prompt !== selectedTemplate.prompt
+    : Boolean(draft.title || draft.prompt);
 }
 
 function renderTemplateEditor() {
@@ -1082,7 +1111,7 @@ function updateTemplateEditorActions() {
 }
 
 function setTemplateStatus(message, tone = "") {
-  elements.templateStatus.textContent = message;
+  setLocalizedElementText(elements.templateStatus, message);
   elements.templateStatus.dataset.tone = tone;
 }
 
@@ -1445,6 +1474,9 @@ function applySettingsToForm() {
 }
 
 async function saveSettingsFromForm(options = {}) {
+  const previousUiLanguage = state.settings.uiLanguage;
+  const selectedTemplateId = elements.templateSelect.value;
+  const preserveTemplateEditor = hasUnsavedTemplateDraft();
   const previousBridgeConfig = {
     bridgeEnabled: state.settings.bridgeEnabled,
     bridgeEndpoint: state.settings.bridgeEndpoint,
@@ -1452,6 +1484,10 @@ async function saveSettingsFromForm(options = {}) {
     persistSecrets: state.settings.persistSecrets
   };
   state.settings = readSettingsFromForm();
+  if (state.settings.uiLanguage !== previousUiLanguage) {
+    applyUiLanguage();
+    renderTemplateSelect(selectedTemplateId, { preserveEditor: preserveTemplateEditor });
+  }
   await persistSettings();
   applySiteProfileForActiveTab();
   updateCustomVisibility();
@@ -1491,6 +1527,7 @@ async function saveSettingsFromForm(options = {}) {
 function readSettingsFromForm() {
   return {
     panelOpenMode: elements.inputs.panelOpenMode.value === "tab" ? "tab" : "side-panel",
+    uiLanguage: UiI18n.normalizePreference(elements.inputs.uiLanguage.value),
     apiProfile: elements.inputs.apiProfile.value,
     apiEndpoint: elements.inputs.apiEndpoint.value.trim(),
     model: elements.inputs.model.value.trim(),
@@ -1554,6 +1591,7 @@ async function resetSettings() {
   state.runtimeSettings = { ...DEFAULT_SETTINGS };
   await persistSettings();
   applySettingsToForm();
+  applyUiLanguage();
   updateCustomVisibility();
   renderSettingsOverview();
   renderTemplateSelect("");
@@ -2937,7 +2975,7 @@ function startRunTimeline(task) {
   header.className = "activity-header";
 
   const title = document.createElement("strong");
-  title.textContent = "작업 흐름";
+  setLocalizedElementText(title, "작업 흐름");
 
   const summary = document.createElement("span");
   summary.className = "activity-summary";
@@ -2961,16 +2999,16 @@ function startRunTimeline(task) {
     content.className = "activity-content";
 
     const name = document.createElement("strong");
-    name.textContent = label;
+    setLocalizedElementText(name, label);
 
     const detail = document.createElement("span");
     detail.className = "activity-detail";
-    detail.textContent = "대기 중";
+    setLocalizedElementText(detail, "대기 중");
 
     content.append(name, detail);
     item.append(dot, content);
     list.append(item);
-    phaseElements[key] = { item, detail };
+    phaseElements[key] = { item, name, detail, detailSource: "대기 중" };
   }
 
   bubble.append(header, list);
@@ -2978,7 +3016,7 @@ function startRunTimeline(task) {
   elements.messageList.append(article);
   elements.messageList.scrollTop = elements.messageList.scrollHeight;
 
-  state.agentRunUi = { article, phaseElements };
+  state.agentRunUi = { article, title, phaseElements };
   updateRunTimeline("observe", "active", "현재 화면을 읽는 중");
 }
 
@@ -2988,7 +3026,8 @@ function updateRunTimeline(phase, status, detail) {
     return;
   }
   target.item.dataset.status = status;
-  target.detail.textContent = detail || getTimelineStatusLabel(status);
+  target.detailSource = detail || getTimelineStatusLabel(status);
+  setLocalizedElementText(target.detail, target.detailSource);
   elements.messageList.scrollTop = elements.messageList.scrollHeight;
 }
 
@@ -5721,11 +5760,16 @@ function clearConversation() {
   state.undoStack = [];
   state.evaluationLogs = [];
   updatePickedElementBadge();
-  elements.messageList.replaceChildren();
+  clearRenderedChatMessages();
   hideApprovalPanel();
   setStatusLine("대화를 비웠습니다.");
   updateAgentButtons();
   void removeCurrentSavedSession();
+}
+
+function clearRenderedChatMessages() {
+  elements.messageList.replaceChildren();
+  localizedChatMessages.clear();
 }
 
 function appendChatMessage(role, text, options = {}) {
@@ -5737,7 +5781,15 @@ function appendChatMessage(role, text, options = {}) {
 
   const bubble = document.createElement("div");
   bubble.className = "message-bubble";
-  renderTextWithSafeLinks(bubble, text || "");
+  const messageText = document.createElement("span");
+  messageText.className = "message-text";
+  const sourceText = text || "";
+  const displayText = UiI18n.hasTranslation(sourceText) ? localizeUiText(sourceText) : sourceText;
+  renderTextWithSafeLinks(messageText, displayText);
+  bubble.append(messageText);
+  if (UiI18n.hasTranslation(sourceText)) {
+    localizedChatMessages.set(messageText, sourceText);
+  }
 
   if (options.actions?.length) {
     const list = document.createElement("ol");
@@ -5770,6 +5822,35 @@ function appendChatMessage(role, text, options = {}) {
     trimList(state.conversation, 24);
     persistCurrentSession();
   }
+}
+
+function applyUiLanguage() {
+  state.uiLocale = UiI18n.applyDocument(document, state.settings.uiLanguage);
+  for (const [container, sourceText] of localizedChatMessages) {
+    if (!container.isConnected) {
+      localizedChatMessages.delete(container);
+      continue;
+    }
+    container.replaceChildren();
+    renderTextWithSafeLinks(container, localizeUiText(sourceText));
+  }
+  if (state.agentRunUi?.article?.isConnected) {
+    setLocalizedElementText(state.agentRunUi.title, "작업 흐름");
+    for (const [key, label] of TIMELINE_PHASES) {
+      const phase = state.agentRunUi.phaseElements[key];
+      if (!phase) continue;
+      setLocalizedElementText(phase.name, label);
+      setLocalizedElementText(phase.detail, phase.detailSource);
+    }
+  }
+}
+
+function localizeUiText(value) {
+  return UiI18n.translateKnownText(value, state.uiLocale);
+}
+
+function setLocalizedElementText(element, value) {
+  return UiI18n.setElementText(element, value, state.uiLocale);
 }
 
 function renderTextWithSafeLinks(container, value) {
@@ -6128,12 +6209,12 @@ function setButtonsDisabled(disabled) {
 
 function setStatusLine(message) {
   const text = message || "";
-  elements.statusLine.textContent = text;
-  elements.statusLine.title = text;
+  setLocalizedElementText(elements.statusLine, text);
+  UiI18n.setElementAttribute(elements.statusLine, "title", text, state.uiLocale);
 }
 
 function setSettingsStatus(message, tone = "info") {
-  elements.settingsStatus.textContent = message;
+  setLocalizedElementText(elements.settingsStatus, message);
   elements.settingsStatus.dataset.tone = tone;
 }
 

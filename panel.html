@@ -258,6 +258,15 @@
               <div class="button-row inline-actions">
                 <button class="secondary-button" id="openPreferredSurfaceButton" type="button">선택한 방식으로 열기</button>
               </div>
+              <label class="field full" for="uiLanguageInput">
+                <span>표시 언어</span>
+                <select id="uiLanguageInput" aria-describedby="uiLanguageHelp">
+                  <option value="auto">브라우저 언어</option>
+                  <option value="ko">한국어</option>
+                  <option value="en">English</option>
+                </select>
+                <small class="field-help" id="uiLanguageHelp">브라우저 언어를 따르거나 한국어와 영어를 직접 선택합니다. 변경 즉시 적용됩니다.</small>
+              </label>
             </div>
 
             <div class="settings-callout" aria-labelledby="sidePanelPlacementTitle">
@@ -787,6 +796,7 @@
 
     <script src="agent-core.js"></script>
     <script src="execution-contract.js"></script>
+    <script src="ui-locales.js"></script>
     <script src="panel.js"></script>
   </body>
 </html>
