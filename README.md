@@ -4,7 +4,7 @@ A Manifest V3 browser extension that turns a configured language model into a bo
 
 ![Agent side panel](docs/assets/agent-panel.png)
 
-Version `0.9.11` with Bridge protocol `2.3` targets Chromium-based browsers version 116 or later. This repository contains a source-loaded development build rather than a store package. The extension UI screenshots in this README were regenerated from the current version with a temporary browser profile and local fixtures.
+Version `0.10.0` with Bridge protocol `2.3` targets Chromium-based browsers version 116 or later. This repository contains a source-loaded development build rather than a store package. The extension UI screenshots in this README were regenerated from the current version with a temporary browser profile and local fixtures.
 
 ## Choose the workflow
 
@@ -47,6 +47,7 @@ The planner may cite only IDs already present in the runtime evidence ledger, bu
 - Traverses open Shadow DOM and visually verified same-origin or permission-granted `iframe` and legacy `frame` documents, while keeping every child-frame ref bound to its document
 - Discovers visible nested scroll regions and scrolls the intended container before observing newly revealed controls
 - Supports `click`, screenshot-bound `visual_click`, `fill`, `select`, `focus`, `hover`, `submit`, `press`, `scroll`, `navigate`, `wait`, `wait_for`, `extract`, and `upload`
+- Collects exact-size structured record sets from repeated rendered content, deduplicates records across result pages, and stops at the target or when another page produces no new records
 - Uses visual coordinates only inside an observed canvas or application surface; coordinates are created inside the extension, require approval, and are independently verified against a fresh screenshot before execution
 - Recognizes semantic controls, visible custom pointer controls, legacy image-map areas, and SVG links, then sends a pointer/mouse sequence before click activation
 - Resolves semantic menu or tree-item containers to their single rendered child link or button when the container owns the visible label, so icon hit points do not replace the intended navigation effect
@@ -63,6 +64,8 @@ The planner may cite only IDs already present in the runtime evidence ledger, bu
 - Supports MCP OAuth 2.1 Authorization Code with PKCE S256 and refresh-token rotation
 - Exposes one explicitly shared tab to MCP-capable development tools through an authenticated loopback companion
 - Freezes each latest request into a standalone or context-dependent correction/continuation intent and prevents successful effects from exceeding its resolved repetition boundary
+- Keeps completed structured datasets locally for CSV or XLSX download
+- Saves, imports, and replays local semantic automation and test sets without persisting observation refs or selectors
 - Restores conversations by tab and URL and exports traces as Markdown, JSON, or CSV
 - Records privacy-preserving AI request audit metadata
 - Treats an HTTP success with no usable output as an explicit failure
@@ -80,7 +83,7 @@ Recognition remains structure-driven rather than site-specific. A focused elemen
 
 One observation reuses query, style, rectangle, exposure, text, and image-map geometry results for the duration of that collection. Embedded-origin permission discovery uses a lightweight frame-boundary pass instead of collecting every control in every frame. A normal semantic DOM page does not send a screenshot with every planning request; the configured screenshot path activates when the DOM has no usable evidence, a visual surface is present, or a fresh screenshot is explicitly required. When a screenshot is required, a compact observation probe verifies that the DOM, viewport, frame boundaries, and bound targets have not changed; an unchanged page does not need a second full collection.
 
-The built-in model loop also avoids serial work that does not add evidence. A fresh standalone request does not call a separate conversation-intent model, planner input excludes duplicate page text and evidence payloads, and a successful terminal decision uses one verifier for completion evidence and current-page grounding. Page observation, MCP tool discovery, and MCP resource/prompt discovery start together, and one capability snapshot is reused across the bounded discovery windows of the same turn. Tool-only turns skip page-settle work, while observation retries wait only for transient navigation or message-channel failures and never sleep after the final failed attempt.
+The built-in model loop also avoids serial work that does not add evidence. Every fresh request still resolves an immutable intent, but that model request overlaps a prefetched initial DOM observation and MCP capability discovery. The prefetched page state is reused only after a compact probe confirms that it is still current; otherwise the runtime collects fresh evidence. Planner input excludes duplicate page text and evidence payloads, and a successful terminal decision uses one verifier for completion evidence and current-page grounding. Later page observation and MCP discovery also run together, and one capability snapshot is reused across the bounded discovery windows of the same turn. Tool-only turns skip page-settle work, while observation retries wait only for transient navigation or message-channel failures and never sleep after the final failed attempt.
 
 Read-only actions, disclosure controls, and same-origin navigation links use the same deterministic state-change classification as the execution gate instead of making a second policy-model request; unknown clicks, submissions, cross-origin movement, tools, and other consequential effects still use the independent policy path. Immediately before either automatic or approved execution, an unchanged observation probe takes the fast path; a changed probe triggers a full recollection and target-precondition check for page actions. Tool-only effects remain bound to the original page probe and model-visible browser context, and screenshot-backed plans also recapture and compare a SHA-256 pixel binding. Any mismatch returns to planning without executing the stale tool arguments or performing an unnecessary full DOM collection. At the content boundary, every page action checks the bound document; element actions additionally check the frame, exact DOM node, and mutable state. Old refs are never reassigned through a former selector, and nested `wait_for` lookups stay attached to the exact observed nodes while their expected state is allowed to change. These private bindings are removed from model and Bridge-client observations. Action verification follows the exact executed node, returns after the first semantic observable change, and treats revision-only churn as indeterminate rather than success. After page actions, the runtime observes document readiness and DOM, visual, URL, and scroll revisions until the page is quiet instead of always sleeping for a fixed interval. If a navigation replaces the document before the content response arrives, the runtime accepts it only when the browser proves that the bound frame's document ID or sanitized URL actually changed.
 
@@ -159,6 +162,8 @@ The agent can dynamically request another visible-control window with a `discove
 
 Write a numeric count or an observable stopping condition when an action genuinely needs repetition, for example “apply this to the next three rows” or “continue until no pending rows remain.” Without that explicit scope, the same successful state-changing effect is limited to one occurrence in the request. If a task ends with an error, rejection, or cancellation, a complete next request starts a new task. A concise, context-dependent correction can instead reuse the unfinished objective while replacing the failed target or method. In both cases, the failed run is context rather than permission to replay its actions.
 
+For a record request, state the exact number of unique records, requested fields, and any inclusion or exclusion rules. The record count is an output requirement, not permission to repeat one page effect that many times. The agent expands the repeated rendered structure around one representative record, adds the current result page to a runtime-owned ledger, and merges duplicate records before moving on. It returns immediately at the exact target; a repeated page or a page with no new unique records stops traversal with a specific blocker instead of looping or claiming a partial result as complete.
+
 ## Settings and workspace placement
 
 The settings dialog starts with a live overview of the model, automation mode, external integrations, and workspace placement. Fields continue to save automatically, and the header reports completed saves or validation errors without requiring a separate global save button.
@@ -194,6 +199,10 @@ Assistant messages use a bundled GitHub-Flavored Markdown parser for syntax reco
 Each submitted message becomes one immutable agent objective. A complete new request does not inherit unfinished effects from an earlier failed run, while an explicit continuation can reuse only the prior context needed to finish that named task. Reusable instructions belong in **Templates**, where they remain visible and editable before being inserted into the composer; there is no hidden persistent goal that can silently broaden a later message. The Bridge still retains the explicit `goal` passed to `browser_begin` for the lifetime of that one external browser task because it is the execution and repetition boundary, not cross-message memory.
 
 ![Template editor with a selected personal template](docs/assets/template-manager.png)
+
+The export dialog keeps collected datasets separate from conversation traces. A completed or safely stalled dataset remains in local extension storage and can be downloaded directly as CSV or XLSX; no remote conversion service is used.
+
+Completed requests can also be saved as an **Automation set** or **Test set**, exported as JSON, and imported on another local installation. Each step stores the semantic goal, completion criteria, output contract, and test assertions rather than transient element refs or CSS selectors. Replay starts each step as a new browser task and plans again from the current page. Automation sets stop on a failed step, while test sets retain per-step outcomes so later checks can still run.
 
 Global settings are saved when a field changes, so there is no separate global save button; site-specific profiles still use their own apply action. The full reset action is under **Settings → Advanced**. While a local action plan is waiting for approval, the new-request composer is hidden because the running task cannot accept another request; rejecting or completing the approval restores the unchanged draft. External Bridge approvals do not hide the composer.
 
@@ -332,32 +341,26 @@ When `hasMore` is true, continue the returned opaque `nextCursor` with the same 
 
 For an optimized targeted search, `availableTotal` is `null` and `availableTotalExact` is `false` because the extension intentionally does not run a second full unfiltered visibility pass. `potentialTotal` is the number of inexpensive identity candidates considered, while `total` is the number that passed complete exposure and search scoring. Broad observations and unfiltered cursor paging continue to report an exact available total.
 
-Short labels on older pages can be disambiguated with nearby text. For example, a numeric page link can be requested as:
+Short labels on older pages can be disambiguated with nearby text. For example, a pagination control can be requested as:
 
 ```json
 {
-  "query": "2",
+  "query": "Next",
   "roles": ["link"],
-  "near_text": "[1/5] [Total: 484]"
+  "near_text": "Search results"
 }
 ```
 
-When `near_text` is present, `query` is matched against the control itself while the nearby filter is matched against bounded local context. This prevents dates and unrelated table rows from outranking a literal page-number link. Pages without semantic `nav`, table, form, or ARIA containers can still contribute a small complete ancestor group; large ancestors are rejected instead of being truncated into misleading context.
+When `near_text` is present, `query` is matched against the control itself while the nearby filter is matched against bounded local context. This prevents unrelated links elsewhere on the page from outranking the intended pagination control. Pages without semantic `nav`, table, form, or ARIA containers can still contribute a small complete ancestor group; large ancestors are rejected instead of being truncated into misleading context.
 
 For a canvas or application surface with no DOM ref, use `browser_visual_act` with a current surface ref and precise visible description. Do not send coordinates. The extension's configured model locates the point, an independent verifier checks the same screenshot evidence, and approval-time re-observation repeats the resolution before execution.
 
-### Legacy Korean-language page validation
+### Disposable public-page compatibility harness
 
-The live Bridge path was exercised on 2026-07-23 against [DART Recent Disclosures](https://dart.fss.or.kr/dsac001/mainAll.do), a Korean-language public site with a large server-rendered table, a `body` document scroller, an AJAX paginator exposed as `javascript:search(2)`, continuous list updates, and a framed disclosure viewer. At the validation moment the list contained 484 disclosures across five pages.
-
-The complete run observed page 1, reached the paginator through viewport-scoped scrolling, found the literal `2` link with a structured query, obtained deterministic approval, and executed the page-owned legacy handler. The operation reported `activation: "page-owned-legacy-handler"` only after the visible state fingerprint changed. A fresh observation showed page 2 of 5; the run then opened the first page-2 report in the same shared tab and verified the disclosure viewer title. These values came from live evidence, not selectors or expected answers embedded in the extension.
-
-![DART disclosure viewer reached through the live Bridge agent loop](docs/assets/dart-legacy-agent-loop.jpg)
-
-For repeatable work on another public page, start the disposable developer harness:
+For a live regression against a public page outside the synthetic fixtures, start the disposable developer harness:
 
 ```bash
-npm run test:live-bridge -- "https://dart.fss.or.kr/dsac001/mainAll.do"
+npm run test:live-bridge -- "<public-page-url>"
 ```
 
 It copies the current unpacked extension into a temporary directory, grants only the supplied page origin to that copy, launches an isolated headless browser profile, connects and shares the target tab, and prints a temporary authenticated `mcp-client.json` path. Point a development MCP client at that file, then drive the normal `browser_begin` → `browser_elements`/`browser_act` → `browser_continue` → `browser_end` loop. The harness accepts `status`, `approve`, `reject`, and `quit` on standard input; `status` prints the pending action and bound target so it can be reviewed before `approve`.
@@ -413,7 +416,7 @@ Never put the token in the URL or commit it to the repository. The exact HTTP tr
 | `uv_spawn`, `ENOENT`, or a stop-hook spawn error appears | This normally comes from the development tool's local hook process, not from the Bridge protocol. Check that hook's executable and `PATH`, or disable the broken hook; verify the Bridge separately from the extension's connected/shared indicators and actual MCP call log. |
 | Streamable HTTP returns `401` | Send the current MCP token as `Authorization: Bearer ...`; the one-time extension setup code is not that token. |
 
-Extension UI screenshots are generated by `npm run capture:docs` against a temporary browser profile and local fixtures. They contain no user session, private page, persistent credential, or machine-specific filesystem path. Loopback ports and synthetic fixture URLs may vary between captures. The separate legacy-site image records a public-page compatibility run and contains only information that was publicly visible on that page.
+Extension UI screenshots are generated by `npm run capture:docs` against a temporary browser profile and local fixtures. They contain no user session, private page, persistent credential, or machine-specific filesystem path. Loopback ports and synthetic fixture URLs may vary between captures.
 
 See [Local MCP companion](docs/bridge.md) for complete startup options, portable MCP client configuration patterns, the tool workflow, security properties, and troubleshooting.
 See [Web structure compatibility](docs/web-compatibility.md) for frame, Shadow DOM, nested-scroll, visual-surface, permission, and browser-policy boundaries.

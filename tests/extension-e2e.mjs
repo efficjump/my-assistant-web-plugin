@@ -748,7 +748,7 @@ try {
       tabId: firstTabId,
       context: firstContext.data
     });
-    assert.equal(turnBoundaryContracts.freshIntentModelCalls, 0);
+    assert.equal(turnBoundaryContracts.freshIntentModelCalls, 1);
     assert.equal(turnBoundaryContracts.freshIntentMode, "standalone");
     assert.equal(turnBoundaryContracts.correctiveIntentMode, "continue_prior");
     assert.equal(turnBoundaryContracts.correctiveIntentModelCalls, 2);
@@ -780,6 +780,43 @@ try {
     assert.equal(turnBoundaryContracts.completionEvidenceDiagnosticHidden, true);
     assert.equal(turnBoundaryContracts.elementSearchDiagnosticHidden, true);
     assert.equal(turnBoundaryContracts.providerStatusErrorPreserved, true);
+
+    const collectionLedgerContracts = await exerciseCollectionLedgerContracts({
+      cdp,
+      panelSessionId,
+      tabId: firstTabId,
+      context: firstContext.data
+    });
+    assert.deepEqual(collectionLedgerContracts, {
+      firstPageCollected: true,
+      requestedColumnsOnly: true,
+      multipleTraversalBlocked: true,
+      spaPaginationIsTransport: true,
+      intermediatePageCannotBeSkipped: true,
+      disclosureDoesNotRequestExtraction: true,
+      plainScrollDoesNotRequestExtraction: true,
+      virtualScrollRequestsExtraction: true,
+      secondPageReachedExactTarget: true,
+      thirdPageBlocked: true,
+      terminalAnswerAllowed: true,
+      repeatedPageStalled: true,
+      zeroNewPageStalled: true
+    });
+
+    const workflowSetContracts = await exerciseWorkflowSetContracts({
+      cdp,
+      panelSessionId,
+      tabId: firstTabId
+    });
+    assert.deepEqual(workflowSetContracts, {
+      parametersResolved: true,
+      outputContractPreserved: true,
+      mismatchedIntentRejected: true,
+      sequentialStepsCompleted: true,
+      preSessionFailureTerminated: true,
+      originDriftBlocked: true,
+      busyStopDeferred: true
+    });
 
     const latencyFastPaths = await exerciseLatencyFastPathContracts({
       cdp,
@@ -1124,6 +1161,145 @@ try {
     assert.equal(targetlessDocumentResult.data.results[0].ok, false);
     assert.equal(targetlessDocumentResult.data.results[0].code, "stale_target");
 
+    await evaluate(cdp, panelSessionId, `(async () => {
+      const [result] = await chrome.scripting.executeScript({
+        target: { tabId: ${JSON.stringify(firstTabId)} },
+        world: "MAIN",
+        func: () => document.getElementById("structured-exemplar").scrollIntoView({ block: "center" })
+      });
+      return result.result;
+    })()`);
+    const structuredCollectionContext = await poll(
+      async () => extensionMessage(cdp, panelSessionId, {
+        type: "COLLECT_PAGE_CONTEXT",
+        targetTabId: firstTabId,
+        options: {
+          maxTextChars: 8000,
+          maxElements: 20,
+          elementQuery: "A complete first record title",
+          elementRoles: ["link"],
+          redactSensitiveData: true
+        }
+      }),
+      (response) => response?.data?.interactiveElements?.some(
+        (element) => element.label === "A complete first record title"
+      ),
+      5_000
+    );
+    const structuredExemplar = structuredCollectionContext.data.interactiveElements.find(
+      (element) => element.label === "A complete first record title"
+    );
+    assert.ok(structuredExemplar?.ref);
+    const structuredCollectionResult = await extensionMessage(cdp, panelSessionId, {
+      type: "EXECUTE_PAGE_ACTIONS",
+      targetTabId: firstTabId,
+      actions: [{
+        id: "extract-structured-records",
+        type: "extract",
+        ref: structuredExemplar.ref,
+        collectionId: "fixture-records",
+        collectionName: "Fixture records",
+        targetCount: 40,
+        reason: "exercise rendered-document collection expansion"
+      }],
+      executionBindings: [{
+        actionId: "extract-structured-records",
+        frameId: structuredExemplar.frameId || 0,
+        documentId: structuredExemplar.frameDocumentId || structuredCollectionContext.data.documentId,
+        targetBinding: structuredExemplar.binding,
+        targetStateBinding: structuredExemplar.stateBinding,
+        conditionBindings: []
+      }]
+    });
+    assert.equal(structuredCollectionResult.ok, true);
+    assert.equal(structuredCollectionResult.data.results[0].ok, true);
+    const structuredBatch = structuredCollectionResult.data.results[0].result.collection;
+    assert.equal(structuredBatch.scope, "rendered-document");
+    assert.equal(structuredBatch.collectionId, "fixture-records");
+    assert.equal(structuredBatch.targetCount, 40);
+    assert.equal(structuredBatch.returnedCount, 4);
+    assert.deepEqual(
+      structuredBatch.records.map((record) => record.title),
+      [
+        "A complete first record title",
+        "A complete offscreen second record title",
+        "A third rendered record title",
+        "2026"
+      ]
+    );
+    assert.ok(
+      structuredBatch.records.some((record) => (
+        record.title === "A complete offscreen second record title"
+        && /\[redacted-email\]/.test(record.context)
+      )),
+      "structured extraction should include offscreen rendered rows while preserving observation redaction"
+    );
+    assert.equal(
+      structuredBatch.records.some((record) => (
+        /Pinned|Display-none|Content-hidden|Opacity-hidden/.test(
+          `${record.title} ${record.context}`
+        )
+      )),
+      false,
+      "single-link notices and non-rendered records must stay outside the collection"
+    );
+    assert.equal(new Set(structuredBatch.records.map((record) => record.url)).size, 4);
+    assert.doesNotMatch(JSON.stringify(structuredBatch), /fixture-private-token|private@example\.com/);
+    assert.ok(structuredBatch.records.every((record) => record.url.includes("%5Bredacted%5D")));
+    assert.ok(structuredBatch.records.every((record) => record.key && record.provenance));
+    assert.match(structuredBatch.pageIdentity.documentId, /^[0-9a-z-]{8,}$/i);
+    assert.equal(structuredBatch.pageIdentity.domRevision, structuredCollectionContext.data.pageState.domRevision);
+    assert.equal(structuredBatch.pageIdentity.sourceSliceDigest, structuredBatch.sourceSliceDigest);
+
+    const repeatedStructuredCollectionResult = await extensionMessage(cdp, panelSessionId, {
+      type: "EXECUTE_PAGE_ACTIONS",
+      targetTabId: firstTabId,
+      actions: [{
+        id: "repeat-structured-records",
+        type: "extract",
+        ref: structuredExemplar.ref,
+        collectionId: "fixture-records",
+        collectionName: "Fixture records",
+        targetCount: 40,
+        reason: "verify stable source slice identity"
+      }],
+      executionBindings: [{
+        actionId: "repeat-structured-records",
+        frameId: structuredExemplar.frameId || 0,
+        documentId: structuredExemplar.frameDocumentId || structuredCollectionContext.data.documentId,
+        targetBinding: structuredExemplar.binding,
+        targetStateBinding: structuredExemplar.stateBinding,
+        conditionBindings: []
+      }]
+    });
+    const repeatedStructuredBatch = repeatedStructuredCollectionResult.data.results[0].result.collection;
+    assert.equal(repeatedStructuredBatch.sourceSliceDigest, structuredBatch.sourceSliceDigest);
+    assert.deepEqual(
+      repeatedStructuredBatch.records.map((record) => record.key),
+      structuredBatch.records.map((record) => record.key)
+    );
+
+    const legacyExtractResult = await extensionMessage(cdp, panelSessionId, {
+      type: "EXECUTE_PAGE_ACTIONS",
+      targetTabId: firstTabId,
+      actions: [{
+        id: "legacy-extract-remains-compatible",
+        type: "extract",
+        reason: "verify the original extract response contract"
+      }],
+      executionBindings: [{
+        actionId: "legacy-extract-remains-compatible",
+        frameId: 0,
+        documentId: structuredCollectionContext.data.documentId,
+        targetBinding: "",
+        targetStateBinding: "",
+        conditionBindings: []
+      }]
+    });
+    assert.equal(legacyExtractResult.data.results[0].ok, true);
+    assert.equal(typeof legacyExtractResult.data.results[0].result.text, "string");
+    assert.equal("collection" in legacyExtractResult.data.results[0].result, false);
+
     const textPressContext = await extensionMessage(cdp, panelSessionId, {
       type: "COLLECT_PAGE_CONTEXT",
       targetTabId: firstTabId,
@@ -1276,10 +1452,23 @@ try {
     })()`);
     assert.equal(staleClickCount, 0, "stale refs must never activate a recycled or selector-rebound target");
 
+    await evaluate(cdp, panelSessionId, `(async () => {
+      const [result] = await chrome.scripting.executeScript({
+        target: { tabId: ${JSON.stringify(firstTabId)} },
+        world: "MAIN",
+        func: () => document.getElementById("pointer-action")?.scrollIntoView({ block: "center" })
+      });
+      return result.result;
+    })()`);
     const pointerStartContext = await extensionMessage(cdp, panelSessionId, {
       type: "COLLECT_PAGE_CONTEXT",
       targetTabId: firstTabId,
-      options: { maxTextChars: 8000, maxElements: 40, redactSensitiveData: true }
+      options: {
+        maxTextChars: 8000,
+        maxElements: 20,
+        elementQuery: "Pointer action",
+        redactSensitiveData: true
+      }
     });
     const pointerTarget = pointerStartContext.data.interactiveElements.find(
       (element) => element.label === "Pointer action"
@@ -2508,7 +2697,10 @@ async function startFixtureServer() {
       }
 
       let payload;
-      if (instructions.includes("immutable repetition boundary")) {
+      if (
+        instructions.includes("immutable repetition boundary")
+        || instructions.includes("resolve one immutable browser-task intent")
+      ) {
         visualAiCallCounts.intent += 1;
         payload = {
           version: "1.0",
@@ -2517,6 +2709,13 @@ async function startFixtureServer() {
           contextSummary: "",
           repeatPolicy: "once",
           repeatLimit: 1,
+          deliverable: {
+            kind: "effect",
+            itemDescription: "",
+            targetCount: null,
+            fields: [],
+            includeCriteria: []
+          },
           completionCriteria: ["The visible Apply target has been clicked once."],
           reason: "The goal requests one complete visual action."
         };
@@ -2664,6 +2863,13 @@ async function startFixtureServer() {
       #covered-frame-shell { position: fixed; left: 300px; bottom: 8px; z-index: 3; width: 180px; height: 70px; }
       #covered-frame-shell iframe { position: absolute; inset: 0; margin: 0; }
       #covered-frame-overlay { position: absolute; inset: 0 auto 0 0; z-index: 1; width: 70px; background: white; }
+      #structured-collection { margin-top: 16px; font: 12px sans-serif; }
+      #structured-collection table { border-collapse: collapse; }
+      #structured-collection td { padding: 2px 8px; }
+      #structured-collection .offscreen-record { transform: translateY(1200px); }
+      #structured-collection .display-none-record { display: none; }
+      #structured-collection .content-hidden-record { content-visibility: hidden; }
+      #structured-collection .opacity-hidden-record { opacity: 0; }
       #offscreen-section { margin-top: 1300px; min-height: 280px; }
     </style></head><body>
       <h1>${second ? "Second" : "First"} page</h1>
@@ -2747,6 +2953,52 @@ async function startFixtureServer() {
       <input id="upload" type="file" accept="text/plain">
       <button id="async" type="button">Start async</button>
       <div id="async-status" role="status">Idle</div>
+      <section id="structured-collection" aria-label="Structured result fixture">
+        <table aria-label="Layout table"><tbody><tr><td>
+          <table aria-label="Nested result table"><tbody>
+            <tr class="result-record notice-record">
+              <td>Notice</td>
+              <td><a href="/records?board=general&amp;record=notice&amp;session_token=fixture-private-token">Pinned maintenance notice</a></td>
+              <td>Staff</td>
+            </tr>
+            <tr class="result-record">
+              <td><a href="/records?board=general&amp;record=101&amp;session_token=fixture-private-token">101</a></td>
+              <td><a id="structured-exemplar" href="/records?board=general&amp;record=101&amp;session_token=fixture-private-token" title="A complete first record title">A short first title…</a></td>
+              <td>2026-07-24</td>
+            </tr>
+            <tr class="result-record offscreen-record">
+              <td><a href="/records?board=general&amp;record=102&amp;session_token=fixture-private-token">102</a></td>
+              <td><a href="/records?board=general&amp;record=102&amp;session_token=fixture-private-token" aria-label="A complete offscreen second record title">Second title…</a></td>
+              <td>private@example.com</td>
+            </tr>
+            <tr class="result-record">
+              <td><a href="/records?board=general&amp;record=103&amp;session_token=fixture-private-token">103</a></td>
+              <td><a href="/records?board=general&amp;record=103&amp;session_token=fixture-private-token" title="Open">A third rendered record title</a></td>
+              <td>2026-07-22</td>
+            </tr>
+            <tr class="result-record">
+              <td><a href="/records?board=general&amp;record=104&amp;session_token=fixture-private-token">104</a></td>
+              <td><a href="/records?board=general&amp;record=104&amp;session_token=fixture-private-token" title="Open">2026</a></td>
+              <td>2026-07-21</td>
+            </tr>
+            <tr class="result-record display-none-record">
+              <td><a href="/records?board=general&amp;record=105&amp;session_token=fixture-private-token">105</a></td>
+              <td><a href="/records?board=general&amp;record=105&amp;session_token=fixture-private-token">Display-none record</a></td>
+              <td>2026-07-20</td>
+            </tr>
+            <tr class="result-record content-hidden-record">
+              <td><a href="/records?board=general&amp;record=106&amp;session_token=fixture-private-token">106</a></td>
+              <td><a href="/records?board=general&amp;record=106&amp;session_token=fixture-private-token">Content-hidden record</a></td>
+              <td>2026-07-19</td>
+            </tr>
+            <tr class="result-record opacity-hidden-record">
+              <td><a href="/records?board=general&amp;record=107&amp;session_token=fixture-private-token">107</a></td>
+              <td><a href="/records?board=general&amp;record=107&amp;session_token=fixture-private-token">Opacity-hidden record</a></td>
+              <td>2026-07-18</td>
+            </tr>
+          </tbody></table>
+        </td><td><a href="/layout-help">Layout help</a></td></tr></tbody></table>
+      </section>
       <section id="offscreen-section">
         <p>Offscreen viewport fact</p>
         <button id="offscreen-action" type="button">Offscreen action</button>
@@ -4114,7 +4366,7 @@ async function exerciseTurnBoundaryContracts({ cdp, panelSessionId, tabId, conte
       let freshIntentModelCalls = 0;
       requestAiDecision = async () => {
         freshIntentModelCalls += 1;
-        throw new Error("a fresh standalone request must not need a model intent round trip");
+        throw new Error("intent endpoint unavailable");
       };
       const freshIntent = await resolveAgentTurnIntent(state.agentSession);
 
@@ -4179,6 +4431,13 @@ async function exerciseTurnBoundaryContracts({ cdp, panelSessionId, tabId, conte
             contextSummary: "직전 실행은 요청양식 드롭다운을 반복했고, 최신 교정은 요청 유형 필드의 돋보기 버튼을 새 대상으로 지정한다.",
             repeatPolicy: "once",
             repeatLimit: 1,
+            deliverable: {
+              kind: "effect",
+              itemDescription: "",
+              targetCount: null,
+              fields: [],
+              includeCriteria: []
+            },
             completionCriteria: ["요청 유형 필드에 선택 결과가 표시된다."],
             reason: "최신 메시지는 직전 실패의 대상을 교정하는 문맥 의존 지시다."
           })
@@ -4229,6 +4488,13 @@ async function exerciseTurnBoundaryContracts({ cdp, panelSessionId, tabId, conte
             contextSummary: "",
             repeatPolicy: "once",
             repeatLimit: 1,
+            deliverable: {
+              kind: "effect",
+              itemDescription: "",
+              targetCount: null,
+              fields: [],
+              includeCriteria: []
+            },
             completionCriteria: ["요청 시작 시점보다 한 페이지 앞으로 이동한 현재 화면이 관찰된다."],
             reason: "최신 메시지는 자체로 완결된 새 명령이며 한 번이라는 범위를 명시한다."
           })
@@ -4642,6 +4908,573 @@ async function exerciseTurnBoundaryContracts({ cdp, panelSessionId, tabId, conte
       state.currentPlan = original.currentPlan;
       state.conversation = original.conversation;
       state.evaluationLogs = original.evaluationLogs;
+      elements.messageList.replaceChildren();
+      for (const message of state.conversation) {
+        appendChatMessage(message.role, message.text, {
+          tone: message.tone || "",
+          record: false
+        });
+      }
+      updateAgentButtons();
+    }
+  })()`);
+}
+
+async function exerciseCollectionLedgerContracts({ cdp, panelSessionId, tabId, context }) {
+  return evaluate(cdp, panelSessionId, `(() => {
+    const original = {
+      activeTab: state.activeTab ? structuredClone(state.activeTab) : null,
+      lastContext: state.lastContext ? structuredClone(state.lastContext) : null,
+      agentSession: state.agentSession,
+      agentRunUi: state.agentRunUi,
+      datasets: structuredClone(state.datasets),
+      evaluationLogs: structuredClone(state.evaluationLogs)
+    };
+    const makeRows = (start) => Array.from({ length: 20 }, (_, index) => ({
+      key: String(start + index),
+      title: "Board title " + (start + index),
+      url: "https://example.test/post/" + (start + index),
+      context: "Record " + (start + index),
+      provenance: { source: "fixture" }
+    }));
+    const makeBatch = (page, start, digest = "slice-" + page) => ({
+      collectionId: "free-board-titles",
+      collectionName: "Free board titles",
+      targetCount: 40,
+      records: makeRows(start),
+      pageIdentity: {
+        url: "https://example.test/board?page=" + page,
+        documentId: "document-" + page,
+        domRevision: page,
+        sourceSliceDigest: digest
+      },
+      scope: "rendered-document",
+      provenance: { source: "bound-exemplar" }
+    });
+    const makeExtractDecision = (step) => ({
+      step,
+      status: "continue",
+      toolCalls: [],
+      actions: [{
+        id: "extract-page-" + step,
+        type: "extract",
+        ref: "record-title",
+        collectionId: "free-board-titles",
+        collectionName: "Free board titles",
+        targetCount: 40,
+        reason: "collect one rendered result page"
+      }],
+      verification: {
+        required: true,
+        expectedChange: "collection ledger grows",
+        successCriteria: ["unique rows are added"]
+      }
+    });
+    const makeSession = () => {
+      createAgentSession("자유게시판 일반 글 제목 40개를 알려줘.");
+      state.agentSession.turnIntent = AgentCore.normalizeTurnIntent({
+        version: "1.0",
+        mode: "standalone",
+        objective: "Collect exactly 40 normal free-board post titles.",
+        contextSummary: "",
+        repeatPolicy: "once",
+        repeatLimit: 1,
+        deliverable: {
+          kind: "collection",
+          itemDescription: "normal free-board post",
+          targetCount: 40,
+          fields: ["title"],
+          includeCriteria: ["Exclude pinned notices."]
+        },
+        completionCriteria: ["Exactly 40 unique titles are returned."],
+        reason: "The number is output cardinality."
+      });
+      return state.agentSession;
+    };
+    try {
+      state.activeTab = {
+        id: ${JSON.stringify(tabId)},
+        title: ${JSON.stringify(context.title)},
+        url: "https://example.test/board?page=1"
+      };
+      state.lastContext = {
+        ...structuredClone(${JSON.stringify(context)}),
+        url: "https://example.test/board?page=1",
+        interactiveElements: [{
+          ref: "next-page",
+          tag: "button",
+          role: "button",
+          type: "button",
+          label: "Next page",
+          selector: "#next-page",
+          disabled: false,
+          actionability: "interactive"
+        }]
+      };
+      state.evaluationLogs = [];
+      clearRunTimeline();
+
+      const session = makeSession();
+      const pageOneDecision = makeExtractDecision(1);
+      const pageOneResult = {
+        ok: true,
+        action: pageOneDecision.actions[0],
+        result: { collection: makeBatch(1, 1) },
+        verification: { changed: false, materialChanged: false, domChanged: false }
+      };
+      ingestStructuredCollectionResults(session, pageOneDecision, [pageOneResult]);
+      recordExecutionOutcomes(session, pageOneDecision, [], [pageOneResult]);
+      const firstPageCollected = session.datasets[0]?.rows.length === 20
+        && session.datasets[0]?.status === "collecting"
+        && session.collectionAwaitingExtraction === false;
+      const requestedColumnsOnly = session.datasets[0]?.columnsExplicit === true
+        && session.datasets[0]?.columns.length === 1
+        && session.datasets[0]?.columns[0]?.key === "title";
+
+      const multipleTraversalDecision = {
+        step: 2,
+        status: "continue",
+        toolCalls: [],
+        actions: [
+          { id: "skip-page-2", type: "click", ref: "next-page", reason: "advance" },
+          { id: "skip-page-3", type: "click", ref: "next-page", reason: "advance again" }
+        ]
+      };
+      const multipleTraversalBlocked = validateCollectionBoundary(
+        session,
+        multipleTraversalDecision,
+        state.lastContext
+      ).valid === false;
+
+      const paginationDecision = {
+        step: 2,
+        status: "continue",
+        toolCalls: [],
+        actions: [{ id: "page-2", type: "click", ref: "next-page", reason: "advance once" }],
+        verification: {
+          required: true,
+          expectedChange: "result page changes",
+          successCriteria: ["new rows appear"]
+        }
+      };
+      enforceTurnEffectBoundary(session, paginationDecision, state.lastContext);
+      recordExecutionOutcomes(session, paginationDecision, [], [{
+        ok: true,
+        action: paginationDecision.actions[0],
+        result: { mayNavigate: false },
+        verification: {
+          changed: true,
+          materialChanged: true,
+          domChanged: true,
+          urlChanged: false,
+          targetChanged: false
+        }
+      }]);
+      const spaPaginationIsTransport = session.collectionAwaitingExtraction === true
+        && session.attemptLedger.at(-1)?.outcome === "transport"
+        && session.successfulEffects.length === 0;
+      const intermediatePageCannotBeSkipped = validateCollectionBoundary(
+        session,
+        paginationDecision,
+        state.lastContext
+      ).valid === false;
+
+      const disclosureSession = structuredClone(session);
+      disclosureSession.collectionAwaitingExtraction = false;
+      disclosureSession.attemptLedger = [];
+      disclosureSession.successfulEffects = [];
+      disclosureSession.successfulInteractions = [];
+      const disclosureContext = {
+        ...structuredClone(state.lastContext),
+        interactiveElements: [{
+          ref: "page-menu",
+          tag: "button",
+          role: "button",
+          type: "button",
+          label: "Page menu",
+          selector: "#page-menu",
+          ariaHasPopup: "menu",
+          ariaExpanded: "false",
+          disabled: false,
+          actionability: "interactive"
+        }]
+      };
+      const disclosureDecision = {
+        step: 2,
+        status: "continue",
+        toolCalls: [],
+        actions: [{ id: "open-page-menu", type: "click", ref: "page-menu", reason: "show choices" }],
+        verification: { required: true, expectedChange: "menu opens", successCriteria: ["choices show"] }
+      };
+      enforceTurnEffectBoundary(disclosureSession, disclosureDecision, disclosureContext);
+      recordExecutionOutcomes(disclosureSession, disclosureDecision, [], [{
+        ok: true,
+        action: disclosureDecision.actions[0],
+        result: { mayNavigate: false },
+        verification: {
+          changed: true,
+          materialChanged: true,
+          domChanged: true,
+          targetChanged: true,
+          beforeTarget: { expanded: "false" },
+          afterTarget: { expanded: "true" }
+        }
+      }]);
+      const disclosureDoesNotRequestExtraction =
+        disclosureSession.collectionAwaitingExtraction === false;
+
+      const plainScrollSession = structuredClone(disclosureSession);
+      plainScrollSession.attemptLedger = [];
+      const scrollDecision = {
+        step: 2,
+        status: "continue",
+        toolCalls: [],
+        actions: [{ id: "scroll-results", type: "scroll", direction: "down", reason: "reveal more" }],
+        verification: { required: true, expectedChange: "scroll", successCriteria: ["viewport moves"] }
+      };
+      recordExecutionOutcomes(plainScrollSession, scrollDecision, [], [{
+        ok: true,
+        action: scrollDecision.actions[0],
+        result: { mayNavigate: false },
+        verification: { changed: true, materialChanged: true, domChanged: false, urlChanged: false }
+      }]);
+      const plainScrollDoesNotRequestExtraction =
+        plainScrollSession.collectionAwaitingExtraction === false;
+
+      const virtualScrollSession = structuredClone(disclosureSession);
+      virtualScrollSession.attemptLedger = [];
+      recordExecutionOutcomes(virtualScrollSession, scrollDecision, [], [{
+        ok: true,
+        action: scrollDecision.actions[0],
+        result: { mayNavigate: false },
+        verification: { changed: true, materialChanged: true, domChanged: true, urlChanged: false }
+      }]);
+      const virtualScrollRequestsExtraction =
+        virtualScrollSession.collectionAwaitingExtraction === true
+        && virtualScrollSession.attemptLedger.at(-1)?.outcome === "transport";
+
+      const pageTwoDecision = makeExtractDecision(3);
+      const pageTwoResult = {
+        ok: true,
+        action: pageTwoDecision.actions[0],
+        result: { collection: makeBatch(2, 21) },
+        verification: { changed: false, materialChanged: false, domChanged: false }
+      };
+      const secondExtractAllowed = validateCollectionBoundary(
+        session,
+        pageTwoDecision,
+        state.lastContext
+      ).valid;
+      ingestStructuredCollectionResults(session, pageTwoDecision, [pageTwoResult]);
+      recordExecutionOutcomes(session, pageTwoDecision, [], [pageTwoResult]);
+      const secondPageReachedExactTarget = secondExtractAllowed
+        && session.datasets[0]?.rows.length === 40
+        && session.datasets[0]?.status === "reached"
+        && session.collectionAwaitingExtraction === false;
+      const thirdPageBlocked = validateCollectionBoundary(
+        session,
+        paginationDecision,
+        state.lastContext
+      ).valid === false;
+      const terminalAnswerAllowed = validateCollectionBoundary(
+        session,
+        { step: 4, status: "answer", toolCalls: [], actions: [] },
+        state.lastContext
+      ).valid === true;
+
+      const repeatedSession = makeSession();
+      const repeatedFirst = {
+        ok: true,
+        action: pageOneDecision.actions[0],
+        result: { collection: makeBatch(1, 1) },
+        verification: {}
+      };
+      ingestStructuredCollectionResults(repeatedSession, pageOneDecision, [repeatedFirst]);
+      repeatedSession.collectionAwaitingExtraction = true;
+      const repeatedAgain = {
+        ok: true,
+        action: pageTwoDecision.actions[0],
+        result: { collection: makeBatch(1, 1) },
+        verification: {}
+      };
+      ingestStructuredCollectionResults(repeatedSession, pageTwoDecision, [repeatedAgain]);
+      const repeatedPageStalled = repeatedSession.datasets[0]?.status === "stalled"
+        && repeatedSession.datasets[0]?.stallReason === "repeated-page"
+        && validateCollectionBoundary(
+          repeatedSession,
+          paginationDecision,
+          state.lastContext
+        ).valid === false;
+
+      const zeroNewSession = makeSession();
+      const zeroFirst = {
+        ok: true,
+        action: pageOneDecision.actions[0],
+        result: { collection: makeBatch(1, 1) },
+        verification: {}
+      };
+      ingestStructuredCollectionResults(zeroNewSession, pageOneDecision, [zeroFirst]);
+      zeroNewSession.collectionAwaitingExtraction = true;
+      const zeroAgain = {
+        ok: true,
+        action: pageTwoDecision.actions[0],
+        result: { collection: makeBatch(2, 1, "different-slice") },
+        verification: {}
+      };
+      ingestStructuredCollectionResults(zeroNewSession, pageTwoDecision, [zeroAgain]);
+      const zeroNewPageStalled = zeroNewSession.datasets[0]?.status === "stalled"
+        && zeroNewSession.datasets[0]?.stallReason === "zero-new-records"
+        && validateCollectionBoundary(
+          zeroNewSession,
+          paginationDecision,
+          state.lastContext
+        ).valid === false;
+
+      return {
+        firstPageCollected,
+        requestedColumnsOnly,
+        multipleTraversalBlocked,
+        spaPaginationIsTransport,
+        intermediatePageCannotBeSkipped,
+        disclosureDoesNotRequestExtraction,
+        plainScrollDoesNotRequestExtraction,
+        virtualScrollRequestsExtraction,
+        secondPageReachedExactTarget,
+        thirdPageBlocked,
+        terminalAnswerAllowed,
+        repeatedPageStalled,
+        zeroNewPageStalled
+      };
+    } finally {
+      state.activeTab = original.activeTab;
+      state.lastContext = original.lastContext;
+      state.agentSession = original.agentSession;
+      state.datasets = original.datasets;
+      state.evaluationLogs = original.evaluationLogs;
+      clearRunTimeline();
+      state.agentRunUi = original.agentRunUi;
+      updateAgentButtons();
+    }
+  })()`);
+}
+
+async function exerciseWorkflowSetContracts({ cdp, panelSessionId, tabId }) {
+  return evaluate(cdp, panelSessionId, `(async () => {
+    const original = {
+      executeAgentInstruction,
+      refreshActiveTabSummary,
+      activeTab: state.activeTab ? structuredClone(state.activeTab) : null,
+      lastContext: state.lastContext ? structuredClone(state.lastContext) : null,
+      agentSession: state.agentSession,
+      workflowRun: state.workflowRun,
+      workflowSets: structuredClone(state.workflowSets),
+      runRecords: structuredClone(state.runRecords),
+      conversation: structuredClone(state.conversation),
+      busy: state.busy
+    };
+    const makeStep = (id, failurePolicy = "stop") => ({
+      id,
+      goalTemplate: "Read the current page title.",
+      completionCriteria: ["The current title is returned."],
+      outputContract: null,
+      assertions: [{
+        type: "status",
+        operator: "in",
+        expected: ["answer", "completed"]
+      }],
+      failurePolicy
+    });
+    try {
+      state.busy = false;
+      state.activeTab = {
+        id: ${JSON.stringify(tabId)},
+        title: "Workflow fixture",
+        url: "https://example.test/start"
+      };
+      state.lastContext = {
+        title: "Workflow fixture",
+        url: "https://example.test/start"
+      };
+      refreshActiveTabSummary = async () => state.activeTab;
+
+      const parametersResolved = renderWorkflowStepInstruction(
+        { goalTemplate: "Collect {{ limit }} titles." },
+        [{ name: "limit", required: true, defaultValue: 40 }]
+      ) === "Collect 40 titles.";
+      const portableContract = buildPortableOutputContract({
+        kind: "collection",
+        itemDescription: "board post",
+        targetCount: 40,
+        fields: ["title"],
+        includeCriteria: ["Exclude notices."]
+      });
+      const outputContractPreserved = portableContract.kind === "collection"
+        && portableContract.itemDescription === "board post"
+        && portableContract.targetCount === 40
+        && portableContract.fields[0]?.name === "title"
+        && portableContract.includeCriteria[0] === "Exclude notices.";
+      const mismatchedIntentRejected = validateWorkflowStepIntent({
+        valid: true,
+        errors: [],
+        intent: AgentCore.normalizeTurnIntent({
+          version: "1.0",
+          mode: "standalone",
+          objective: "Collect records.",
+          contextSummary: "",
+          repeatPolicy: "once",
+          repeatLimit: 1,
+          deliverable: {
+            kind: "effect",
+            itemDescription: "",
+            targetCount: null,
+            fields: [],
+            includeCriteria: []
+          },
+          completionCriteria: ["The task completes."],
+          reason: "fixture"
+        })
+      }, { outputContract: portableContract }).valid === false;
+
+      let sequentialCalls = 0;
+      state.runRecords = [];
+      state.workflowRun = {
+        setId: "sequential",
+        name: "Sequential fixture",
+        kind: "test",
+        siteScope: { origin: "https://example.test", enforcement: "same-origin" },
+        parameters: [],
+        steps: [makeStep("one", "continue"), makeStep("two", "continue")],
+        index: 0,
+        currentRunId: "",
+        handledRunIds: [],
+        results: [],
+        status: "running",
+        startedAt: new Date().toISOString()
+      };
+      executeAgentInstruction = async () => {
+        sequentialCalls += 1;
+        const runId = "workflow-run-" + sequentialCalls;
+        state.agentSession = {
+          runId,
+          status: "completed",
+          stopRequested: true,
+          datasets: [],
+          activeCollectionId: ""
+        };
+        state.workflowRun.currentRunId = runId;
+        state.runRecords.push({ runId, result: "done" });
+      };
+      await runNextWorkflowStep();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const sequentialStepsCompleted = sequentialCalls === 2
+        && state.workflowRun.status === "completed"
+        && state.workflowRun.results.length === 2
+        && state.workflowRun.results.every((result) => result.passed);
+
+      state.agentSession = null;
+      state.workflowRun = {
+        setId: "pre-session-error",
+        name: "Pre-session failure",
+        kind: "test",
+        siteScope: { origin: "https://example.test", enforcement: "same-origin" },
+        parameters: [],
+        steps: [makeStep("fails-before-session", "continue")],
+        index: 0,
+        currentRunId: "",
+        handledRunIds: [],
+        results: [],
+        status: "running",
+        startedAt: new Date().toISOString()
+      };
+      executeAgentInstruction = async () => {
+        throw new Error("settings unavailable before session");
+      };
+      await runNextWorkflowStep();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const preSessionFailureTerminated = state.workflowRun.status === "failed"
+        && state.workflowRun.results.length === 1
+        && /settings unavailable/.test(state.workflowRun.results[0].message);
+
+      let originDriftExecutions = 0;
+      state.agentSession = null;
+      state.activeTab.url = "https://outside.test/landing";
+      state.workflowRun = {
+        setId: "origin-drift",
+        name: "Origin drift",
+        kind: "automation",
+        siteScope: { origin: "https://example.test", enforcement: "same-origin" },
+        parameters: [],
+        steps: [makeStep("must-not-run")],
+        index: 0,
+        currentRunId: "",
+        handledRunIds: [],
+        results: [],
+        status: "running",
+        startedAt: new Date().toISOString()
+      };
+      executeAgentInstruction = async () => {
+        originDriftExecutions += 1;
+      };
+      await runNextWorkflowStep();
+      const originDriftBlocked = originDriftExecutions === 0
+        && state.workflowRun.status === "failed"
+        && /허용 출처/.test(state.workflowRun.results[0]?.message || "");
+
+      state.activeTab.url = "https://example.test/start";
+      const stoppedRun = {
+        setId: "busy-stop",
+        name: "Busy stop",
+        kind: "test",
+        siteScope: { origin: "https://example.test", enforcement: "same-origin" },
+        parameters: [],
+        steps: [makeStep("stopped", "continue"), makeStep("later", "continue")],
+        index: 0,
+        currentRunId: "busy-stop-run",
+        handledRunIds: [],
+        results: [],
+        status: "running",
+        startedAt: new Date().toISOString()
+      };
+      state.workflowRun = stoppedRun;
+      state.agentSession = {
+        runId: "busy-stop-run",
+        status: "running",
+        stopRequested: false,
+        archivedAt: new Date().toISOString(),
+        datasets: [],
+        activeCollectionId: ""
+      };
+      state.busy = true;
+      stopAgent();
+      const skippedWhileBusy = stoppedRun.index === 0
+        && stoppedRun.handledRunIds.length === 0;
+      state.busy = false;
+      handleWorkflowStepCompletion();
+      const busyStopDeferred = skippedWhileBusy
+        && stoppedRun.index === 1
+        && stoppedRun.handledRunIds.includes("busy-stop-run");
+      stoppedRun.status = "failed";
+
+      return {
+        parametersResolved,
+        outputContractPreserved,
+        mismatchedIntentRejected,
+        sequentialStepsCompleted,
+        preSessionFailureTerminated,
+        originDriftBlocked,
+        busyStopDeferred
+      };
+    } finally {
+      executeAgentInstruction = original.executeAgentInstruction;
+      refreshActiveTabSummary = original.refreshActiveTabSummary;
+      state.activeTab = original.activeTab;
+      state.lastContext = original.lastContext;
+      state.agentSession = original.agentSession;
+      state.workflowRun = original.workflowRun;
+      state.workflowSets = original.workflowSets;
+      state.runRecords = original.runRecords;
+      state.conversation = original.conversation;
+      state.busy = original.busy;
       elements.messageList.replaceChildren();
       for (const message of state.conversation) {
         appendChatMessage(message.role, message.text, {

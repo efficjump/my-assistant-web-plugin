@@ -283,6 +283,13 @@ test("turn intent defaults to a standalone single-effect boundary and validates 
     contextSummary: "",
     repeatPolicy: "once",
     repeatLimit: 1,
+    deliverable: {
+      kind: "effect",
+      itemDescription: "",
+      targetCount: null,
+      fields: [],
+      includeCriteria: []
+    },
     completionCriteria: [],
     reason: ""
   });
@@ -294,6 +301,13 @@ test("turn intent defaults to a standalone single-effect boundary and validates 
     contextSummary: "must be discarded",
     repeatPolicy: "bounded",
     repeatLimit: 3,
+    deliverable: {
+      kind: "effect",
+      itemDescription: "",
+      targetCount: null,
+      fields: [],
+      includeCriteria: []
+    },
     completionCriteria: ["Three additional pages were inspected."],
     reason: "The latest request contains an explicit numeric bound."
   });
@@ -307,6 +321,32 @@ test("turn intent defaults to a standalone single-effect boundary and validates 
     contextSummary: ""
   });
   assert.equal(Core.validateTurnIntent(invalidContinuation).valid, false);
+});
+
+test("collection cardinality stays separate from semantic effect repetition", () => {
+  const intent = Core.normalizeTurnIntent({
+    version: "1.0",
+    mode: "standalone",
+    objective: "Collect exactly 40 post titles.",
+    contextSummary: "",
+    repeatPolicy: "once",
+    repeatLimit: 1,
+    deliverable: {
+      kind: "collection",
+      itemDescription: "board post",
+      targetCount: 40,
+      fields: ["title"],
+      includeCriteria: ["Exclude pinned notices."]
+    },
+    completionCriteria: ["Exactly 40 unique normal post titles are collected."],
+    reason: "The number describes output rows, not repeated permission."
+  });
+
+  assert.equal(Core.validateTurnIntent(intent).valid, true);
+  assert.equal(intent.repeatPolicy, "once");
+  assert.equal(intent.repeatLimit, 1);
+  assert.equal(intent.deliverable.targetCount, 40);
+  assert.deepEqual(intent.deliverable.fields, ["title"]);
 });
 
 test("accepts only runtime-issued completion evidence IDs", () => {

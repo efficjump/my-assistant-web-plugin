@@ -785,12 +785,50 @@
           </button>
         </header>
         <div class="export-body">
-          <div class="export-grid">
-            <button class="secondary-button" id="copyMarkdownButton" type="button">Markdown 복사</button>
-            <button class="secondary-button" id="downloadMarkdownButton" type="button">Markdown 저장</button>
-            <button class="secondary-button" id="downloadJsonButton" type="button">JSON 저장</button>
-            <button class="secondary-button" id="downloadCsvButton" type="button">CSV 저장</button>
-          </div>
+          <section class="export-section" aria-labelledby="datasetExportTitle">
+            <div class="export-section-heading">
+              <strong id="datasetExportTitle">수집 결과</strong>
+              <span id="datasetExportStatus">저장된 수집 결과 없음</span>
+            </div>
+            <select id="datasetSelect" aria-label="내보낼 수집 결과"></select>
+            <div class="export-grid">
+              <button class="secondary-button" id="downloadDatasetCsvButton" type="button">결과 CSV 저장</button>
+              <button class="secondary-button" id="downloadDatasetXlsxButton" type="button">결과 XLSX 저장</button>
+            </div>
+          </section>
+          <section class="export-section" aria-labelledby="workflowSetTitle">
+            <div class="export-section-heading">
+              <strong id="workflowSetTitle">자동화 · 테스트 세트</strong>
+              <span id="workflowSetStatus" role="status" aria-live="polite"></span>
+            </div>
+            <label class="template-field" for="workflowSetNameInput">
+              <span>세트 이름</span>
+              <input id="workflowSetNameInput" type="text" maxlength="120" autocomplete="off" placeholder="현재 작업 묶음의 이름">
+            </label>
+            <div class="export-grid">
+              <button class="secondary-button" id="saveAutomationSetButton" type="button">자동화 세트 저장</button>
+              <button class="secondary-button" id="saveTestSetButton" type="button">테스트 세트 저장</button>
+            </div>
+            <select id="workflowSetSelect" aria-label="저장된 자동화 또는 테스트 세트"></select>
+            <div class="export-grid">
+              <button class="secondary-button" id="runWorkflowSetButton" type="button">선택 세트 실행</button>
+              <button class="secondary-button" id="exportWorkflowSetButton" type="button">세트 JSON 내보내기</button>
+              <button class="secondary-button" id="importWorkflowSetButton" type="button">세트 가져오기</button>
+              <button class="secondary-button" id="deleteWorkflowSetButton" type="button">세트 삭제</button>
+            </div>
+            <input id="workflowSetFileInput" type="file" accept="application/json,.json" hidden>
+          </section>
+          <section class="export-section" aria-labelledby="sessionExportTitle">
+            <div class="export-section-heading">
+              <strong id="sessionExportTitle">대화 기록</strong>
+            </div>
+            <div class="export-grid">
+              <button class="secondary-button" id="copyMarkdownButton" type="button">Markdown 복사</button>
+              <button class="secondary-button" id="downloadMarkdownButton" type="button">Markdown 저장</button>
+              <button class="secondary-button" id="downloadJsonButton" type="button">JSON 저장</button>
+              <button class="secondary-button" id="downloadCsvButton" type="button">대화 CSV 저장</button>
+            </div>
+          </section>
           <pre class="context-preview" id="exportPreview"></pre>
         </div>
       </div>
@@ -801,6 +839,7 @@
     <script src="agent-core.js"></script>
     <script src="execution-contract.js"></script>
     <script src="ui-locales.js"></script>
+    <script src="workflow-artifacts.js"></script>
     <script src="panel.js"></script>
   </body>
 </html>

@@ -1987,6 +1987,44 @@ h2 {
   gap: 8px;
 }
 
+.export-section {
+  display: grid;
+  gap: 9px;
+  padding: 11px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-soft);
+}
+
+.export-section-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
+.export-section-heading strong {
+  color: var(--text-soft);
+  font-size: 12px;
+}
+
+.export-section-heading span {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 10px;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.export-section select,
+.export-section input {
+  width: 100%;
+  min-height: 36px;
+}
+
 .field {
   display: block;
 }

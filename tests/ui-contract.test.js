@@ -27,6 +27,36 @@ test("agent core loads before the panel controller", () => {
   assert.ok(html.indexOf('src="markdown-renderer.js"') < html.indexOf('src="panel.js"'));
   assert.ok(html.indexOf('src="agent-core.js"') < html.indexOf('src="panel.js"'));
   assert.ok(html.indexOf('src="ui-locales.js"') < html.indexOf('src="panel.js"'));
+  assert.ok(html.indexOf('src="workflow-artifacts.js"') < html.indexOf('src="panel.js"'));
+});
+
+test("structured datasets and portable workflow sets have local guarded controls", () => {
+  const html = fs.readFileSync(path.join(root, "panel.html"), "utf8");
+  const script = fs.readFileSync(path.join(root, "panel.js"), "utf8");
+  const artifacts = fs.readFileSync(path.join(root, "workflow-artifacts.js"), "utf8");
+
+  for (const id of [
+    "datasetSelect",
+    "downloadDatasetCsvButton",
+    "downloadDatasetXlsxButton",
+    "saveAutomationSetButton",
+    "saveTestSetButton",
+    "runWorkflowSetButton",
+    "exportWorkflowSetButton",
+    "importWorkflowSetButton"
+  ]) {
+    assert.equal(hasElementId(html, id), true, id);
+  }
+  assert.match(script, /mergeCollectionBatch\(existing/);
+  assert.match(script, /collectionAwaitingExtraction/);
+  assert.match(script, /Advance a collection by exactly one page or result-window action per turn/);
+  assert.match(script, /run\.siteScope\.origin !== currentOrigin/);
+  assert.match(script, /workflowStepContract/);
+  assert.match(script, /renderWorkflowStepInstruction/);
+  assert.match(artifacts, /datasetToCsv/);
+  assert.match(artifacts, /datasetToXlsx/);
+  assert.match(artifacts, /assertNoUnsafeWorkflowFields/);
+  assert.match(artifacts, /siteScope\.enforcement must be "same-origin"/);
 });
 
 test("assistant Markdown uses token parsing and an allowlisted DOM renderer", () => {
@@ -411,7 +441,7 @@ test("terminal response verification uses one immutable turn intent and current 
   assert.match(script, /decision\.status === "completed"[\s\S]*decision\.verifier\?\.status !== "verified"/);
   assert.match(script, /function bindVerifiedCompletionEvidence/);
   assert.match(script, /function bindCompletionVerifierAsGrounding/);
-  assert.match(completionFunction, /current-page-grounding verifier/);
+  assert.match(completionFunction, /completion, response-delivery, and grounding verifier/);
   assert.match(script, /discarded_unissued_ids/);
   assert.match(script, /allowVerifierEvidenceBinding:\s*false/);
   assert.match(script, /resolveAgentTurnIntent\(state\.agentSession\)/);

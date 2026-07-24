@@ -133,7 +133,7 @@ Element refs remain observation-scoped. A refreshed snapshot or element window c
 
 The extension evaluates this against currently exposed controls without sending the unfiltered control list back to the caller. It searches accessible names, semantic roles, tags, input types, placeholders, titles, ARIA descriptions, names, test identifiers, and bounded context from the nearest visible cell, row, collection, form, dialog, or region. When the filter allows it, cheap identity matching runs before expensive exposure and nearby-context scoring. Each returned control includes `searchMatch` with its score, matched fields, and a redacted context snippet so the caller can check why it was retrieved.
 
-When both `query` and `near_text` are supplied, the query must match the control's own identity and the nearby text must match its bounded context. Older pagination markup without semantic containers can contribute a small, complete ancestor group, but large ancestor text is rejected. For example, `{ "query": "2", "roles": ["link"], "near_text": "[1/5] [총 484건]" }` returns the literal page link instead of links whose table rows merely contain dates.
+When both `query` and `near_text` are supplied, the query must match the control's own identity and the nearby text must match its bounded context. Older pagination markup without semantic containers can contribute a small, complete ancestor group, but large ancestor text is rejected. For example, `{ "query": "Next", "roles": ["link"], "near_text": "Search results" }` selects the pagination link instead of an unrelated link with similar wording.
 
 For an unnamed icon identified only by its relation to a field, leave `query` empty, constrain `roles` to the actual control type, and put the adjacent field label in `near_text`. Local scoring gives the smallest complete ancestor or field group more weight than a broad form or region, so a nearby lookup button outranks an unrelated dropdown that happens to share the same form text.
 
@@ -166,7 +166,7 @@ The same approval behavior applies to `browser_visual_act`. The approval describ
 For a public-page regression outside the synthetic E2E fixture:
 
 ```bash
-npm run test:live-bridge -- "https://dart.fss.or.kr/dsac001/mainAll.do"
+npm run test:live-bridge -- "<public-page-url>"
 ```
 
 The harness creates a temporary extension copy with permission only for the supplied origin, an isolated headless browser profile, a local companion, one shared target tab, and a protected temporary `mcp-client.json`. Use the printed configuration in an MCP test client and run the same guided tools described above.

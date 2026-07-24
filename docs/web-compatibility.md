@@ -52,7 +52,13 @@ The observer keeps a collection-scoped cache for DOM queries, computed styles, r
 
 Permission preflight collects only visible frame boundaries and origins. Planning is DOM-first: if an ordinary page already exposes visible text, controls, forms, or tables, enabling screenshot support does not attach pixels to every model request. Screenshots are selected when visual surfaces exist, the DOM provides no usable evidence, or the runtime explicitly requires fresh visual evidence. A screenshot cycle performs one full observation, captures the pixels, and validates a compact probe containing document and viewport revisions, included target bindings, and frame boundaries. It recollects the full page only when that probe detects a change. Collection diagnostics, including wall time, phase timings, scanned-node count, query count, and cache hits, are available to the extension context view for distinguishing DOM collection cost from model or network latency.
 
-The built-in agent skips a conversation-intent model call for a fresh standalone request, excludes duplicate page-text aliases and full evidence payloads from planner input, and combines terminal completion-evidence and current-page-grounding checks in one verifier request. Before execution, actions proven read-only or limited to a disclosure control or same-origin link use the canonical deterministic state-change contract; actions that can be consequential still use the independent policy model. Inside an action, the first paint and observable state fingerprint are checked immediately; a bounded 220 ms grace period is used only when no change appears, and the old unconditional trailing 120 ms delay is gone. After execution, the top document reports readiness plus DOM, visual, URL, and scroll revisions until they have remained quiet for a dynamically bounded interval, replacing unconditional 450 ms and 1.2 s sleeps. If document replacement closes the content response channel, success is recovered only after the browser confirms that the same frame has a new document ID or sanitized URL. A prior conversation, changed screenshot, malformed decision, consequential effect, or uncertain completion still activates the corresponding conservative path.
+Every fresh request resolves an immutable intent. That model request runs concurrently with a prefetched initial DOM observation and MCP capability discovery, and the prefetched page state is reused only if a compact probe confirms that it is still current. The planner excludes duplicate page-text aliases and full evidence payloads, and terminal completion-evidence and current-page-grounding checks share one verifier request. Before execution, actions proven read-only or limited to a disclosure control or same-origin link use the canonical deterministic state-change contract; actions that can be consequential still use the independent policy model. Inside an action, the first paint and observable state fingerprint are checked immediately; a bounded grace period is used only when no change appears. After execution, the top document reports readiness plus DOM, visual, URL, and scroll revisions until they have remained quiet for a dynamically bounded interval instead of relying on unconditional sleeps. If document replacement closes the content response channel, success is recovered only after the browser confirms that the same frame has a new document ID or sanitized URL. A stale prefetch, prior conversation, changed screenshot, malformed decision, consequential effect, or uncertain completion still activates the corresponding conservative path.
+
+## Structured record collections
+
+An exact record count is treated as output cardinality, separate from permission to repeat a state-changing effect. For a structured collection, the agent binds `extract` to one representative record ref and supplies one stable collection identity across result pages. The content layer expands the repeated rendered structure around that exemplar, preserves the redacted record context and provenance, groups links that describe the same record, and emits stable keys for runtime deduplication.
+
+The runtime merges each page batch into one collection ledger before allowing further traversal. It stops as soon as the unique-record count reaches the requested target and returns only that target-sized result. A repeated page identity or a page that adds no new unique records marks the ledger as stalled; further pagination is blocked and the agent must report the exact shortfall instead of looping or treating navigation as collection progress.
 
 ## How model-assisted visual targeting works
 
@@ -70,15 +76,15 @@ Any missing screenshot, changed geometry, replaced frame document, occluded poin
 
 The authenticated external MCP bridge still does not accept raw `visual_click` actions. Instead, `browser_visual_act` lets the caller provide only a current surface ref and a precise target description. The extension captures and binds the screenshot, obtains and verifies the normalized point with the configured model, applies policy and approval, then resolves and verifies the target again against a fresh screenshot immediately before execution. Coordinates, screenshot tokens, policy results, and approval claims never cross the public input boundary.
 
-## Live legacy-page validation
+## Disposable public-page validation
 
-On 2026-07-23 the public [DART recent-disclosure list](https://dart.fss.or.kr/dsac001/mainAll.do) provided a combined compatibility case: hundreds of live table records, continuous updates, `body { overflow-y: scroll }`, numeric AJAX pagination implemented with `javascript:search(page)`, and a framed report viewer.
+Use the live Bridge harness for a public-page regression that is not covered by the synthetic fixture:
 
-The initial run exposed two concrete failures. Treating the shifted `body` rectangle as an ordinary overflow ancestor removed table rows that were visibly painted after scrolling. After that was corrected, the isolated content-script world could dispatch pointer events to page `2` but could not reliably resolve the page-owned `search` function; the action was incorrectly described as navigation even though `[1/5]` remained visible.
+```bash
+npm run test:live-bridge -- "<public-page-url>"
+```
 
-The current path clips the document root only once against the viewport. It also identifies `javascript:` anchors generically, binds the exact observed selector and declared `href`, activates that already-approved link in the page's main world, and asks the content layer to compare the post-action fingerprint. No observable change becomes a failed action rather than a success. In the final live run, structured retrieval returned the `2` link first with `[1/5] [총 484건]` as its evidence, execution changed the fingerprint, the next observation showed `[2/5]`, and the first page-2 disclosure opened in the same shared tab.
-
-![DART report detail opened after verified legacy pagination](assets/dart-legacy-agent-loop.jpg)
+The harness grants only the supplied origin to a temporary extension copy, launches an isolated browser profile, and creates short-lived local Bridge credentials. Drive the normal guided workflow, review pending effects with `status`, and use `approve` or `reject` before execution. `quit` closes the browser and companion and removes the temporary profile and token. Do not use this harness with a signed-in or private page.
 
 ## Permission behavior
 
@@ -141,7 +147,8 @@ The real-browser E2E fixture checks that:
 - a document replacement that closes the content response is recovered from browser-observed navigation, and a composite menu item activates its one nested link instead of its icon;
 - immediate disclosure changes return without the former per-action fixed waits, while a delayed mutation still has a bounded grace window;
 - the built-in model loop issues `discover` and obtains the target without blindly advancing the unfiltered cursor;
-- a fresh standalone request skips the intent-resolver model call, planner context removes duplicate aliases and evidence payloads, and a successful completion does not invoke a second grounding verifier;
+- immutable-intent resolution overlaps the prefetched initial DOM and MCP observation, reuses it only after a fresh probe, and discards it when page state changed;
+- structured collection extraction expands rendered records from a bound exemplar, deduplicates stable rows across pages, and stops at the exact target or a repeated/no-new-record page;
 - a complete latest message becomes a standalone immutable intent even after a failed related run, while an explicit continuation carries only the named unfinished deliverable;
 - malformed decision output and stray `elementSearch` metadata are repaired without exposing internal JSON or schema errors, and one successful semantic effect cannot be repeated beyond the resolved turn boundary;
 - approval-time validation reconstructs the search observation instead of rebinding its ref in the default window;

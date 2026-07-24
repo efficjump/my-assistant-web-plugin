@@ -94,6 +94,42 @@
         minimum: 1,
         description: "Maximum successful occurrences of the same semantic effect. Use 1 for once."
       },
+      deliverable: {
+        type: "object",
+        additionalProperties: false,
+        description: "The requested output contract. Collection cardinality is separate from effect repetition.",
+        properties: {
+          kind: {
+            type: "string",
+            enum: ["answer", "effect", "collection"],
+            description: "Whether the request primarily returns an answer, performs an effect, or collects records."
+          },
+          itemDescription: {
+            type: "string",
+            maxLength: 500,
+            description: "Concise semantic description of one requested collection item; empty for non-collections."
+          },
+          targetCount: {
+            type: ["integer", "null"],
+            minimum: 1,
+            maximum: 5000,
+            description: "Exact requested unique record count, or null when no explicit collection count exists."
+          },
+          fields: {
+            type: "array",
+            maxItems: 16,
+            items: { type: "string", maxLength: 120 },
+            description: "Semantic output fields requested by the user, such as title or URL."
+          },
+          includeCriteria: {
+            type: "array",
+            maxItems: 8,
+            items: { type: "string", maxLength: 500 },
+            description: "User-stated inclusion or exclusion rules for collected records."
+          }
+        },
+        required: ["kind", "itemDescription", "targetCount", "fields", "includeCriteria"]
+      },
       completionCriteria: {
         type: "array",
         maxItems: 8,
@@ -113,6 +149,7 @@
       "contextSummary",
       "repeatPolicy",
       "repeatLimit",
+      "deliverable",
       "completionCriteria",
       "reason"
     ]
@@ -241,6 +278,20 @@
               ...nullableString,
               description: "Concise visible description of the exact target at the proposed visual coordinates."
             },
+            collectionId: {
+              ...nullableString,
+              description: "Stable semantic ID reused across pages for one structured record collection."
+            },
+            collectionName: {
+              ...nullableString,
+              description: "User-facing name for the structured collection."
+            },
+            targetCount: {
+              type: ["integer", "null"],
+              minimum: 1,
+              maximum: 5000,
+              description: "Exact unique-record target from the immutable turn intent."
+            },
             altKey: nullableBoolean,
             ctrlKey: nullableBoolean,
             metaKey: nullableBoolean,
@@ -274,6 +325,9 @@
             "xNormalized",
             "yNormalized",
             "targetDescription",
+            "collectionId",
+            "collectionName",
+            "targetCount",
             "altKey",
             "ctrlKey",
             "metaKey",
@@ -489,6 +543,17 @@
     const normalizedLimit = Number.isFinite(requestedLimit)
       ? Math.max(1, Math.min(Number.MAX_SAFE_INTEGER, Math.round(requestedLimit)))
       : 1;
+    const deliverableSource = source.deliverable && typeof source.deliverable === "object"
+      && !Array.isArray(source.deliverable)
+      ? source.deliverable
+      : {};
+    const deliverableKind = ["answer", "effect", "collection"].includes(deliverableSource.kind)
+      ? deliverableSource.kind
+      : "effect";
+    const requestedTargetCount = Number(deliverableSource.targetCount);
+    const targetCount = deliverableKind === "collection" && Number.isFinite(requestedTargetCount)
+      ? Math.max(1, Math.min(5000, Math.round(requestedTargetCount)))
+      : null;
     return {
       version: stringValue(source.version || "1.0"),
       mode,
@@ -498,6 +563,25 @@
         : "",
       repeatPolicy,
       repeatLimit: repeatPolicy === "once" ? 1 : normalizedLimit,
+      deliverable: {
+        kind: deliverableKind,
+        itemDescription: deliverableKind === "collection"
+          ? stringValue(deliverableSource.itemDescription).trim().slice(0, 500)
+          : "",
+        targetCount,
+        fields: deliverableKind === "collection"
+          ? uniqueStrings(stringArray(deliverableSource.fields)
+            .map((item) => normalizeWhitespace(item).slice(0, 120))
+            .filter(Boolean))
+            .slice(0, 16)
+          : [],
+        includeCriteria: deliverableKind === "collection"
+          ? uniqueStrings(stringArray(deliverableSource.includeCriteria)
+            .map((item) => normalizeWhitespace(item).slice(0, 500))
+            .filter(Boolean))
+            .slice(0, 8)
+          : []
+      },
       completionCriteria: stringArray(source.completionCriteria)
         .map((item) => normalizeWhitespace(item).slice(0, 1000))
         .filter(Boolean)
@@ -519,6 +603,17 @@
     }
     if (normalized.repeatPolicy === "bounded" && normalized.repeatLimit < 2) {
       errors.push("A bounded repeat policy requires an explicit limit of at least 2.");
+    }
+    if (normalized.deliverable.kind === "collection") {
+      if (!normalized.deliverable.itemDescription) {
+        errors.push("A collection deliverable requires an item description.");
+      }
+      if (!Number.isInteger(normalized.deliverable.targetCount) || normalized.deliverable.targetCount < 1) {
+        errors.push("A collection deliverable requires an exact target count.");
+      }
+      if (!normalized.deliverable.fields.length) {
+        errors.push("A collection deliverable requires at least one requested field.");
+      }
     }
     if (!normalized.completionCriteria.length) {
       errors.push("Turn intent requires at least one observable completion criterion.");
@@ -645,12 +740,12 @@
       type: stringValue(action.type).trim().toLowerCase(),
       reason: stringValue(action.reason)
     };
-    for (const key of ["ref", "selector", "text", "key", "code", "direction", "block", "inline", "url", "conditionJson", "filename", "accept", "visualObservationId", "targetDescription"]) {
+    for (const key of ["ref", "selector", "text", "key", "code", "direction", "block", "inline", "url", "conditionJson", "filename", "accept", "visualObservationId", "targetDescription", "collectionId", "collectionName"]) {
       if (action[key] !== undefined && action[key] !== null && String(action[key]).trim()) {
         normalized[key] = String(action[key]).trim();
       }
     }
-    for (const key of ["value", "checked", "amount", "ms", "tabId", "adopt", "multiple", "downloadId", "xNormalized", "yNormalized", "altKey", "ctrlKey", "metaKey", "shiftKey"]) {
+    for (const key of ["value", "checked", "amount", "ms", "tabId", "adopt", "multiple", "downloadId", "xNormalized", "yNormalized", "targetCount", "altKey", "ctrlKey", "metaKey", "shiftKey"]) {
       if (action[key] !== undefined && action[key] !== null) {
         normalized[key] = action[key];
       }
@@ -812,6 +907,30 @@
         } catch {
           errors.push("wait_for 액션에는 유효한 conditionJson이 필요합니다.");
         }
+      }
+      if (action.type === "extract" && action.collectionId) {
+        if (!action.ref) {
+          errors.push("구조화 extract 액션에는 현재 관찰의 예시 레코드 ref가 필요합니다.");
+        }
+        if (!action.collectionName) {
+          errors.push("구조화 extract 액션에는 collectionName이 필요합니다.");
+        }
+        if (!Number.isInteger(Number(action.targetCount)) || Number(action.targetCount) < 1 || Number(action.targetCount) > 5000) {
+          errors.push("구조화 extract 액션에는 1~5000 범위의 targetCount가 필요합니다.");
+        }
+      }
+      if (
+        action.type !== "extract"
+        && (action.collectionId || action.collectionName || action.targetCount !== undefined)
+      ) {
+        errors.push("collectionId, collectionName, targetCount는 extract 액션에서만 사용할 수 있습니다.");
+      }
+      if (
+        action.type === "extract"
+        && !action.collectionId
+        && (action.collectionName || action.targetCount !== undefined)
+      ) {
+        errors.push("구조화 extract 필드는 collectionId와 함께 사용해야 합니다.");
       }
       if (["tab_focus", "tab_adopt", "tab_close"].includes(action.type) && !Number.isInteger(Number(action.tabId))) {
         errors.push(`${action.type} 액션에는 관찰된 tabId가 필요합니다.`);
@@ -1161,6 +1280,7 @@ If the required visible control is absent, prefer status discover with a concise
 For an unlabeled icon or button identified relative to a nearby field, put the control kind in roles and the adjacent visible label in nearText. Leave query empty when the control itself has no visible or accessible name.
 Use visual_click only when the latest context contains visualObservation and a visual surface ref, no normal DOM ref can represent the visible target, and the target is unambiguous in the attached screenshot. Bind it to visualObservation.id, describe the exact visible target, and provide one point relative to that surface on a 0–1000 scale. Never use visual coordinates to guess hidden content or bypass a permission boundary.
 Use the runtime-resolved immutable turn intent. Do not re-expand it from raw conversation history or retry a failed prior effect unless that intent explicitly carries the prior deliverable.
+Treat deliverable.targetCount as output cardinality, never as permission to repeat the same state-changing effect. For a collection deliverable, use a bound extract action with one representative record ref, a stable collectionId reused across pages, collectionName, and the exact targetCount. The runtime expands repeated rendered records, deduplicates them across pages, and reports the remaining count. Extract the current result page before navigating again. Stop page traversal as soon as the ledger reaches the target or reports a repeated/no-new-record page.
 A terminal message is the exact response shown to the user. For answer or completed, include the requested result itself. Never end with a promise to inspect, summarize, compare, or report later, and never say that information was summarized without presenting that information.
 Keep each turn small. Prefer one effect class per turn. If the previous attempt made no progress, choose a materially different action, gather missing evidence, ask one focused clarification, or stop with a precise blocker.
 An executed request is not proof of progress. Use the reported observable change and do not repeat the same failed, unchanged, indeterminate, or disclosure-toggle attempt from the same evidence state.

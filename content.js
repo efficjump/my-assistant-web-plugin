@@ -16,6 +16,7 @@ const assistantPageState = {
   mutationObservers: [],
   visualOccluderCache: new WeakMap(),
   includeChildFrames: true,
+  redactSensitiveData: true,
   collectionCache: null,
   observationProbe: null,
   visualRevision: 0,
@@ -55,6 +56,7 @@ const NATIVE_INTERACTIVE_TAGS = new Set([
   "textarea",
   "video"
 ]);
+const MAX_COLLECTION_LINK_SCAN = 12000;
 
 observePageMutations();
 
@@ -112,6 +114,7 @@ function collectPageContext(options) {
     nearText: options.elementNearText
   });
   const redactSensitiveData = options.redactSensitiveData !== false;
+  assistantPageState.redactSensitiveData = redactSensitiveData;
   const interactiveElementCollection = measureCollectionPhase(
     "interactiveElements",
     () => collectInteractiveElements({
@@ -444,6 +447,7 @@ function collectFrameContext(options = {}) {
     assistantPageState.scopes = collectDomScopes(false);
     observeDomScopes(assistantPageState.scopes);
     const redactSensitiveData = options.redactSensitiveData !== false;
+    assistantPageState.redactSensitiveData = redactSensitiveData;
     return {
       documentId: assistantPageState.documentId,
       url: sanitizeUrlForContext(location.href, redactSensitiveData),
@@ -2395,14 +2399,752 @@ async function executeSingleAction(action) {
       return waitForCondition(action);
     case "upload":
       return uploadFiles(action);
-    case "extract":
-      return {
+    case "extract": {
+      const extracted = {
         text: collectVisibleText(8000),
         selection: getSelectionText()
       };
+      if (isStructuredCollectionAction(action)) {
+        extracted.collection = collectStructuredRecords(action);
+      }
+      return extracted;
+    }
     default:
       throw new Error(`Unsupported action type: ${action.type}`);
   }
+}
+
+function isStructuredCollectionAction(action) {
+  return Boolean(
+    action?._resolvedTarget?.element
+    && action.ref
+    && normalizeWhitespace(action.collectionId)
+    && normalizeWhitespace(action.collectionName)
+    && Number.isFinite(Number(action.targetCount))
+    && Number(action.targetCount) > 0
+  );
+}
+
+function collectStructuredRecords(action) {
+  const exemplar = resolveElement(action);
+  const ownerDocument = exemplar.ownerDocument;
+  const collectionId = normalizeWhitespace(action.collectionId);
+  const collectionName = normalizeWhitespace(action.collectionName);
+  const targetCount = Math.max(1, Math.floor(Number(action.targetCount)));
+  const exemplarLink = findCollectionLink(exemplar);
+  const linkSource = collectCollectionLinkSource(exemplar, ownerDocument, targetCount);
+  const documentLinks = linkSource.links;
+  const scanWindow = selectCollectionLinkScanWindow(
+    documentLinks,
+    exemplarLink,
+    targetCount
+  );
+  const renderedLinks = scanWindow.links
+    .map((link) => describeCollectionLink(link))
+    .filter((descriptor) => descriptor.url);
+  const exemplarDescriptor = exemplarLink
+    ? renderedLinks.find((descriptor) => descriptor.element === exemplarLink)
+      || describeCollectionLink(exemplarLink)
+    : null;
+  const shapedLinks = exemplarDescriptor?.url
+    ? renderedLinks.filter((descriptor) => collectionUrlsShareShape(
+      exemplarDescriptor.url,
+      descriptor.url
+    ))
+    : [];
+  const repeatedBoundary = inferRepeatedCollectionBoundary(
+    exemplar,
+    exemplarDescriptor,
+    shapedLinks
+  );
+  const scopedLinks = repeatedBoundary
+    ? shapedLinks.filter((descriptor) => (
+      composedElementContains(repeatedBoundary.root, descriptor.element)
+    ))
+    : shapedLinks;
+  const groupedLinks = groupCollectionLinksByUrl(scopedLinks);
+  const exemplarGroup = exemplarDescriptor?.url
+    ? groupedLinks.find((group) => group.url === exemplarDescriptor.url)
+      || groupCollectionLinksByUrl([exemplarDescriptor])[0]
+    : null;
+  const requiresNumericTitlePair = collectionLinkGroupHasNumericTitlePair(exemplarGroup);
+  const exemplarContainer = findCollectionRecordContainer(exemplarGroup, repeatedBoundary);
+  const exemplarPath = collectionRelativeElementPath(
+    exemplarDescriptor?.element,
+    exemplarContainer
+  );
+  const collectionStrategy = repeatedBoundary
+    ? "repeated-container-and-url-shape"
+    : exemplarDescriptor?.url
+      ? "url-shape"
+      : "repeated-container";
+
+  let recordCandidates = groupedLinks
+    .filter((group) => (
+      !requiresNumericTitlePair
+      || collectionLinkGroupHasNumericTitlePair(group)
+    ))
+    .map((group) => buildCollectionRecord({
+      action,
+      group,
+      repeatedBoundary,
+      exemplarPath,
+      strategy: collectionStrategy
+    }))
+    .filter((record) => record.title || record.text || record.context);
+
+  if (!recordCandidates.length) {
+    recordCandidates = collectRepeatedContainerRecords({
+      action,
+      exemplar,
+      ownerDocument,
+      targetCount
+    });
+  }
+
+  const seenKeys = new Set();
+  const records = recordCandidates
+    .filter((record) => {
+      if (!record.key || seenKeys.has(record.key)) {
+        return false;
+      }
+      seenKeys.add(record.key);
+      return true;
+    })
+    .slice(0, targetCount);
+  const sourceSliceDigest = hashObservationProbe(records.map((record) => record.key));
+  const pageIdentity = {
+    url: sanitizeUrlForContext(
+      String(ownerDocument.location?.href || location.href),
+      assistantPageState.redactSensitiveData
+    ),
+    documentId: assistantPageState.documentId,
+    domRevision: assistantPageState.domRevision,
+    sourceSliceDigest
+  };
+
+  return {
+    collectionId,
+    collectionName,
+    targetCount,
+    returnedCount: records.length,
+    records,
+    pageIdentity,
+    scope: "rendered-document",
+    sourceSliceDigest,
+    provenance: {
+      source: "bound-exemplar",
+      exemplarRef: String(action.ref),
+      strategy: collectionStrategy,
+      scanSource: linkSource.source,
+      scannedLinkCount: scanWindow.links.length,
+      totalRenderedLinkCount: documentLinks.length,
+      scanTruncated: scanWindow.truncated,
+      matchedLinkCount: scopedLinks.length,
+      inferredRecordCount: recordCandidates.length,
+      excludedSingleLinkRecords: requiresNumericTitlePair
+    }
+  };
+}
+
+function collectCollectionLinkSource(exemplar, ownerDocument, targetCount) {
+  const structuralBoundary = inferStructuralCollectionBoundary(exemplar);
+  if (structuralBoundary?.root?.querySelectorAll) {
+    const localLinks = Array.from(
+      structuralBoundary.root.querySelectorAll("a[href],area[href]")
+    ).filter((link) => (
+      link.ownerDocument === ownerDocument
+      && link.isConnected
+      && isElementTreeRendered(link)
+    ));
+    const distinctUrls = new Set(
+      localLinks.map((link) => canonicalizeCollectionUrl(readElementHref(link))).filter(Boolean)
+    );
+    const minimumDistinctRecords = Math.max(1, Math.min(Number(targetCount) || 1, 4));
+    if (distinctUrls.size >= minimumDistinctRecords) {
+      return { links: localLinks, source: "repeated-ancestor" };
+    }
+  }
+  return {
+    links: queryAllDom("a[href],area[href]")
+      .filter((link) => (
+        link.ownerDocument === ownerDocument
+        && link.isConnected
+        && isElementTreeRendered(link)
+      )),
+    source: "document-fallback"
+  };
+}
+
+function selectCollectionLinkScanWindow(links, exemplar, targetCount) {
+  if (!links.length) {
+    return { links: [], truncated: false };
+  }
+  const desiredSize = Math.min(
+    MAX_COLLECTION_LINK_SCAN,
+    Math.max(96, Math.ceil(targetCount * 12))
+  );
+  if (links.length <= desiredSize) {
+    return { links, truncated: false };
+  }
+  const exemplarIndex = Math.max(0, links.indexOf(exemplar));
+  const beforeCount = Math.floor(desiredSize / 2);
+  let start = Math.max(0, exemplarIndex - beforeCount);
+  let end = Math.min(links.length, start + desiredSize);
+  start = Math.max(0, end - desiredSize);
+  return {
+    links: links.slice(start, end),
+    truncated: true
+  };
+}
+
+function findCollectionLink(element) {
+  let current = element;
+  while (current?.ownerDocument === element?.ownerDocument) {
+    if (
+      ["a", "area"].includes(current.tagName?.toLowerCase())
+      && hasElementHref(current)
+      && isElementTreeRendered(current)
+    ) {
+      return current;
+    }
+    current = getLocalComposedParentElement(current);
+  }
+  return Array.from(element?.querySelectorAll?.("a[href],area[href]") || [])
+    .find((link) => isElementTreeRendered(link))
+    || null;
+}
+
+function describeCollectionLink(link) {
+  return {
+    element: link,
+    url: canonicalizeCollectionUrl(readElementHref(link)),
+    labels: collectCollectionLinkLabels(link)
+  };
+}
+
+function canonicalizeCollectionUrl(value) {
+  try {
+    const parsed = new URL(String(value || ""), location.href);
+    if (!["http:", "https:"].includes(parsed.protocol)) {
+      return "";
+    }
+    parsed.hash = "";
+    const sortedParameters = Array.from(parsed.searchParams.entries())
+      .sort(([leftKey, leftValue], [rightKey, rightValue]) => (
+        leftKey.localeCompare(rightKey) || leftValue.localeCompare(rightValue)
+      ));
+    parsed.search = "";
+    for (const [key, parameterValue] of sortedParameters) {
+      parsed.searchParams.append(key, parameterValue);
+    }
+    return parsed.href;
+  } catch {
+    return "";
+  }
+}
+
+function collectionUrlsShareShape(exemplarValue, candidateValue) {
+  let exemplar;
+  let candidate;
+  try {
+    exemplar = new URL(exemplarValue);
+    candidate = new URL(candidateValue);
+  } catch {
+    return exemplarValue === candidateValue;
+  }
+  if (exemplar.origin !== candidate.origin) {
+    return false;
+  }
+
+  const exemplarKeys = Array.from(new Set(exemplar.searchParams.keys())).sort();
+  const candidateKeys = Array.from(new Set(candidate.searchParams.keys())).sort();
+  if (exemplarKeys.length || candidateKeys.length) {
+    return (
+      exemplar.pathname === candidate.pathname
+      && exemplarKeys.length === candidateKeys.length
+      && exemplarKeys.every((key, index) => key === candidateKeys[index])
+    );
+  }
+  if (exemplar.pathname === candidate.pathname) {
+    return true;
+  }
+
+  const exemplarSegments = exemplar.pathname.split("/").filter(Boolean);
+  const candidateSegments = candidate.pathname.split("/").filter(Boolean);
+  if (exemplarSegments.length !== candidateSegments.length) {
+    return false;
+  }
+  const differingIndexes = exemplarSegments
+    .map((segment, index) => segment === candidateSegments[index] ? -1 : index)
+    .filter((index) => index >= 0);
+  if (differingIndexes.length !== 1) {
+    return false;
+  }
+  const differingIndex = differingIndexes[0];
+  const hasStablePathContext = exemplarSegments.some((
+    segment,
+    index
+  ) => index !== differingIndex && segment === candidateSegments[index]);
+  return (
+    hasStablePathContext
+    || (
+      isCollectionIdentifierSegment(exemplarSegments[differingIndex])
+      && isCollectionIdentifierSegment(candidateSegments[differingIndex])
+    )
+  );
+}
+
+function isCollectionIdentifierSegment(value) {
+  const text = String(value || "");
+  return (
+    /^\d+$/.test(text)
+    || /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(text)
+    || /^[0-9a-f]{16,}$/i.test(text)
+  );
+}
+
+function inferRepeatedCollectionBoundary(exemplar, exemplarDescriptor, shapedLinks) {
+  if (!exemplarDescriptor?.url || shapedLinks.length < 2) {
+    return inferStructuralCollectionBoundary(exemplar);
+  }
+  let current = exemplarDescriptor.element;
+  const ownerDocument = exemplar.ownerDocument;
+  while (
+    current
+    && current.ownerDocument === ownerDocument
+    && current !== ownerDocument.documentElement
+  ) {
+    const parent = getLocalComposedParentElement(current);
+    if (!parent || parent.ownerDocument !== ownerDocument) {
+      break;
+    }
+    const children = Array.from(parent.children || [])
+      .filter((child) => isElementTreeRendered(child));
+    const matchingChildren = children
+      .map((child) => ({
+        element: child,
+        links: shapedLinks.filter((descriptor) => composedElementContains(
+          child,
+          descriptor.element
+        ))
+      }))
+      .filter((entry) => entry.links.length);
+    const distinctUrls = new Set(
+      matchingChildren.flatMap((entry) => entry.links.map((descriptor) => descriptor.url))
+    );
+    const exemplarContainer = matchingChildren.find((entry) => (
+      composedElementContains(entry.element, exemplarDescriptor.element)
+    ))?.element;
+    if (exemplarContainer && matchingChildren.length >= 2 && distinctUrls.size >= 2) {
+      return {
+        root: parent,
+        exemplarContainer,
+        containers: matchingChildren.map((entry) => entry.element),
+        strategy: "repeated-url-containers"
+      };
+    }
+    current = parent;
+  }
+  return inferStructuralCollectionBoundary(exemplar);
+}
+
+function inferStructuralCollectionBoundary(exemplar) {
+  const ownerDocument = exemplar?.ownerDocument;
+  let current = getLocalComposedParentElement(exemplar);
+  while (
+    current
+    && current.ownerDocument === ownerDocument
+    && current !== ownerDocument.documentElement
+  ) {
+    const parent = getLocalComposedParentElement(current);
+    if (!parent || parent.ownerDocument !== ownerDocument) {
+      break;
+    }
+    const fingerprint = collectionContainerFingerprint(current);
+    const matchingChildren = Array.from(parent.children || []).filter((child) => (
+      child !== current
+      && isElementTreeRendered(child)
+      && collectionContainerFingerprint(child) === fingerprint
+      && collectRenderedRecordText(child, 120)
+    ));
+    if (matchingChildren.length) {
+      return {
+        root: parent,
+        exemplarContainer: current,
+        containers: [current, ...matchingChildren],
+        strategy: "repeated-structure"
+      };
+    }
+    current = parent;
+  }
+  return null;
+}
+
+function collectionContainerFingerprint(element) {
+  const tag = element?.tagName?.toLowerCase() || "";
+  const role = normalizeWhitespace(element?.getAttribute?.("role") || "");
+  const childTags = Array.from(element?.children || [])
+    .slice(0, 12)
+    .map((child) => child.tagName?.toLowerCase() || "")
+    .join(",");
+  const linkCount = Array.from(element?.querySelectorAll?.("a[href],area[href]") || [])
+    .filter((link) => isElementTreeRendered(link))
+    .length;
+  return `${tag}|${role}|${childTags}|${Math.min(linkCount, 3)}`;
+}
+
+function composedElementContains(container, element) {
+  let current = element;
+  while (current) {
+    if (current === container) {
+      return true;
+    }
+    current = getLocalComposedParentElement(current);
+  }
+  return false;
+}
+
+function groupCollectionLinksByUrl(descriptors) {
+  const groups = new Map();
+  for (const descriptor of descriptors) {
+    if (!descriptor?.url) {
+      continue;
+    }
+    if (!groups.has(descriptor.url)) {
+      groups.set(descriptor.url, {
+        url: descriptor.url,
+        links: []
+      });
+    }
+    groups.get(descriptor.url).links.push(descriptor);
+  }
+  return Array.from(groups.values());
+}
+
+function collectCollectionLinkLabels(link) {
+  const rawText = collectRenderedRecordText(link, 1200);
+  const candidates = [
+    { value: normalizeWhitespace(link.getAttribute("title") || ""), source: "title", priority: 4 },
+    { value: normalizeWhitespace(link.getAttribute("aria-label") || ""), source: "aria-label", priority: 3 },
+    { value: rawText, source: "rendered-text", priority: 2 },
+    { value: normalizeWhitespace(getAccessibleName(link)), source: "accessible-name", priority: 1 }
+  ];
+  const seen = new Set();
+  return candidates.filter((candidate) => {
+    candidate.value = redactCollectionText(candidate.value);
+    const identity = `${candidate.source}:${candidate.value}`;
+    if (!candidate.value || seen.has(identity)) {
+      return false;
+    }
+    seen.add(identity);
+    return true;
+  });
+}
+
+function isNumericCollectionLabel(value) {
+  const text = normalizeWhitespace(value);
+  return (
+    /\p{N}/u.test(text)
+    && /^[\p{N}\s.,#()[\]{}:+/_-]+$/u.test(text)
+  );
+}
+
+function collectionLinkGroupHasNumericTitlePair(group) {
+  if (!group?.links?.length || group.links.length < 2) {
+    return false;
+  }
+  return group.links.some((descriptor) => (
+    (descriptor.labels || []).some((label) => isNumericCollectionLabel(label.value))
+  ));
+}
+
+function selectCollectionTitle(group, preferredPath = "") {
+  const labels = (group?.links || []).flatMap((descriptor) => {
+    const path = collectionRelativeElementPath(
+      descriptor.element,
+      findCollectionRecordContainer(group, null)
+    );
+    return (descriptor.labels || []).map((label) => ({
+      ...label,
+      preferred: Boolean(preferredPath && path === preferredPath),
+      relationship: collectionLabelRelationship(label, descriptor.labels)
+    }));
+  });
+  return labels
+    .slice()
+    .sort((left, right) => {
+      const leftDescriptive = isNumericCollectionLabel(left.value) ? 0 : 1;
+      const rightDescriptive = isNumericCollectionLabel(right.value) ? 0 : 1;
+      return (
+        right.relationship - left.relationship
+        || rightDescriptive - leftDescriptive
+        || Number(right.preferred) - Number(left.preferred)
+        || collectionLabelSpecificity(right) - collectionLabelSpecificity(left)
+        || right.priority - left.priority
+        || right.value.length - left.value.length
+      );
+    })[0]
+    || { value: "", source: "none" };
+}
+
+function collectionLabelRelationship(label, siblingLabels) {
+  if (label?.source === "rendered-text") {
+    return 3;
+  }
+  const renderedText = (siblingLabels || []).find(
+    (candidate) => candidate.source === "rendered-text"
+  )?.value || "";
+  if (!renderedText) {
+    return 1;
+  }
+  if (
+    ["title", "aria-label", "accessible-name"].includes(label?.source)
+    && collectionLabelExpandsRenderedText(label.value, renderedText)
+  ) {
+    return 4;
+  }
+  return 0;
+}
+
+function collectionLabelExpandsRenderedText(candidate, renderedText) {
+  const candidateText = normalizeWhitespace(candidate).normalize("NFKC").toLocaleLowerCase();
+  const renderedBase = normalizeWhitespace(renderedText)
+    .normalize("NFKC")
+    .toLocaleLowerCase()
+    .replace(/(?:\u2026|\.{2,})+\s*$/u, "")
+    .trim();
+  const candidateTokens = new Set(candidateText.match(/[\p{L}\p{N}]+/gu) || []);
+  const renderedTokens = new Set(renderedBase.match(/[\p{L}\p{N}]+/gu) || []);
+  const sharedTokenCount = Array.from(renderedTokens).filter(
+    (token) => candidateTokens.has(token)
+  ).length;
+  return Boolean(
+    renderedBase.length >= 2
+    && candidateText.length > renderedBase.length
+    && (
+      candidateText.startsWith(renderedBase)
+      || (
+        sharedTokenCount >= 2
+        && sharedTokenCount / Math.max(1, renderedTokens.size) >= 0.5
+      )
+    )
+  );
+}
+
+function collectionLabelSpecificity(label) {
+  const text = normalizeWhitespace(label?.value || "");
+  const lengthScore = Math.min(text.length, 240);
+  const wordScore = Math.min(text.split(/\s+/).filter(Boolean).length, 24) * 3;
+  return lengthScore + wordScore + Number(label?.priority || 0) * 4;
+}
+
+function buildCollectionRecord({
+  action,
+  group,
+  repeatedBoundary,
+  exemplarPath,
+  strategy
+}) {
+  const titleDescriptor = selectCollectionTitle(group, exemplarPath);
+  const recordContainer = findCollectionRecordContainer(group, repeatedBoundary);
+  const context = redactCollectionText(collectRenderedRecordText(recordContainer, 1600));
+  const outputUrl = sanitizeUrlForContext(group.url, assistantPageState.redactSensitiveData);
+  const key = outputUrl === group.url ? group.url : `url:${hashObservationProbe(group.url)}`;
+  return {
+    key,
+    title: truncate(titleDescriptor.value, 1200),
+    url: outputUrl,
+    text: truncate(titleDescriptor.value || context, 1600),
+    context: truncate(context || titleDescriptor.value, 1600),
+    provenance: {
+      source: "rendered-document",
+      collectionId: normalizeWhitespace(action.collectionId),
+      exemplarRef: String(action.ref),
+      strategy,
+      labelSource: titleDescriptor.source,
+      linkCount: group.links.length,
+      numericTitlePair: collectionLinkGroupHasNumericTitlePair(group),
+      containerTag: recordContainer?.tagName?.toLowerCase() || ""
+    }
+  };
+}
+
+function collectionRelativeElementPath(element, container) {
+  if (!element || !container || !composedElementContains(container, element)) {
+    return "";
+  }
+  const parts = [];
+  let current = element;
+  while (current && current !== container) {
+    const parent = getLocalComposedParentElement(current);
+    if (!parent) {
+      return "";
+    }
+    const siblings = Array.from(parent.children || []);
+    parts.unshift(`${current.tagName?.toLowerCase() || ""}:${siblings.indexOf(current)}`);
+    current = parent;
+  }
+  return current === container ? parts.join("/") : "";
+}
+
+function findCollectionRecordContainer(group, repeatedBoundary) {
+  const firstLink = group?.links?.[0]?.element;
+  if (!firstLink) {
+    return null;
+  }
+  if (repeatedBoundary?.root) {
+    const directContainer = Array.from(repeatedBoundary.root.children || [])
+      .find((child) => composedElementContains(child, firstLink));
+    if (directContainer) {
+      return directContainer;
+    }
+  }
+  if (group.links.length > 1) {
+    let current = firstLink;
+    while (current) {
+      if (group.links.every((descriptor) => composedElementContains(current, descriptor.element))) {
+        return current;
+      }
+      current = getLocalComposedParentElement(current);
+    }
+  }
+  return getLocalComposedParentElement(firstLink) || firstLink;
+}
+
+function collectRepeatedContainerRecords({
+  action,
+  exemplar,
+  ownerDocument,
+  targetCount
+}) {
+  const boundary = inferStructuralCollectionBoundary(exemplar);
+  if (!boundary?.containers?.length) {
+    const context = collectRenderedRecordText(exemplar, 1600);
+    const title = normalizeWhitespace(
+      exemplar.getAttribute?.("title")
+      || exemplar.getAttribute?.("aria-label")
+      || getAccessibleName(exemplar)
+      || context
+    );
+    if (!title && !context) {
+      return [];
+    }
+    return [buildTextCollectionRecord({
+      action,
+      element: exemplar,
+      title,
+      context,
+      strategy: "bound-exemplar"
+    })];
+  }
+  return boundary.containers
+    .filter((container) => (
+      container.ownerDocument === ownerDocument
+      && isElementTreeRendered(container)
+    ))
+    .slice(0, targetCount)
+    .map((container) => {
+      const link = Array.from(container.querySelectorAll?.("a[href],area[href]") || [])
+        .find((candidate) => isElementTreeRendered(candidate));
+      const descriptor = link ? describeCollectionLink(link) : null;
+      const titleDescriptor = descriptor
+        ? selectCollectionTitle({ links: [descriptor] })
+        : { value: "", source: "rendered-text" };
+      const context = collectRenderedRecordText(container, 1600);
+      return buildTextCollectionRecord({
+        action,
+        element: container,
+        title: titleDescriptor.value || context,
+        context,
+        url: descriptor?.url || "",
+        labelSource: titleDescriptor.source,
+        strategy: boundary.strategy
+      });
+    });
+}
+
+function buildTextCollectionRecord({
+  action,
+  element,
+  title,
+  context,
+  url = "",
+  labelSource = "rendered-text",
+  strategy
+}) {
+  const normalizedTitle = normalizeWhitespace(title);
+  const normalizedContext = redactCollectionText(normalizeWhitespace(context));
+  const safeTitle = redactCollectionText(normalizedTitle);
+  const outputUrl = sanitizeUrlForContext(url, assistantPageState.redactSensitiveData);
+  const key = outputUrl === url && outputUrl
+    ? outputUrl
+    : url
+      ? `url:${hashObservationProbe(url)}`
+      : `record:${hashObservationProbe({
+    title: normalizedTitle,
+    context: normalizedContext
+      })}`;
+  return {
+    key,
+    title: truncate(safeTitle, 1200),
+    url: outputUrl,
+    text: truncate(safeTitle || normalizedContext, 1600),
+    context: truncate(normalizedContext || safeTitle, 1600),
+    provenance: {
+      source: "rendered-document",
+      collectionId: normalizeWhitespace(action.collectionId),
+      exemplarRef: String(action.ref),
+      strategy,
+      labelSource,
+      linkCount: outputUrl ? 1 : 0,
+      numericTitlePair: false,
+      containerTag: element?.tagName?.toLowerCase() || ""
+    }
+  };
+}
+
+function redactCollectionText(value) {
+  const text = normalizeWhitespace(value);
+  return assistantPageState.redactSensitiveData
+    ? redactSensitiveText(text)
+    : text;
+}
+
+function collectRenderedRecordText(element, maxChars) {
+  const ownerDocument = element?.ownerDocument;
+  const ownerWindow = ownerDocument?.defaultView || window;
+  if (!element || !ownerDocument || maxChars <= 0 || !isElementTreeRendered(element)) {
+    return "";
+  }
+  const parts = [];
+  let length = 0;
+  const walker = ownerDocument.createTreeWalker(
+    element,
+    ownerWindow.NodeFilter.SHOW_ELEMENT | ownerWindow.NodeFilter.SHOW_TEXT,
+    {
+      acceptNode(node) {
+        if (node.nodeType === ownerWindow.Node.ELEMENT_NODE) {
+          return shouldSkipElement(node) || !isElementTreeRendered(node)
+            ? ownerWindow.NodeFilter.FILTER_REJECT
+            : ownerWindow.NodeFilter.FILTER_SKIP;
+        }
+        const text = normalizeWhitespace(node.nodeValue || "");
+        const parent = node.parentElement;
+        if (!text || !parent || shouldSkipElement(parent) || !isElementTreeRendered(parent)) {
+          return ownerWindow.NodeFilter.FILTER_REJECT;
+        }
+        return ownerWindow.NodeFilter.FILTER_ACCEPT;
+      }
+    }
+  );
+  while (walker.nextNode() && length < maxChars) {
+    const text = normalizeWhitespace(walker.currentNode.nodeValue || "");
+    const remaining = maxChars - length;
+    parts.push(text.slice(0, remaining));
+    length += text.length + 1;
+  }
+  return normalizeWhitespace(parts.join(" "));
 }
 
 async function waitForCondition(action) {
