@@ -86,6 +86,13 @@ test("rejects invented refs and completion without evidence", () => {
   }), { maxEffects: 3 });
   const validation = Core.validateDecision(completed, { context });
   assert.match(validation.errors.join(" "), /completionEvidence/);
+
+  const verifierBoundValidation = Core.validateDecision(completed, {
+    context,
+    allowVerifierEvidenceBinding: true
+  });
+  assert.equal(verifierBoundValidation.valid, true);
+  assert.match(verifierBoundValidation.warnings.join(" "), /verifier/);
 });
 
 test("rejects actions against controls that are visibly disabled", () => {

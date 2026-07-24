@@ -4,7 +4,7 @@ A Manifest V3 browser extension that turns a configured language model into a bo
 
 ![Agent side panel](docs/assets/agent-panel.png)
 
-Version `0.9.4` with Bridge protocol `2.3` targets Chromium-based browsers version 116 or later. This repository contains a source-loaded development build rather than a store package. The screenshots in this README were regenerated from the current version with a temporary browser profile and local fixtures.
+Version `0.9.6` with Bridge protocol `2.3` targets Chromium-based browsers version 116 or later. This repository contains a source-loaded development build rather than a store package. The screenshots in this README were regenerated from the current version with a temporary browser profile and local fixtures.
 
 ## Choose the workflow
 
@@ -36,6 +36,8 @@ flowchart LR
 
 Completion is not accepted from model prose alone. Before any page effect, the runtime resolves one immutable intent for the latest message. A complete command starts a new standalone task even when it resembles an earlier failed request; only a semantically incomplete follow-up that explicitly resumes one unfinished deliverable carries prior context forward. The runtime also resolves whether the same semantic effect is allowed once, an explicit number of times, or until an explicit condition. A successful effect cannot be repeated beyond that boundary merely because the same control remains visible. Runtime-issued evidence and separate verifiers then check both the completion claim and the exact user-facing result. A terminal response must contain the requested result rather than announce future work or merely say that a summary was produced.
 
+The planner may cite only IDs already present in the runtime evidence ledger, but it no longer has to copy an opaque ID correctly to reach verification. An empty completion-evidence candidate proceeds to the independent verifier, which selects valid runtime-issued IDs and binds them to the decision. Unissued IDs are discarded, and the terminal state still fails closed unless the verifier returns at least one valid supporting ID. Contract diagnostics remain in the internal trace instead of being shown as a `completionEvidence` error in the conversation.
+
 ## Capabilities
 
 - Observes the URL and only the text, controls, forms, tables, and live regions that are visually exposed in the current viewport
@@ -59,6 +61,7 @@ Completion is not accepted from model prose alone. Before any page effect, the r
 - Records privacy-preserving AI request audit metadata
 - Treats an HTTP success with no usable output as an explicit failure
 - Repairs malformed structured decisions without exposing model JSON or internal validation details in the conversation
+- Renders CommonMark and GFM assistant output as structured headings, emphasis, nested and task lists, tables, quotes, code, and safe links instead of exposing source delimiters
 - Switches the extension-owned interface between browser-detected language, Korean, and English without a reload
 
 The **Context** inspector shows what the current browser observation actually contains: visible text and controls, mapped frames, nested scroll regions, visual surfaces, automation constraints, selection, and recent logs. It is useful for distinguishing a model-planning problem from a browser-permission or page-structure boundary.
@@ -165,6 +168,8 @@ A toolbar popup is technically possible, but Chrome closes it as soon as focus m
 ## Using the panel controls
 
 The panel keeps only the current page, element picker, settings, and request composer visible. Less frequent actions such as context inspection, undo, export, and clearing the conversation are under **더보기**. Manual context refresh is available inside the context dialog, where it is relevant, rather than as a duplicate toolbar action. The layout has no fixed desktop minimum width, so browser zoom and narrow side panels keep the primary actions and send control inside the viewport; long page and status labels use an ellipsis while their full text remains available as a tooltip.
+
+Assistant messages use a bundled GitHub-Flavored Markdown parser for syntax recognition, then build a separate allowlisted DOM tree. The renderer covers headings, paragraphs and hard breaks, bold and italic emphasis, strikethrough, escaped characters and HTML character references, ordered, unordered, nested, and task lists, block quotes, horizontal rules, inline and fenced code, tables, inline and reference links, and automatic HTTP(S) links. Tables remain semantic tables inside a keyboard-focusable horizontal scroll region, and long code blocks are keyboard-scrollable. Remote images are represented as labeled links rather than fetched automatically, while raw HTML is displayed as inert source text; unsafe link protocols are never inserted into the live DOM. User messages and extension-owned status messages remain plain text.
 
 **Templates** are reusable request text, not an automatic workflow. Open **템플릿** above the composer to create a template or select an existing one, then edit its title and request text directly. **변경 저장** updates the selected item instead of creating a duplicate. Personal-template deletion and built-in-template restoration both use a two-step confirmation. **현재 입력 가져오기** copies the composer draft into the editor without saving it, and **입력창에 넣기** preserves the existing draft while inserting the edited template at the current cursor or selection.
 

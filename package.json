@@ -1,11 +1,11 @@
 {
   "name": "my-assistant-web-plugin",
-  "version": "0.9.4",
+  "version": "0.9.6",
   "private": true,
   "license": "UNLICENSED",
   "description": "A verifiable AI browser agent for Chrome and Edge.",
   "scripts": {
-    "check": "node --check agent-core.js && node --check execution-contract.js && node --check ui-locales.js && node --check bridge-protocol.js && node --check external-control-runtime.js && node --check background.js && node --check content.js && node --check panel.js && node --check bridge/server.mjs && node --check bridge/state.mjs && node --check tests/live-bridge-host.mjs",
+    "check": "node --check agent-core.js && node --check execution-contract.js && node --check ui-locales.js && node --check markdown-renderer.js && node --check bridge-protocol.js && node --check external-control-runtime.js && node --check background.js && node --check content.js && node --check panel.js && node --check bridge/server.mjs && node --check bridge/state.mjs && node --check tests/live-bridge-host.mjs",
     "test": "node --test tests/*.test.js",
     "test:bridge": "node --test tests/bridge-companion.test.mjs",
     "test:e2e": "node tests/extension-e2e.mjs",
@@ -28,5 +28,8 @@
   "overrides": {
     "@hono/node-server": "^2.0.5",
     "fast-uri": "^3.1.4"
+  },
+  "devDependencies": {
+    "marked": "18.0.7"
   }
 }

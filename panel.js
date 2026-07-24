@@ -10,6 +10,7 @@ const UiI18n = globalThis.WebUiI18n;
 if (!UiI18n) {
   throw new Error("UI locales failed to load.");
 }
+const MarkdownRenderer = globalThis.WebMarkdownRenderer;
 
 const DEFAULT_SETTINGS = {
   panelOpenMode: "side-panel",
@@ -3196,6 +3197,7 @@ async function requestChatDecision(session, discovery = {}) {
   if (validation.valid && decision.status === "completed" && !session.stopRequested) {
     let verifier = await requestCompletionVerification(session, decision, context, step, screenshotDataUrl);
     decision.verifier = verifier;
+    bindVerifiedCompletionEvidence(decision, verifier, session);
     if (verifier.status !== "verified") {
       updateRunTimeline("think", "active", `${step}번째 턴 근거 보완 계획 중`);
       const replanResponse = await requestAiDecision(session, {
@@ -3211,6 +3213,7 @@ async function requestChatDecision(session, discovery = {}) {
       if (validation.valid && decision.status === "completed") {
         verifier = await requestCompletionVerification(session, decision, context, step, screenshotDataUrl);
         decision.verifier = verifier;
+        bindVerifiedCompletionEvidence(decision, verifier, session);
         if (verifier.status !== "verified") {
           validation = {
             valid: false,
@@ -3275,6 +3278,7 @@ async function requestChatDecision(session, discovery = {}) {
       screenshotDataUrl
     );
     decision.verifier = verifier;
+    bindVerifiedCompletionEvidence(decision, verifier, session);
     if (verifier.status !== "verified") {
       validation = {
         valid: false,
@@ -3285,6 +3289,12 @@ async function requestChatDecision(session, discovery = {}) {
         ]
       };
     }
+  }
+
+  if (validation.valid && decision.status === "completed") {
+    validation = validateChatDecision(decision, context, mcpContext, {
+      allowVerifierEvidenceBinding: false
+    });
   }
 
   decision.validation = validation;
@@ -3525,12 +3535,54 @@ function normalizeChatDecision(decision, step) {
   };
 }
 
-function validateChatDecision(decision, context, mcpContext) {
+function reconcilePlannerCompletionEvidence(decision, session = state.agentSession) {
+  if (decision?.status !== "completed") {
+    return;
+  }
+  const availableEvidenceIds = new Set(getAvailableEvidenceIds(session));
+  const suppliedEvidenceIds = Array.isArray(decision.completionEvidence)
+    ? decision.completionEvidence
+    : [];
+  const retainedEvidenceIds = Array.from(new Set(
+    suppliedEvidenceIds.filter((evidenceId) => availableEvidenceIds.has(evidenceId))
+  ));
+  const discardedEvidenceIds = suppliedEvidenceIds.filter(
+    (evidenceId) => !availableEvidenceIds.has(evidenceId)
+  );
+  decision.completionEvidence = retainedEvidenceIds;
+  if (discardedEvidenceIds.length) {
+    appendEvaluationLog({
+      kind: "completion-evidence-reconciliation",
+      step: decision.step,
+      outcome: "discarded_unissued_ids",
+      discardedCount: discardedEvidenceIds.length
+    });
+  }
+}
+
+function bindVerifiedCompletionEvidence(decision, verifier, session = state.agentSession) {
+  if (decision?.status !== "completed" || verifier?.status !== "verified") {
+    return false;
+  }
+  const availableEvidenceIds = new Set(getAvailableEvidenceIds(session));
+  const verifiedEvidenceIds = Array.from(new Set(
+    (verifier.evidenceIds || []).filter((evidenceId) => availableEvidenceIds.has(evidenceId))
+  ));
+  if (!verifiedEvidenceIds.length) {
+    return false;
+  }
+  decision.completionEvidence = verifiedEvidenceIds;
+  return true;
+}
+
+function validateChatDecision(decision, context, mcpContext, options = {}) {
+  reconcilePlannerCompletionEvidence(decision);
   const validation = AgentCore.validateDecision(decision, {
     context,
     availableTools: mcpContext?.tools || [],
     availableEvidenceIds: getAvailableEvidenceIds(state.agentSession),
-    maxEffects: getRuntimeSettings().maxActionsPerTurn
+    maxEffects: getRuntimeSettings().maxActionsPerTurn,
+    allowVerifierEvidenceBinding: options.allowVerifierEvidenceBinding !== false
   });
   if (looksLikeInternalDecisionPayload(decision.message)) {
     validation.valid = false;
@@ -5109,7 +5161,7 @@ Treat the current page context as a visual-viewport observation, not a dump of t
 When the required visible control is absent, prefer status discover with elementSearch instead of paging blindly or reporting a blocker. Use a concise visible-label or symbol query, optional semantic roles/tags/types, and optional nearby row/table/form/dialog/region text. The runtime searches the current viewport locally and returns fresh refs without sending unrelated controls to the model. Continue elementDiscovery.nextCursor only when more matching results are needed. The element limit is not a browser capability boundary. After targeted search and visible results are exhausted, use the reported scroll regions before requesting manual interaction.
 Page-grounded answers are checked by an independent verifier. State only facts supported by the latest visual-viewport evidence; if that evidence is insufficient, ask one focused question or name the precise limitation instead of filling gaps from prior conversation.
 The turn intent was resolved once before observation. Do not broaden, reinterpret, or re-resolve it from raw chat. When repeatPolicy is once, a semantic state-changing effect that already succeeded must not be proposed again; verify the new state or finish instead.
-After every effect, verify the expected observable change. A completed status requires concrete completionEvidence and a final message that contains the requested result itself. Never finish by promising to summarize or report later, or by saying that a result was produced without presenting it. A blocked status must state the actual blocker and the safest next step.
+After every effect, verify the expected observable change. For completionEvidence, cite only IDs from the runtime ledger; use an empty array when unsure because the independent runtime verifier performs the final evidence binding. A completed status is accepted only after that binding succeeds and the final message contains the requested result itself. Never finish by promising to summarize or report later, or by saying that a result was produced without presenting it. A blocked status must state the actual blocker and the safest next step.
 
 ${CHAT_AGENT_SCHEMA_TEXT}`;
 }
@@ -5781,14 +5833,14 @@ function appendChatMessage(role, text, options = {}) {
 
   const bubble = document.createElement("div");
   bubble.className = "message-bubble";
-  const messageText = document.createElement("span");
+  const messageText = document.createElement("div");
   messageText.className = "message-text";
   const sourceText = text || "";
   const displayText = UiI18n.hasTranslation(sourceText) ? localizeUiText(sourceText) : sourceText;
-  renderTextWithSafeLinks(messageText, displayText);
+  renderChatMessageText(messageText, displayText, role);
   bubble.append(messageText);
   if (UiI18n.hasTranslation(sourceText)) {
-    localizedChatMessages.set(messageText, sourceText);
+    localizedChatMessages.set(messageText, { sourceText, role });
   }
 
   if (options.actions?.length) {
@@ -5826,13 +5878,14 @@ function appendChatMessage(role, text, options = {}) {
 
 function applyUiLanguage() {
   state.uiLocale = UiI18n.applyDocument(document, state.settings.uiLanguage);
-  for (const [container, sourceText] of localizedChatMessages) {
+  for (const [container, message] of localizedChatMessages) {
     if (!container.isConnected) {
       localizedChatMessages.delete(container);
       continue;
     }
-    container.replaceChildren();
-    renderTextWithSafeLinks(container, localizeUiText(sourceText));
+    const sourceText = typeof message === "string" ? message : message.sourceText;
+    const role = typeof message === "string" ? container.dataset.messageRole : message.role;
+    renderChatMessageText(container, localizeUiText(sourceText), role);
   }
   if (state.agentRunUi?.article?.isConnected) {
     setLocalizedElementText(state.agentRunUi.title, "작업 흐름");
@@ -5851,6 +5904,19 @@ function localizeUiText(value) {
 
 function setLocalizedElementText(element, value) {
   return UiI18n.setElementText(element, value, state.uiLocale);
+}
+
+function renderChatMessageText(container, value, role) {
+  container.replaceChildren();
+  container.dataset.messageRole = String(role || "");
+  const renderedMarkdown = role === "assistant"
+    && MarkdownRenderer?.render(container, value, {
+      baseUrl: state.activeTab?.url || ""
+    });
+  container.classList.toggle("markdown-body", Boolean(renderedMarkdown));
+  if (!renderedMarkdown) {
+    renderTextWithSafeLinks(container, value);
+  }
 }
 
 function renderTextWithSafeLinks(container, value) {
@@ -6756,6 +6822,9 @@ function normalizeUserFacingErrorMessage(error, depth) {
   if (!message) {
     return "알 수 없는 오류가 발생했습니다.";
   }
+  if (looksLikeInternalContractDiagnostic(message)) {
+    return "AI 응답을 안전한 실행 계획으로 변환하지 못해 페이지를 추가로 변경하지 않았습니다. 잠시 후 다시 요청해 주세요.";
+  }
   try {
     const structured = AgentCore.parseJsonFromText(message);
     if (structured && typeof structured === "object" && !Array.isArray(structured)) {
@@ -6777,4 +6846,23 @@ function normalizeUserFacingErrorMessage(error, depth) {
     // Plain-text errors remain useful to the user.
   }
   return truncate(redactSecretText(message), 1000);
+}
+
+function looksLikeInternalContractDiagnostic(value) {
+  const text = String(value || "").trim();
+  if (!text) {
+    return false;
+  }
+  const schemaFieldNames = Array.from(new Set([
+    ...Object.keys(AgentCore.DECISION_SCHEMA?.properties || {}),
+    ...Object.keys(AgentCore.VERIFIER_SCHEMA?.properties || {})
+  ])).filter((fieldName) => /[A-Z]/u.test(fieldName));
+  const normalizedText = text.toLowerCase();
+  const mentionsInternalField = schemaFieldNames.some(
+    (fieldName) => normalizedText.includes(String(fieldName).toLowerCase())
+  );
+  if (!mentionsInternalField) {
+    return false;
+  }
+  return /(?:required|missing|invalid|must|only|schema|contract|validation|필요|누락|유효하지|판단|검증|사용할 수 없)/iu.test(text);
 }

@@ -377,6 +377,46 @@ try {
         timelineDetail: "3번째 턴 화면 관찰 중"
       }
     });
+    assert.deepEqual(panelContracts.markdown, {
+      bodyClass: true,
+      headings: ["렌더링 상태", "세부 표현"],
+      strongText: "굵게",
+      emphasisText: "기울임",
+      deletedText: "취소선",
+      escapedAndDecodedText: true,
+      entitySourceHidden: true,
+      escapedHtmlVisible: true,
+      lineBreaks: 2,
+      orderedStart: 3,
+      nestedListText: "중첩 목록",
+      tableCount: 1,
+      tableHeaders: ["항목", "결과"],
+      tableCells: ["표", "완료"],
+      sourceDelimiterVisible: false,
+      listStrongText: "굵은 목록",
+      checkedTaskDisabled: true,
+      checkedTaskText: "확인 완료",
+      checkedTaskLabel: "확인 완료",
+      quote: "전체 테두리 인용",
+      horizontalRules: 1,
+      inlineCode: "inline",
+      blockCode: "const value = '<script>unsafe()</script>';",
+      blockCodeFocusable: true,
+      safeLinkHref: "https://example.test/docs",
+      relativeLinkPath: "/relative-docs",
+      automaticLinkHref: "https://example.test/auto",
+      referenceLinkHref: "https://example.test/reference",
+      unsafeLinkAnchors: 0,
+      unsafeLinkText: "위험한 링크",
+      fetchedImages: 0,
+      remoteImageLink: "https://example.test/image.png",
+      rawHtmlVisible: true,
+      scripts: 0,
+      executionProbe: false,
+      tableRegionFocusable: true,
+      userSourceText: "**사용자 원문은 그대로**",
+      userMarkdownElements: 0
+    });
     if (process.argv.includes("--capture-docs")) {
       await captureAgentPanelDocs(cdp, panelSessionId);
       await captureSettingsOverviewDocs(cdp, panelSessionId);
@@ -394,6 +434,10 @@ try {
     assert.equal(verificationContracts.terminalGroundingVerified, true);
     assert.equal(verificationContracts.completionVerifierSawTurnIntent, true);
     assert.equal(verificationContracts.groundingVerifierSawTurnIntent, true);
+    assert.equal(verificationContracts.completionEvidenceBound, true);
+    assert.equal(verificationContracts.completionEvidenceRepairSkipped, true);
+    assert.equal(verificationContracts.completionEvidenceErrorHidden, true);
+    assert.equal(verificationContracts.inventedCompletionEvidenceDiscarded, true);
     assert.equal(verificationContracts.promiseReplanOccurred, true);
     assert.equal(verificationContracts.promiseCompletionVerifierCalls, 2);
     assert.equal(verificationContracts.promiseFinalStatus, "completed");
@@ -449,6 +493,9 @@ try {
     assert.equal(turnBoundaryContracts.readOnlyToolRepeatAllowed, true);
     assert.equal(turnBoundaryContracts.runtimeErrorStoppedSession, true);
     assert.equal(turnBoundaryContracts.runtimeErrorJsonHidden, true);
+    assert.equal(turnBoundaryContracts.completionEvidenceDiagnosticHidden, true);
+    assert.equal(turnBoundaryContracts.elementSearchDiagnosticHidden, true);
+    assert.equal(turnBoundaryContracts.providerStatusErrorPreserved, true);
 
     const transitionContracts = await exerciseTabTransitionContracts({ cdp, panelSessionId });
     assert.equal(transitionContracts.preservedRunningSession, true);
@@ -2211,7 +2258,117 @@ async function exercisePanelContracts({ cdp, panelSessionId, tabId, context }) {
         };
         const locale = { english: englishLocale, korean: koreanLocale };
 
-        return { template, site, locale };
+        appendChatMessage("user", "**사용자 원문은 그대로**", { record: false });
+        const plainUserMessage = elements.messageList.querySelector(".message.user:last-child .message-text");
+
+        globalThis.__markdownExecutionProbe = false;
+        appendChatMessage("assistant", [
+          "# 렌더링 상태",
+          "",
+          "## 세부 표현",
+          "",
+          "**굵게**, *기울임*, ~~취소선~~, \\\\*리터럴 별표\\\\*, AT&amp;T &lt;안전한 텍스트&gt;",
+          "첫 줄  ",
+          "둘째 줄",
+          "",
+          "엔티티 HTML: &lt;img src=x onerror=globalThis.__markdownExecutionProbe=true&gt;",
+          "",
+          "3. 세 번째부터 시작",
+          "4. 다음 항목",
+          "   - 중첩 목록",
+          "",
+          "| 항목 | 결과 |",
+          "| --- | ---: |",
+          "| 표 | 완료 |",
+          "",
+          "- **굵은 목록**",
+          "- [x] 확인 완료",
+          "",
+          "> 전체 테두리 인용",
+          "",
+          "---",
+          "",
+          "\`inline\`",
+          "",
+          "\`\`\`js",
+          "const value = '<script>unsafe()</script>';",
+          "\`\`\`",
+          "",
+          "[안전한 링크](https://example.test/docs)",
+          "[상대 링크](/relative-docs)",
+          "<https://example.test/auto>",
+          "[참조 링크][guide]",
+          "[위험한 링크](javascript:globalThis.__markdownExecutionProbe=true)",
+          "![원격 이미지](https://example.test/image.png)",
+          "",
+          "<img src=x onerror=\\"globalThis.__markdownExecutionProbe=true\\">",
+          "",
+          "[guide]: https://example.test/reference"
+        ].join("\\n"), { record: false });
+        const markdownMessage = elements.messageList.querySelector(".message.assistant:last-child .message-text");
+        const markdownTableRegion = markdownMessage.querySelector(".markdown-table-scroll");
+        const markdown = {
+          bodyClass: markdownMessage.classList.contains("markdown-body"),
+          headings: Array.from(markdownMessage.querySelectorAll("h1, h2"), (heading) => heading.textContent),
+          strongText: markdownMessage.querySelector("strong")?.textContent,
+          emphasisText: markdownMessage.querySelector("em")?.textContent,
+          deletedText: markdownMessage.querySelector("del")?.textContent,
+          escapedAndDecodedText: markdownMessage.textContent.includes(
+            "*리터럴 별표*, AT&T <안전한 텍스트>"
+          ),
+          entitySourceHidden: !markdownMessage.textContent.includes("&amp;"),
+          escapedHtmlVisible: markdownMessage.textContent.includes(
+            "<img src=x onerror=globalThis.__markdownExecutionProbe=true>"
+          ),
+          lineBreaks: Array.from(markdownMessage.querySelectorAll("p"))
+            .find((paragraph) => (
+              paragraph.textContent.includes("첫 줄")
+              && paragraph.textContent.includes("둘째 줄")
+            ))
+            ?.querySelectorAll("br").length,
+          orderedStart: markdownMessage.querySelector("ol")?.start,
+          nestedListText: markdownMessage.querySelector("ol ul li")?.textContent,
+          tableCount: markdownMessage.querySelectorAll("table").length,
+          tableHeaders: Array.from(markdownMessage.querySelectorAll("th"), (cell) => cell.textContent),
+          tableCells: Array.from(markdownMessage.querySelectorAll("td"), (cell) => cell.textContent),
+          sourceDelimiterVisible: markdownMessage.textContent.includes("| --- |"),
+          listStrongText: markdownMessage.querySelector("li strong")?.textContent,
+          checkedTaskDisabled: Boolean(
+            markdownMessage.querySelector('.markdown-task-list-item input[type="checkbox"]:checked:disabled')
+          ),
+          checkedTaskText: markdownMessage.querySelector(
+            ".markdown-task-list-item .markdown-task-content"
+          )?.textContent,
+          checkedTaskLabel: markdownMessage.querySelector(
+            '.markdown-task-list-item input[type="checkbox"]:checked'
+          )?.getAttribute("aria-label"),
+          quote: markdownMessage.querySelector("blockquote")?.textContent.trim(),
+          horizontalRules: markdownMessage.querySelectorAll("hr").length,
+          inlineCode: markdownMessage.querySelector(".markdown-inline-code")?.textContent,
+          blockCode: markdownMessage.querySelector(".markdown-code-shell code")?.textContent,
+          blockCodeFocusable: markdownMessage.querySelector(".markdown-code-shell pre")?.tabIndex === 0,
+          safeLinkHref: markdownMessage.querySelector('a[href="https://example.test/docs"]')?.href,
+          relativeLinkPath: Array.from(markdownMessage.querySelectorAll("a"))
+            .find((anchor) => anchor.textContent === "상대 링크")?.pathname,
+          automaticLinkHref: Array.from(markdownMessage.querySelectorAll("a"))
+            .find((anchor) => anchor.textContent === "https://example.test/auto")?.href,
+          referenceLinkHref: Array.from(markdownMessage.querySelectorAll("a"))
+            .find((anchor) => anchor.textContent === "참조 링크")?.href,
+          unsafeLinkAnchors: Array.from(markdownMessage.querySelectorAll("a"), (anchor) => anchor.href)
+            .filter((href) => href.startsWith("javascript:")).length,
+          unsafeLinkText: markdownMessage.querySelector(".markdown-unsafe-link")?.textContent,
+          fetchedImages: markdownMessage.querySelectorAll("img").length,
+          remoteImageLink: markdownMessage.querySelector(".markdown-image-link")?.href,
+          rawHtmlVisible: markdownMessage.textContent.includes("<img src=x onerror="),
+          scripts: markdownMessage.querySelectorAll("script").length,
+          executionProbe: globalThis.__markdownExecutionProbe,
+          tableRegionFocusable: markdownTableRegion?.tabIndex === 0,
+          userSourceText: plainUserMessage?.textContent,
+          userMarkdownElements: plainUserMessage?.querySelectorAll("strong, em, table, code").length
+        };
+        delete globalThis.__markdownExecutionProbe;
+
+        return { template, site, locale, markdown };
     })()`);
 
     return { layouts, approvalModes, ...functional };
@@ -2733,6 +2890,15 @@ async function exerciseTurnBoundaryContracts({ cdp, panelSessionId, tabId, conte
         }));
       });
       const lastConversation = state.conversation.at(-1);
+      const completionEvidenceDiagnostic = getUserFacingErrorMessage(
+        new Error("completed 판단에는 런타임이 발급한 completionEvidence ID가 필요합니다.")
+      );
+      const elementSearchDiagnostic = getUserFacingErrorMessage(
+        new Error("elementSearch는 discover 판단에서만 사용할 수 있습니다.")
+      );
+      const providerStatusError = getUserFacingErrorMessage(
+        new Error("Invalid status 401 from provider.")
+      );
 
       return {
         intentMode: intent.mode,
@@ -2757,7 +2923,12 @@ async function exerciseTurnBoundaryContracts({ cdp, panelSessionId, tabId, conte
         runtimeErrorStoppedSession: session.status === "failed" && session.stopRequested === true,
         runtimeErrorJsonHidden: lastConversation?.kind === "run-error"
           && !lastConversation.text.includes("{")
-          && lastConversation.text.includes("Provider request failed")
+          && lastConversation.text.includes("Provider request failed"),
+        completionEvidenceDiagnosticHidden: !completionEvidenceDiagnostic.includes("completionEvidence")
+          && completionEvidenceDiagnostic.includes("안전한 실행 계획"),
+        elementSearchDiagnosticHidden: !elementSearchDiagnostic.includes("elementSearch")
+          && elementSearchDiagnostic.includes("안전한 실행 계획"),
+        providerStatusErrorPreserved: providerStatusError === "Invalid status 401 from provider."
       };
     } finally {
       requestAiDecision = original.requestAiDecision;
@@ -2896,7 +3067,7 @@ async function exerciseAgentVerificationContracts({ cdp, panelSessionId, tabId, 
             summary: "화면 확인 완료",
             progress: "현재 뷰포트 근거를 확보했습니다.",
             doneReason: "현재 화면 관찰 근거로 확인됨",
-            completionEvidence: [activeSession.currentPageEvidenceId],
+            completionEvidence: [],
             needsUserApproval: false,
             plan: ["현재 화면 확인"],
             toolCalls: [],
@@ -2923,6 +3094,15 @@ async function exerciseAgentVerificationContracts({ cdp, panelSessionId, tabId, 
       };
 
       const repairedDecision = await requestChatDecision(session);
+      const inventedEvidenceDecision = structuredClone(repairedDecision);
+      inventedEvidenceDecision.completionEvidence = ["invented-completion-evidence"];
+      const inventedEvidenceValidation = validateChatDecision(
+        inventedEvidenceDecision,
+        ${JSON.stringify(context)},
+        { enabled: false, tools: [], error: "" }
+      );
+      const inventedCompletionEvidenceDiscarded = inventedEvidenceValidation.valid
+        && inventedEvidenceDecision.completionEvidence.length === 0;
 
       state.conversation = [
         { role: "assistant", text: "확인한 상태 정보를 다음 답변에서 정리해 드리겠습니다." },
@@ -3164,6 +3344,11 @@ async function exerciseAgentVerificationContracts({ cdp, panelSessionId, tabId, 
         terminalGroundingVerified: repairedDecision.grounding?.status === "verified",
         completionVerifierSawTurnIntent,
         groundingVerifierSawTurnIntent,
+        completionEvidenceBound: repairedDecision.completionEvidence.length === 1
+          && repairedDecision.completionEvidence[0] === session.currentPageEvidenceId,
+        completionEvidenceRepairSkipped: !purposes.includes("repair"),
+        completionEvidenceErrorHidden: !repairedDecision.message.includes("completionEvidence"),
+        inventedCompletionEvidenceDiscarded,
         promiseReplanOccurred: promisePurposes.includes("verification-replan"),
         promiseCompletionVerifierCalls: completionVerifierCalls,
         promiseFinalMessage: promiseRepairedDecision.message,
@@ -3397,6 +3582,25 @@ async function captureTemplateManagerDocs(cdp, panelSessionId) {
 }
 
 async function captureAgentPanelDocs(cdp, panelSessionId) {
+  const markdownDemo = [
+    "## 화면 확인 결과",
+    "",
+    "**요약:** 현재 화면 기준이며, *추가 확인*이 필요한 항목도 함께 표시했습니다.",
+    "",
+    "| 항목 | 상태 |",
+    "| --- | --- |",
+    "| 로그인 상태 | 확인됨 |",
+    "| 미처리 요청 | 3건 |",
+    "",
+    "- [x] 현재 화면 관찰",
+    "- [ ] 미처리 요청 상세 확인",
+    "",
+    "> 화면에 표시된 정보만 결과에 포함했습니다.",
+    "",
+    "~~이전 상태~~ 대신 현재 관찰 결과를 사용했습니다.",
+    "",
+    "`다음 페이지` 조작은 아직 실행하지 않았습니다."
+  ].join("\n");
   await evaluate(cdp, panelSessionId, `(async () => {
     globalThis.__agentPanelCaptureSnapshot = {
       settings: structuredClone(state.settings),
@@ -3419,8 +3623,8 @@ async function captureAgentPanelDocs(cdp, panelSessionId) {
     state.runtimeSettings = { ...state.settings };
     applyActiveTabSummary({ id: 1, title: "Example dashboard", url: "https://fixture.invalid/dashboard" });
     state.conversation = [
-      { role: "user", text: "현재 화면에서 확인해야 할 항목을 정리해줘." },
-      { role: "assistant", text: "현재 화면의 보이는 내용과 조작 가능한 요소를 기준으로 확인할 준비가 되었습니다." }
+      { role: "user", text: "현재 화면에서 확인할 항목을 표로 정리해줘." },
+      { role: "assistant", text: ${JSON.stringify(markdownDemo)} }
     ];
     elements.messageList.replaceChildren();
     for (const message of state.conversation) {

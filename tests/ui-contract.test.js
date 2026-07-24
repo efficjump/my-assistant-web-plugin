@@ -23,8 +23,32 @@ test("every panel DOM binding exists in the HTML", () => {
 
 test("agent core loads before the panel controller", () => {
   const html = fs.readFileSync(path.join(root, "panel.html"), "utf8");
+  assert.ok(html.indexOf('src="vendor/marked.umd.js"') < html.indexOf('src="markdown-renderer.js"'));
+  assert.ok(html.indexOf('src="markdown-renderer.js"') < html.indexOf('src="panel.js"'));
   assert.ok(html.indexOf('src="agent-core.js"') < html.indexOf('src="panel.js"'));
   assert.ok(html.indexOf('src="ui-locales.js"') < html.indexOf('src="panel.js"'));
+});
+
+test("assistant Markdown uses token parsing and an allowlisted DOM renderer", () => {
+  const html = fs.readFileSync(path.join(root, "panel.html"), "utf8");
+  const panel = fs.readFileSync(path.join(root, "panel.js"), "utf8");
+  const renderer = fs.readFileSync(path.join(root, "markdown-renderer.js"), "utf8");
+  const css = fs.readFileSync(path.join(root, "styles.css"), "utf8");
+
+  assert.match(html, /src="vendor\/marked\.umd\.js"/);
+  assert.match(renderer, /Markdown\.lexer/);
+  assert.match(renderer, /decodeMarkdownText/);
+  assert.match(renderer, /DOMParserConstructor/);
+  assert.match(renderer, /SAFE_LINK_PROTOCOLS\s*=\s*new Set\(\["http:",\s*"https:"\]\)/);
+  assert.match(renderer, /createElement\("table"\)/);
+  assert.match(renderer, /case "checkbox":\s*break;/);
+  assert.match(renderer, /checkbox\.setAttribute\("aria-label",\s*taskLabel\)/);
+  assert.match(renderer, /pre\.tabIndex\s*=\s*0/);
+  assert.match(renderer, /raw\.textContent\s*=/);
+  assert.doesNotMatch(renderer, /\.innerHTML\b|insertAdjacentHTML|document\.write/);
+  assert.match(panel, /role === "assistant"[\s\S]*MarkdownRenderer\?\.render/);
+  assert.match(css, /\.markdown-table-scroll\s*\{[\s\S]*?overflow-x:\s*auto;/);
+  assert.match(css, /\.markdown-code-shell\s*\{/);
 });
 
 test("display language is a persisted immediate setting", () => {
@@ -42,6 +66,15 @@ test("display language is a persisted immediate setting", () => {
 test("the design does not use a left accent bar", () => {
   const css = fs.readFileSync(path.join(root, "styles.css"), "utf8");
   assert.doesNotMatch(css, /border-left\s*:/i);
+});
+
+test("selected settings tabs do not use a bottom accent indicator", () => {
+  const css = fs.readFileSync(path.join(root, "styles.css"), "utf8");
+  const activeRule = css.match(/\.settings-tab\.active\s*\{([^}]*)\}/i)?.[1] || "";
+  assert.ok(activeRule);
+  assert.doesNotMatch(activeRule, /border-bottom\s*:/i);
+  assert.doesNotMatch(activeRule, /box-shadow\s*:\s*inset\b/i);
+  assert.doesNotMatch(css, /\.settings-tab\.active::(?:before|after)/i);
 });
 
 test("secondary toolbar actions live in the utility menu without redundant save or refresh controls", () => {
@@ -281,6 +314,9 @@ test("terminal response verification uses one immutable turn intent and current 
   assert.match(groundingFunction, /screenshotDataUrl,/);
   assert.match(script, /\["answer", "completed"\]\.includes\(decision\.status\)/);
   assert.match(script, /decision\.status === "completed"[\s\S]*decision\.verifier\?\.status !== "verified"/);
+  assert.match(script, /function bindVerifiedCompletionEvidence/);
+  assert.match(script, /discarded_unissued_ids/);
+  assert.match(script, /allowVerifierEvidenceBinding:\s*false/);
   assert.match(script, /resolveAgentTurnIntent\(state\.agentSession\)/);
   assert.match(script, /repeatPolicy === "until_condition"/);
   assert.match(script, /recordSuccessfulEffects/);
@@ -298,6 +334,8 @@ test("malformed decision output and internal JSON stay out of user-facing chat",
   assert.match(script, /사용자에게 표시할 message에는 내부 판단 JSON을 넣을 수 없습니다/);
   assert.match(script, /AI 응답을 안전한 실행 계획으로 변환하지 못해/);
   assert.match(script, /normalizeUserFacingErrorMessage/);
+  assert.match(script, /looksLikeInternalContractDiagnostic\(message\)/);
+  assert.match(script, /Object\.keys\(AgentCore\.DECISION_SCHEMA\?\.properties/);
   assert.match(script, /getUserFacingErrorMessage\([\s\S]*result\.error \|\| result\.text/);
 });
 

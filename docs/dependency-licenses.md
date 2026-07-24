@@ -1,6 +1,6 @@
 # Dependency license audit
 
-Audit date: 2026-07-23
+Audit date: 2026-07-24
 
 The local companion is installed with the production dependency tree pinned by `package.json` and `pnpm-lock.yaml`. The project itself remains `UNLICENSED`; dependency licenses do not grant a license to the project source.
 
@@ -20,6 +20,8 @@ The three direct production dependencies are licensed under MIT:
 - `@modelcontextprotocol/sdk` `1.29.0`
 - `ws` `8.21.1`
 - `zod` `4.4.3`
+
+The extension also redistributes the browser build of `marked` `18.0.7` under the MIT license. It is pinned as a development dependency, copied to `vendor/marked.umd.js`, and accompanied by `vendor/marked.LICENSE.txt`. The parser only produces Markdown tokens; the extension constructs an allowlisted DOM tree itself instead of inserting the parser's unsanitized HTML output.
 
 The non-MIT transitive entries are:
 
