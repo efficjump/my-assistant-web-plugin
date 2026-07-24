@@ -843,19 +843,22 @@ h2 {
 
 .activity-summary-content {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 3px;
   min-width: 0;
 }
 
 .activity-header {
-  display: flex;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
   align-items: baseline;
-  justify-content: space-between;
   gap: 10px;
+  min-width: 0;
 }
 
 .activity-header strong {
   font-size: 13px;
+  white-space: nowrap;
 }
 
 .activity-summary {

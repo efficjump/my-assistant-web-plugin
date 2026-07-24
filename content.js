@@ -4,13 +4,17 @@ if (globalThis.__myAssistantWebPluginLoaded) {
 }
 globalThis.__myAssistantWebPluginLoaded = true;
 
+const assistantDocumentId = createDocumentId();
 const assistantPageState = {
   elementsByRef: new Map(),
   elementBindings: new WeakMap(),
   elementStateBindings: new WeakMap(),
+  elementRefs: new WeakMap(),
+  elementRefCounters: { e: 0, s: 0, v: 0 },
   picker: null,
   domRevision: 0,
-  documentId: createDocumentId(),
+  documentId: assistantDocumentId,
+  refNamespace: createRefNamespace(assistantDocumentId),
   scopes: [],
   observedRoots: new WeakSet(),
   mutationObservers: [],
@@ -166,6 +170,11 @@ function collectPageContext(options) {
 
   const context = {
     documentId: assistantPageState.documentId,
+    refScope: {
+      namespace: assistantPageState.refNamespace,
+      documentId: assistantPageState.documentId,
+      policy: "Only refs returned by this observation are executable."
+    },
     url: sanitizeUrlForContext(location.href, redactSensitiveData),
     title: redactSensitiveData ? redactSensitiveText(document.title) : document.title,
     frameName: redactSensitiveData ? redactSensitiveText(window.name || "") : window.name || "",
@@ -528,6 +537,27 @@ function createDocumentId() {
   return `document-${entropy}`;
 }
 
+function createRefNamespace(documentId) {
+  const normalized = String(documentId || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "")
+    .slice(0, 12);
+  return normalized || Math.floor(Date.now()).toString(36);
+}
+
+function getOrCreateElementRef(element, kind) {
+  const prefix = ["e", "s", "v"].includes(kind) ? kind : "e";
+  const existing = assistantPageState.elementRefs.get(element) || {};
+  if (existing[prefix]) {
+    return existing[prefix];
+  }
+  assistantPageState.elementRefCounters[prefix] += 1;
+  const ref = `${prefix}${assistantPageState.refNamespace}-${assistantPageState.elementRefCounters[prefix].toString(36)}`;
+  existing[prefix] = ref;
+  assistantPageState.elementRefs.set(element, existing);
+  return ref;
+}
+
 function collectDomScopes(includeChildFrames = true) {
   const scopes = [];
   const seenRoots = new Set();
@@ -770,7 +800,7 @@ function collectInteractiveElements(options) {
   const includedCandidates = matchingCandidates.slice(offset, offset + limit);
   const elements = includedCandidates.map((candidate, index) => {
     const { element } = candidate;
-    const ref = `e${offset + index + 1}`;
+    const ref = getOrCreateElementRef(element, "e");
     const info = describeInteractiveElement(element, ref, {
       redactSensitiveData,
       scope: candidate.scope,
@@ -824,7 +854,7 @@ function matchesInteractiveSearchIdentity(element, search) {
   ) {
     return false;
   }
-  if (!search.query || !search.nearText) {
+  if (!search.query) {
     return true;
   }
   return scoreSearchTerms(search.query, record, {
@@ -1036,19 +1066,8 @@ function scoreInteractiveCandidateForSearch(record, search) {
     title: 220,
     description: 180,
     testId: 130,
-    context: search.nearText ? 0 : 30,
-    contextByKind: search.nearText ? {} : {
-      "ancestor-1": 140,
-      "ancestor-2": 120,
-      cell: 110,
-      "ancestor-3": 90,
-      row: 65,
-      "ancestor-4": 55,
-      heading: 45,
-      "ancestor-5": 35,
-      collection: 25,
-      region: 20
-    }
+    context: 0,
+    contextByKind: {}
   });
   if (search.query && !queryMatch.matched) {
     return { matched: false, score: 0, matchedFields: [], contextSnippet: "" };
@@ -1555,7 +1574,7 @@ function collectScrollRegions(limit, redactSensitiveData) {
     .slice(0, limit);
 
   return candidates.map(({ element, rect, scope }, index) => {
-    const ref = `s${index + 1}`;
+    const ref = getOrCreateElementRef(element, "s");
     const labelSource = getAccessibleName(element)
       || collectVisibleTextWithin(element, 180)
       || element.getAttribute("role")
@@ -1615,7 +1634,7 @@ function collectVisualSurfaces(limit, redactSensitiveData) {
     .slice(0, limit);
 
   return candidates.map(({ element, rect, scope }, index) => {
-    const ref = `v${index + 1}`;
+    const ref = getOrCreateElementRef(element, "v");
     const tag = element.tagName.toLowerCase();
     const labelSource = getAccessibleName(element)
       || element.getAttribute("title")

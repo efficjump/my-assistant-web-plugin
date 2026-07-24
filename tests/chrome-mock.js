@@ -94,9 +94,17 @@
         } else if (message.type === "CALL_AI") {
           const verifierRequested = Array.isArray(message.request?.responseSchema?.required)
             && message.request.responseSchema.required.includes("evidenceIds");
+          const initialDecisionRequested = Array.isArray(message.request?.responseSchema?.required)
+            && message.request.responseSchema.required.includes("turnIntent");
           const evidenceIds = Array.from(new Set(
             String(message.request?.user || "").match(/ev-[a-z0-9_-]+/gi) || []
           ));
+          const latestUserMessageMatch = String(message.request?.user || "").match(
+            /"latestUserMessage":\s*("(?:\\.|[^"\\])*")/
+          );
+          const latestUserMessage = latestUserMessageMatch
+            ? JSON.parse(latestUserMessageMatch[1])
+            : "Review the current visible page.";
           const result = verifierRequested
             ? {
                 version: "1.0",
@@ -108,7 +116,29 @@
                 missingEvidence: evidenceIds.length ? [] : ["현재 화면 관찰"],
                 confidence: evidenceIds.length ? 0.98 : 0.2
               }
-            : decision;
+            : initialDecisionRequested
+              ? {
+                  turnIntent: {
+                    version: "1.0",
+                    mode: "standalone",
+                    objective: latestUserMessage,
+                    contextSummary: "",
+                    repeatPolicy: "once",
+                    repeatLimit: 1,
+                    deliverable: {
+                      kind: "answer",
+                      itemDescription: "",
+                      targetCount: null,
+                      fields: [],
+                      includeCriteria: [],
+                      formats: []
+                    },
+                    completionCriteria: ["현재 화면 근거를 사용한 답변이 제공됩니다."],
+                    reason: "최신 메시지는 독립적으로 이해할 수 있는 요청입니다."
+                  },
+                  ...decision
+                }
+              : decision;
           const text = JSON.stringify(result);
           data = {
             status: 200,

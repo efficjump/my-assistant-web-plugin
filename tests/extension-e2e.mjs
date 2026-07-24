@@ -508,6 +508,21 @@ try {
         true,
         `${viewportLabel} task-flow dock should not overflow horizontally`
       );
+      assert.equal(
+        layout.activitySummaryContentNoHorizontalOverflow,
+        true,
+        `${viewportLabel} task-flow summary content should shrink within its grid track`
+      );
+      assert.equal(
+        layout.activitySummaryTitleSingleLine,
+        true,
+        `${viewportLabel} task-flow title should stay on one line`
+      );
+      assert.equal(
+        layout.activitySummaryRowsContained,
+        true,
+        `${viewportLabel} task-flow summary rows should remain inside the card`
+      );
       assert.ok(layout.externalApprovalHeight >= 120, `${viewportLabel} approval viewport was only ${layout.externalApprovalHeight}px tall`);
       assert.equal(layout.composerVisible, true, `${viewportLabel} composer should remain available for external approval`);
       assert.equal(layout.composerInputSingleRow, true, `${viewportLabel} composer input and send control should share a row`);
@@ -729,6 +744,31 @@ try {
     assert.equal(internalDiscovery.mcpAssetLoads, 1);
     assert.equal(internalDiscovery.capabilityLoadsOverlappedObservation, true);
     assert.equal(internalDiscovery.userHandoffSuppressed, true);
+    assert.equal(internalDiscovery.relaxedSearchDecisionStatus, "continue");
+    assert.equal(internalDiscovery.relaxedSearchActionRef, "stable-pagination-ref");
+    assert.deepEqual(internalDiscovery.relaxationRequests, [
+      { query: "", roles: [], nearText: "" },
+      {
+        query: "Dense grid next page",
+        roles: ["button"],
+        nearText: "Synthetic collection name"
+      },
+      {
+        query: "Dense grid next page",
+        roles: ["button"],
+        nearText: ""
+      }
+    ]);
+    assert.equal(internalDiscovery.relaxationModelCalls, 2);
+    assert.equal(internalDiscovery.relaxationLogged, true);
+    assert.equal(internalDiscovery.staleRefRecoveredStatus, "continue");
+    assert.equal(internalDiscovery.staleRefRecoveredActionRef, "fresh-result-ref");
+    assert.equal(internalDiscovery.staleRefObservationCalls, 2);
+    assert.deepEqual(internalDiscovery.staleRefPurposes, ["decision", "repair", "decision"]);
+    assert.equal(internalDiscovery.staleRefRecoveryPromptSeen, true);
+    assert.equal(internalDiscovery.staleRefRecoveryLogged, true);
+    assert.equal(internalDiscovery.genericContractRecoveryAvailable, true);
+    assert.equal(internalDiscovery.repeatBoundaryRecoverySuppressed, true);
     assert.equal(internalDiscovery.recoveryDecisionStatus, "continue");
     assert.equal(internalDiscovery.recoveryActionRef, "request-type-lookup");
     assert.deepEqual(internalDiscovery.recoveryPurposes, ["decision", "repair", "decision"]);
@@ -748,6 +788,11 @@ try {
       tabId: firstTabId,
       context: firstContext.data
     });
+    assert.equal(turnBoundaryContracts.fusedInitialModelCalls, 1);
+    assert.equal(turnBoundaryContracts.fusedInitialPurpose, "intent-and-decision");
+    assert.equal(turnBoundaryContracts.fusedInitialSchemaIncludesIntent, true);
+    assert.equal(turnBoundaryContracts.fusedIntentResolved, true);
+    assert.equal(turnBoundaryContracts.fusedDecisionExecutable, true);
     assert.equal(turnBoundaryContracts.freshIntentModelCalls, 1);
     assert.equal(turnBoundaryContracts.freshIntentMode, "standalone");
     assert.equal(turnBoundaryContracts.correctiveIntentMode, "continue_prior");
@@ -799,6 +844,13 @@ try {
       secondPageReachedExactTarget: true,
       thirdPageBlocked: true,
       terminalAnswerAllowed: true,
+      exportMissingBeforeTool: true,
+      runtimeToolAvailableWithoutMcp: true,
+      exportDecisionAllowed: true,
+      exportArtifactRecorded: true,
+      terminalAllowedAfterExport: true,
+      runtimeTerminalMessageGrounded: true,
+      unrequestedFormatRejected: true,
       repeatedPageStalled: true,
       zeroNewPageStalled: true
     });
@@ -1049,6 +1101,26 @@ try {
     assert.equal(replacedTargetResult.ok, true);
     assert.equal(replacedTargetResult.data.results[0].ok, false);
     assert.equal(replacedTargetResult.data.results[0].code, "stale_target");
+    const replacementContext = await extensionMessage(cdp, panelSessionId, {
+      type: "COLLECT_PAGE_CONTEXT",
+      targetTabId: firstTabId,
+      options: {
+        maxTextChars: 4000,
+        maxElements: 20,
+        elementQuery: "Replacement row",
+        elementRoles: ["button"],
+        redactSensitiveData: true
+      }
+    });
+    const replacementTarget = replacementContext.data.interactiveElements.find(
+      (element) => element.label === "Replacement row"
+    );
+    assert.ok(replacementTarget?.ref);
+    assert.notEqual(
+      replacementTarget.ref,
+      replacedTarget.ref,
+      "a replacement DOM element must never inherit the stale element ref"
+    );
     const ambientContext = await extensionMessage(cdp, panelSessionId, {
       type: "COLLECT_PAGE_CONTEXT",
       targetTabId: firstTabId,
@@ -1845,8 +1917,34 @@ try {
     const searchedPaginator = queriedElements.data.interactiveElements.find(
       (element) => element.label === "Dense grid next page"
     );
+    assert.equal(
+      searchedPaginator.ref,
+      denseNextPage.ref,
+      "one connected DOM element must keep its ref across observation windows"
+    );
+    assert.match(searchedPaginator.ref, /^e[a-z0-9]+-[a-z0-9]+$/);
     assert.ok(searchedPaginator.searchMatch.matchedFields.includes("context"));
     assert.match(searchedPaginator.searchMatch.contextSnippet, /Dense issue grid/);
+
+    const queryMustNotBorrowNearbyText = await extensionMessage(cdp, panelSessionId, {
+      type: "COLLECT_PAGE_CONTEXT",
+      targetTabId: firstTabId,
+      options: {
+        maxTextChars: 8000,
+        maxElements: 20,
+        elementQuery: "Request type",
+        elementRoles: ["button"],
+        elementNearText: "",
+        redactSensitiveData: true
+      }
+    });
+    assert.equal(
+      queryMustNotBorrowNearbyText.data.interactiveElements.some(
+        (element) => element.selector === "#request-type-lookup"
+      ),
+      false,
+      "query must match the control identity; relational text belongs in nearText"
+    );
 
     const broadSearch = await extensionMessage(cdp, panelSessionId, {
       type: "COLLECT_PAGE_CONTEXT",
@@ -1994,7 +2092,7 @@ try {
     const uploadInput = restoredContext.data.interactiveElements.find((element) => element.label === "Upload document");
     assert.match(shadowInput?.scope || "", /shadow/);
     assert.match(frameInput?.scope || "", /frame/);
-    assert.match(crossFrameInput?.ref || "", /^f\d+:e\d+$/);
+    assert.match(crossFrameInput?.ref || "", /^f\d+:e[a-z0-9]+-[a-z0-9]+$/);
     assert.ok(crossFrameInput?.frameId > 0);
     assert.equal(crossFrameInput?.rectSpace, "top-viewport");
     assert.ok(uploadInput?.ref);
@@ -2714,7 +2812,8 @@ async function startFixtureServer() {
             itemDescription: "",
             targetCount: null,
             fields: [],
-            includeCriteria: []
+            includeCriteria: [],
+            formats: []
           },
           completionCriteria: ["The visible Apply target has been clicked once."],
           reason: "The goal requests one complete visual action."
@@ -3155,7 +3254,9 @@ async function exercisePanelContracts({ cdp, panelSessionId, tabId, context }) {
           { record: false }
         );
       }
-      startRunTimeline("좁은 패널 작업 흐름 검증");
+      startRunTimeline(
+        "자유게시판에 들어가서 1페이지부터 3페이지까지의 내용을 전부 확인하고 결과를 정리해 주세요"
+      );
       updateRunTimeline("observe", "active", "현재 화면을 읽는 중");
       const actionTarget = state.lastContext.interactiveElements.find((item) => item.rect)
         || state.lastContext.interactiveElements[0];
@@ -3220,9 +3321,20 @@ async function exercisePanelContracts({ cdp, panelSessionId, tabId, context }) {
         const chatRect = elements.messageList.getBoundingClientRect();
         const approvalRect = elements.externalApprovalPanel.getBoundingClientRect();
         const activityDockRect = elements.activityDock.getBoundingClientRect();
+        const activitySummaryContent = elements.activityDock.querySelector(".activity-summary-content");
+        const activitySummaryTitle = elements.activityDock.querySelector(".activity-header strong");
+        const activitySummaryHeader = elements.activityDock.querySelector(".activity-header");
+        const activityCurrent = elements.activityDock.querySelector(".activity-current");
+        const activitySummaryContentRect = activitySummaryContent.getBoundingClientRect();
+        const activitySummaryTitleRect = activitySummaryTitle.getBoundingClientRect();
+        const activitySummaryHeaderRect = activitySummaryHeader.getBoundingClientRect();
+        const activityCurrentRect = activityCurrent.getBoundingClientRect();
         const inputRect = elements.chatInput.getBoundingClientRect();
         const sendRect = elements.sendButton.getBoundingClientRect();
         const composerStyle = getComputedStyle(elements.composer);
+        const activitySummaryTitleFontSize = Number.parseFloat(
+          getComputedStyle(activitySummaryTitle).fontSize
+        );
         const layout = {
           width: innerWidth,
           height: innerHeight,
@@ -3236,6 +3348,15 @@ async function exercisePanelContracts({ cdp, panelSessionId, tabId, context }) {
           activityDockCollapsed: !state.agentRunUi?.article?.open,
           activityDockNoHorizontalOverflow:
             elements.activityDock.scrollWidth <= elements.activityDock.clientWidth + 1,
+          activitySummaryContentNoHorizontalOverflow:
+            activitySummaryContent.scrollWidth <= activitySummaryContent.clientWidth + 1,
+          activitySummaryTitleSingleLine:
+            activitySummaryTitleRect.height <= activitySummaryTitleFontSize * 1.6,
+          activitySummaryRowsContained:
+            activitySummaryHeaderRect.left >= activitySummaryContentRect.left - 1
+            && activitySummaryHeaderRect.right <= activitySummaryContentRect.right + 1
+            && activityCurrentRect.left >= activitySummaryContentRect.left - 1
+            && activityCurrentRect.right <= activitySummaryContentRect.right + 1,
           externalApprovalHeight: Math.round(approvalRect.height),
           composerVisible: !elements.composer.hidden
             && composerStyle.display !== "none"
@@ -3984,6 +4105,269 @@ async function exerciseInternalElementDiscoveryContract({ cdp, panelSessionId, t
         )
       };
 
+      state.agentSession = {
+        runId: "search-relaxation-e2e",
+        targetTabId: ${JSON.stringify(tabId)},
+        documentId: ${JSON.stringify(context.documentId)},
+        latestUserMessage: "다음 결과 페이지로 이동해줘",
+        turnIntent: createFallbackTurnIntent("다음 결과 페이지로 이동해줘"),
+        successfulEffects: [],
+        successfulInteractions: [],
+        attemptLedger: [],
+        effectSequence: 0,
+        effectKeySalt: "search-relaxation",
+        step: 0,
+        history: [],
+        evidence: [],
+        datasets: [],
+        activeCollectionId: "",
+        collectionAwaitingExtraction: false,
+        collectionExports: [],
+        currentPageEvidenceId: "",
+        status: "running",
+        stopRequested: false,
+        pendingRequestId: "",
+        noProgressCount: 0,
+        lastObservationFingerprint: "",
+        lastDecisionFingerprint: "",
+        startedAt: new Date().toISOString()
+      };
+      const emptyExactSearchContext = {
+        ...structuredClone(firstContext),
+        interactiveElements: [],
+        interactiveElementStats: {
+          total: 0,
+          availableTotal: null,
+          potentialTotal: 121,
+          included: 0,
+          visited: 0,
+          truncated: false
+        },
+        elementDiscovery: {
+          scope: "current-visual-viewport",
+          query: "Dense grid next page",
+          search: {
+            query: "Dense grid next page",
+            roles: ["button"],
+            nearText: "Synthetic collection name"
+          },
+          pageSize: 80,
+          returned: 0,
+          total: 0,
+          availableTotal: null,
+          potentialTotal: 121,
+          visited: 0,
+          remaining: 0,
+          hasMore: false,
+          nextCursor: ""
+        }
+      };
+      const relaxedSearchContext = {
+        ...structuredClone(emptyExactSearchContext),
+        interactiveElements: [{
+          ref: "stable-pagination-ref",
+          tag: "button",
+          role: "button",
+          type: "button",
+          label: "Dense grid next page",
+          selector: "#dense-next-page",
+          disabled: false,
+          actionability: "interactive"
+        }],
+        interactiveElementStats: {
+          total: 1,
+          availableTotal: null,
+          potentialTotal: 121,
+          included: 1,
+          visited: 1,
+          truncated: false
+        },
+        elementDiscovery: {
+          ...structuredClone(emptyExactSearchContext.elementDiscovery),
+          search: {
+            query: "Dense grid next page",
+            roles: ["button"],
+            nearText: ""
+          },
+          returned: 1,
+          total: 1,
+          visited: 1
+        }
+      };
+      const relaxationRequests = [];
+      let relaxationModelCalls = 0;
+      collectDecisionObservation = async (discovery = {}) => {
+        relaxationRequests.push({
+          query: discovery.elementQuery || "",
+          roles: discovery.elementRoles || [],
+          nearText: discovery.elementNearText || ""
+        });
+        const observed = !discovery.elementQuery
+          ? firstContext
+          : discovery.elementNearText
+            ? emptyExactSearchContext
+            : relaxedSearchContext;
+        state.lastContext = observed;
+        return { context: observed, screenshotDataUrl: "" };
+      };
+      loadMcpToolContext = async () => ({ enabled: false, tools: [], error: "" });
+      loadMcpAssetContext = async () => ({ enabled: false, resources: [], prompts: [], error: "" });
+      requestAiDecision = async () => {
+        relaxationModelCalls += 1;
+        return {
+          text: JSON.stringify(relaxationModelCalls === 1 ? {
+            version: "1.0",
+            status: "discover",
+            message: "",
+            summary: "페이지 이동 버튼 검색",
+            progress: "현재 묶음에는 대상이 없습니다.",
+            doneReason: "",
+            completionEvidence: [],
+            needsUserApproval: false,
+            plan: ["다음 페이지 버튼 찾기"],
+            elementSearch: {
+              query: "Dense grid next page",
+              roles: ["button"],
+              nearText: "Synthetic collection name",
+              reason: "페이지 이동 버튼을 현재 화면에서 찾습니다."
+            },
+            toolCalls: [],
+            actions: [],
+            verification: { required: false, expectedChange: "", successCriteria: [] }
+          } : {
+            version: "1.0",
+            status: "continue",
+            message: "현재 관찰에서 찾은 다음 페이지 버튼을 누릅니다.",
+            summary: "완화 검색으로 현재 버튼 확인",
+            progress: "잘못된 주변 문맥을 제거해 버튼을 찾았습니다.",
+            doneReason: "",
+            completionEvidence: [],
+            needsUserApproval: false,
+            plan: ["다음 페이지 버튼 클릭"],
+            elementSearch: { query: "", roles: [], nearText: "", reason: "" },
+            toolCalls: [],
+            actions: [{
+              id: "relaxed-next-page",
+              type: "click",
+              ref: "stable-pagination-ref",
+              reason: "현재 완화 검색 결과의 페이지 이동 버튼"
+            }],
+            verification: {
+              required: true,
+              expectedChange: "다음 결과 페이지가 표시됩니다.",
+              successCriteria: ["결과 페이지가 변경됩니다."]
+            }
+          })
+        };
+      };
+      const relaxedDecision = await requestChatDecision(state.agentSession);
+
+      state.agentSession = {
+        runId: "stale-ref-recovery-e2e",
+        targetTabId: ${JSON.stringify(tabId)},
+        documentId: ${JSON.stringify(context.documentId)},
+        latestUserMessage: "현재 결과 버튼을 눌러줘",
+        turnIntent: createFallbackTurnIntent("현재 결과 버튼을 눌러줘"),
+        successfulEffects: [],
+        successfulInteractions: [],
+        attemptLedger: [],
+        effectSequence: 0,
+        effectKeySalt: "stale-ref-recovery",
+        step: 0,
+        history: [],
+        evidence: [],
+        datasets: [],
+        activeCollectionId: "",
+        collectionAwaitingExtraction: false,
+        collectionExports: [],
+        currentPageEvidenceId: "",
+        status: "running",
+        stopRequested: false,
+        pendingRequestId: "",
+        noProgressCount: 0,
+        lastObservationFingerprint: "",
+        lastDecisionFingerprint: "",
+        startedAt: new Date().toISOString()
+      };
+      const currentRefContext = {
+        ...structuredClone(firstContext),
+        interactiveElements: [{
+          ref: "fresh-result-ref",
+          tag: "button",
+          role: "button",
+          type: "button",
+          label: "Current result",
+          selector: "#current-result",
+          disabled: false,
+          actionability: "interactive"
+        }],
+        interactiveElementStats: {
+          total: 1,
+          availableTotal: 1,
+          potentialTotal: 1,
+          included: 1,
+          visited: 1,
+          truncated: false
+        },
+        elementDiscovery: {
+          scope: "current-visual-viewport",
+          query: "",
+          search: { query: "", roles: [], nearText: "" },
+          pageSize: 80,
+          returned: 1,
+          total: 1,
+          availableTotal: 1,
+          potentialTotal: 1,
+          visited: 1,
+          remaining: 0,
+          hasMore: false,
+          nextCursor: ""
+        }
+      };
+      let staleRefObservationCalls = 0;
+      const staleRefPurposes = [];
+      let staleRefRecoveryPromptSeen = false;
+      collectDecisionObservation = async () => {
+        staleRefObservationCalls += 1;
+        state.lastContext = currentRefContext;
+        return { context: currentRefContext, screenshotDataUrl: "" };
+      };
+      requestAiDecision = async (_session, request) => {
+        staleRefPurposes.push(request.purpose);
+        staleRefRecoveryPromptSeen ||= request.user.includes('"active": true')
+          && request.user.includes("expired-result-ref");
+        const ref = staleRefPurposes.length < 3
+          ? "expired-result-ref"
+          : "fresh-result-ref";
+        return {
+          text: JSON.stringify({
+            version: "1.0",
+            status: "continue",
+            message: "현재 결과 버튼을 누릅니다.",
+            summary: "현재 관찰의 결과 버튼 선택",
+            progress: "",
+            doneReason: "",
+            completionEvidence: [],
+            needsUserApproval: false,
+            plan: ["결과 버튼 클릭"],
+            elementSearch: { query: "", roles: [], nearText: "", reason: "" },
+            toolCalls: [],
+            actions: [{
+              id: "click-current-result",
+              type: "click",
+              ref,
+              reason: "현재 화면의 결과 버튼"
+            }],
+            verification: {
+              required: true,
+              expectedChange: "결과 화면이 열립니다.",
+              successCriteria: ["결과 화면이 표시됩니다."]
+            }
+          })
+        };
+      };
+      const staleRefRecoveredDecision = await requestChatDecision(state.agentSession);
+
       const wrongDisclosureContext = {
         ...structuredClone(firstContext),
         pageState: {
@@ -4277,8 +4661,53 @@ async function exerciseInternalElementDiscoveryContract({ cdp, panelSessionId, t
         };
       };
       const boundedDecision = await requestChatDecision(state.agentSession);
+      const genericContractRecovery = buildDecisionValidationRecovery(
+        state.agentSession,
+        { status: "continue", actions: [], toolCalls: [] },
+        {
+          valid: false,
+          errors: ["A continue decision requires at least one executable effect."]
+        },
+        firstContext,
+        {},
+        { windows: 1, maxWindows: 4 },
+        getRuntimeSettings()
+      );
+      const repeatBoundaryRecovery = buildDecisionValidationRecovery(
+        state.agentSession,
+        { status: "continue", actions: [], toolCalls: [] },
+        {
+          valid: false,
+          errors: ["The same semantic effect already reached its repetition limit."],
+          turnBoundary: {
+            violations: [{ kind: "semantic-effect-repeat" }]
+          }
+        },
+        firstContext,
+        {},
+        { windows: 1, maxWindows: 4 },
+        getRuntimeSettings()
+      );
       return {
         ...firstScenario,
+        relaxedSearchDecisionStatus: relaxedDecision.status,
+        relaxedSearchActionRef: relaxedDecision.actions[0]?.ref || "",
+        relaxationRequests,
+        relaxationModelCalls,
+        relaxationLogged: state.evaluationLogs.some(
+          (entry) => entry.kind === "element-discovery-relaxation"
+        ),
+        staleRefRecoveredStatus: staleRefRecoveredDecision.status,
+        staleRefRecoveredActionRef: staleRefRecoveredDecision.actions[0]?.ref || "",
+        staleRefObservationCalls,
+        staleRefPurposes,
+        staleRefRecoveryPromptSeen,
+        staleRefRecoveryLogged: state.evaluationLogs.some(
+          (entry) => entry.kind === "decision-recovery"
+        ),
+        genericContractRecoveryAvailable:
+          genericContractRecovery?.state?.reason.includes("executable runtime contract") === true,
+        repeatBoundaryRecoverySuppressed: repeatBoundaryRecovery === null,
         recoveryDecisionStatus: recoveryDecision.status,
         recoveryActionRef: recoveryDecision.actions[0]?.ref || "",
         recoveryPurposes,
@@ -4315,6 +4744,8 @@ async function exerciseTurnBoundaryContracts({ cdp, panelSessionId, tabId, conte
   return evaluate(cdp, panelSessionId, `(async () => {
     const original = {
       requestAiDecision,
+      collectDecisionObservation,
+      loadAgentMcpContext,
       settings: structuredClone(state.settings),
       runtimeSettings: structuredClone(state.runtimeSettings),
       activeTab: state.activeTab ? structuredClone(state.activeTab) : null,
@@ -4436,7 +4867,8 @@ async function exerciseTurnBoundaryContracts({ cdp, panelSessionId, tabId, conte
               itemDescription: "",
               targetCount: null,
               fields: [],
-              includeCriteria: []
+              includeCriteria: [],
+              formats: []
             },
             completionCriteria: ["요청 유형 필드에 선택 결과가 표시된다."],
             reason: "최신 메시지는 직전 실패의 대상을 교정하는 문맥 의존 지시다."
@@ -4493,7 +4925,8 @@ async function exerciseTurnBoundaryContracts({ cdp, panelSessionId, tabId, conte
               itemDescription: "",
               targetCount: null,
               fields: [],
-              includeCriteria: []
+              includeCriteria: [],
+              formats: []
             },
             completionCriteria: ["요청 시작 시점보다 한 페이지 앞으로 이동한 현재 화면이 관찰된다."],
             reason: "최신 메시지는 자체로 완결된 새 명령이며 한 번이라는 범위를 명시한다."
@@ -4835,7 +5268,80 @@ async function exerciseTurnBoundaryContracts({ cdp, panelSessionId, tabId, conte
         new Error("Invalid status 401 from provider.")
       );
 
+      clearRunTimeline();
+      createAgentSession("현재 페이지에서 다음 페이지로 한 번 이동해줘.");
+      const fusedSession = state.agentSession;
+      const fusedRequests = [];
+      collectDecisionObservation = async () => ({
+        context: currentContext,
+        screenshotDataUrl: ""
+      });
+      loadAgentMcpContext = async () => ({
+        enabled: false,
+        tools: [],
+        resources: [],
+        prompts: [],
+        error: "",
+        assetError: ""
+      });
+      requestAiDecision = async (_activeSession, request) => {
+        fusedRequests.push(request);
+        return {
+          text: JSON.stringify({
+            turnIntent: {
+              version: "1.0",
+              mode: "standalone",
+              objective: "현재 페이지에서 다음 페이지로 한 번 이동해줘.",
+              contextSummary: "",
+              repeatPolicy: "once",
+              repeatLimit: 1,
+              deliverable: {
+                kind: "effect",
+                itemDescription: "",
+                targetCount: null,
+                fields: [],
+                includeCriteria: [],
+                formats: []
+              },
+              completionCriteria: ["현재 위치에서 정확히 한 페이지 앞으로 이동한 상태가 관찰된다."],
+              reason: "최신 메시지는 한 번의 이동을 요청하는 완결된 지시다."
+            },
+            version: "1.0",
+            status: "continue",
+            message: "다음 페이지로 한 번 이동합니다.",
+            summary: "현재 페이지에서 한 번 이동",
+            progress: "현재 화면의 다음 페이지 버튼을 확인했습니다.",
+            doneReason: "",
+            completionEvidence: [],
+            needsUserApproval: false,
+            plan: ["다음 페이지 버튼 실행", "변경된 페이지 확인"],
+            elementSearch: { query: "", roles: [], nearText: "", reason: "" },
+            toolCalls: [],
+            actions: [{
+              id: "fused-next-page",
+              type: "click",
+              ref: "e1",
+              reason: "현재 관찰의 다음 페이지 버튼"
+            }],
+            verification: {
+              required: true,
+              expectedChange: "페이지가 한 번 변경된다.",
+              successCriteria: ["이전 위치보다 한 페이지 앞으로 이동한다."]
+            }
+          })
+        };
+      };
+      const fusedDecision = await requestChatDecision(fusedSession);
+
       return {
+        fusedInitialModelCalls: fusedRequests.length,
+        fusedInitialPurpose: fusedRequests[0]?.purpose || "",
+        fusedInitialSchemaIncludesIntent:
+          fusedRequests[0]?.responseSchema?.required?.includes("turnIntent") === true,
+        fusedIntentResolved: fusedSession.turnIntentResolved === true
+          && fusedSession.turnIntent.objective === "현재 페이지에서 다음 페이지로 한 번 이동해줘.",
+        fusedDecisionExecutable: fusedDecision.status === "continue"
+          && fusedDecision.actions[0]?.ref === "e1",
         freshIntentModelCalls,
         freshIntentMode: freshIntent.mode,
         correctiveIntentMode: correctiveIntent.mode,
@@ -4892,13 +5398,15 @@ async function exerciseTurnBoundaryContracts({ cdp, panelSessionId, tabId, conte
           && !lastConversation.text.includes("{")
           && lastConversation.text.includes("Provider request failed"),
         completionEvidenceDiagnosticHidden: !completionEvidenceDiagnostic.includes("completionEvidence")
-          && completionEvidenceDiagnostic.includes("안전한 실행 계획"),
+          && completionEvidenceDiagnostic.includes("실행 계약의 안전 검증"),
         elementSearchDiagnosticHidden: !elementSearchDiagnostic.includes("elementSearch")
-          && elementSearchDiagnostic.includes("안전한 실행 계획"),
+          && elementSearchDiagnostic.includes("실행 계약의 안전 검증"),
         providerStatusErrorPreserved: providerStatusError === "Invalid status 401 from provider."
       };
     } finally {
       requestAiDecision = original.requestAiDecision;
+      collectDecisionObservation = original.collectDecisionObservation;
+      loadAgentMcpContext = original.loadAgentMcpContext;
       state.settings = original.settings;
       state.runtimeSettings = original.runtimeSettings;
       state.activeTab = original.activeTab;
@@ -4928,7 +5436,8 @@ async function exerciseCollectionLedgerContracts({ cdp, panelSessionId, tabId, c
       agentSession: state.agentSession,
       agentRunUi: state.agentRunUi,
       datasets: structuredClone(state.datasets),
-      evaluationLogs: structuredClone(state.evaluationLogs)
+      evaluationLogs: structuredClone(state.evaluationLogs),
+      downloadBlobFile
     };
     const makeRows = (start) => Array.from({ length: 20 }, (_, index) => ({
       key: String(start + index),
@@ -4970,7 +5479,7 @@ async function exerciseCollectionLedgerContracts({ cdp, panelSessionId, tabId, c
         successCriteria: ["unique rows are added"]
       }
     });
-    const makeSession = () => {
+    const makeSession = (formats = []) => {
       createAgentSession("자유게시판 일반 글 제목 40개를 알려줘.");
       state.agentSession.turnIntent = AgentCore.normalizeTurnIntent({
         version: "1.0",
@@ -4984,7 +5493,8 @@ async function exerciseCollectionLedgerContracts({ cdp, panelSessionId, tabId, c
           itemDescription: "normal free-board post",
           targetCount: 40,
           fields: ["title"],
-          includeCriteria: ["Exclude pinned notices."]
+          includeCriteria: ["Exclude pinned notices."],
+          formats
         },
         completionCriteria: ["Exactly 40 unique titles are returned."],
         reason: "The number is output cardinality."
@@ -5182,6 +5692,112 @@ async function exerciseCollectionLedgerContracts({ cdp, panelSessionId, tabId, c
         state.lastContext
       ).valid === true;
 
+      const exportSession = makeSession(["xlsx"]);
+      const exportPageOne = {
+        ok: true,
+        action: pageOneDecision.actions[0],
+        result: { collection: makeBatch(1, 1) },
+        verification: {}
+      };
+      ingestStructuredCollectionResults(exportSession, pageOneDecision, [exportPageOne]);
+      exportSession.collectionAwaitingExtraction = true;
+      const exportPageTwo = {
+        ok: true,
+        action: pageTwoDecision.actions[0],
+        result: { collection: makeBatch(2, 21) },
+        verification: {}
+      };
+      ingestStructuredCollectionResults(exportSession, pageTwoDecision, [exportPageTwo]);
+      state.agentSession = exportSession;
+      const exportMissingBeforeTool = validateCollectionBoundary(
+        exportSession,
+        { step: 4, status: "completed", toolCalls: [], actions: [] },
+        state.lastContext
+      ).valid === false;
+      const runtimeContext = buildAgentMcpContext(
+        { enabled: false, tools: [], error: "" },
+        { resources: [], prompts: [], error: "" }
+      );
+      const runtimeToolAvailableWithoutMcp = runtimeContext.tools.some(
+        (tool) => tool.name === RUNTIME_COLLECTION_EXPORT_TOOL
+          && tool.kind === "runtime_tool"
+      );
+      const exportToolCall = {
+        toolName: RUNTIME_COLLECTION_EXPORT_TOOL,
+        arguments: {
+          collectionId: "free-board-titles",
+          format: "xlsx",
+          filename: "free-board-titles"
+        },
+        reason: "Save the requested local workbook."
+      };
+      const exportDecision = {
+        step: 4,
+        status: "continue",
+        mcpContext: runtimeContext,
+        toolCalls: [exportToolCall],
+        actions: []
+      };
+      const exportDecisionAllowed = validateCollectionBoundary(
+        exportSession,
+        exportDecision,
+        state.lastContext
+      ).valid === true;
+      let generatedDownloadCount = 0;
+      downloadBlobFile = (filename, value, mimeType) => {
+        generatedDownloadCount += 1;
+        return {
+          filename,
+          mimeType,
+          byteLength: new Blob([value]).size,
+          startedAt: "2026-07-24T00:00:00.000Z"
+        };
+      };
+      const exportResult = executeRuntimeCapability(exportToolCall);
+      const duplicateExportResult = executeRuntimeCapability(exportToolCall);
+      const exportArtifactRecorded = exportSession.collectionExports.length === 1
+        && exportSession.collectionExports[0]?.format === "xlsx"
+        && exportSession.collectionExports[0]?.rowCount === 40
+        && exportSession.collectionExports[0]?.byteLength > 0
+        && exportResult.artifact?.filename.endsWith(".xlsx")
+        && duplicateExportResult.reused === true
+        && generatedDownloadCount === 1;
+      const terminalAllowedAfterExport = validateCollectionBoundary(
+        exportSession,
+        { step: 5, status: "completed", toolCalls: [], actions: [] },
+        state.lastContext
+      ).valid === true;
+      const terminalDefaults = normalizeChatDecision({
+        version: "1.0",
+        status: "completed",
+        message: "",
+        summary: "",
+        progress: "",
+        doneReason: "",
+        completionEvidence: [],
+        needsUserApproval: false,
+        plan: [],
+        elementSearch: { query: "", roles: [], nearText: "", reason: "" },
+        toolCalls: [],
+        actions: [],
+        verification: { required: false, expectedChange: "", successCriteria: [] }
+      }, 5);
+      applyRuntimeTerminalDefaults(exportSession, terminalDefaults);
+      const runtimeTerminalMessageGrounded = terminalDefaults.message.includes("40개")
+        && terminalDefaults.message.includes(exportResult.artifact.filename);
+      let unrequestedFormatRejected = false;
+      try {
+        executeRuntimeCapability({
+          ...exportToolCall,
+          arguments: {
+            ...exportToolCall.arguments,
+            format: "csv"
+          }
+        });
+      } catch {
+        unrequestedFormatRejected = true;
+      }
+
       const repeatedSession = makeSession();
       const repeatedFirst = {
         ok: true,
@@ -5242,6 +5858,13 @@ async function exerciseCollectionLedgerContracts({ cdp, panelSessionId, tabId, c
         secondPageReachedExactTarget,
         thirdPageBlocked,
         terminalAnswerAllowed,
+        exportMissingBeforeTool,
+        runtimeToolAvailableWithoutMcp,
+        exportDecisionAllowed,
+        exportArtifactRecorded,
+        terminalAllowedAfterExport,
+        runtimeTerminalMessageGrounded,
+        unrequestedFormatRejected,
         repeatedPageStalled,
         zeroNewPageStalled
       };
@@ -5251,6 +5874,7 @@ async function exerciseCollectionLedgerContracts({ cdp, panelSessionId, tabId, c
       state.agentSession = original.agentSession;
       state.datasets = original.datasets;
       state.evaluationLogs = original.evaluationLogs;
+      downloadBlobFile = original.downloadBlobFile;
       clearRunTimeline();
       state.agentRunUi = original.agentRunUi;
       updateAgentButtons();
@@ -5306,7 +5930,8 @@ async function exerciseWorkflowSetContracts({ cdp, panelSessionId, tabId }) {
         itemDescription: "board post",
         targetCount: 40,
         fields: ["title"],
-        includeCriteria: ["Exclude notices."]
+        includeCriteria: ["Exclude notices."],
+        formats: []
       });
       const outputContractPreserved = portableContract.kind === "collection"
         && portableContract.itemDescription === "board post"
@@ -5328,7 +5953,8 @@ async function exerciseWorkflowSetContracts({ cdp, panelSessionId, tabId }) {
             itemDescription: "",
             targetCount: null,
             fields: [],
-            includeCriteria: []
+            includeCriteria: [],
+            formats: []
           },
           completionCriteria: ["The task completes."],
           reason: "fixture"
@@ -5993,6 +6619,7 @@ async function exerciseAgentVerificationContracts({ cdp, panelSessionId, tabId, 
         completionCriteria: ["현재 화면 상태 정보가 최종 답변에 실제로 포함된다."],
         reason: "최신 메시지는 직전의 구체적인 미완료 전달 약속을 명시적으로 이어 간다."
       });
+      session.turnIntentResolved = true;
       const purposes = [];
       const screenshotChecks = [];
       let groundingCallCount = 0;
@@ -6117,6 +6744,7 @@ async function exerciseAgentVerificationContracts({ cdp, panelSessionId, tabId, 
         completionCriteria: ["확인한 상태 정보가 최종 답변 본문에 포함된다."],
         reason: "최신 메시지는 직전의 구체적인 미완료 결과 전달을 수락한다."
       });
+      promiseSession.turnIntentResolved = true;
       const promisePurposes = [];
       let completionVerifierCalls = 0;
       requestAiDecision = async (activeSession, request) => {
@@ -7091,7 +7719,7 @@ async function captureAgentPanelDocs(cdp, panelSessionId) {
     }
     startRunTimeline("Summarize the current-page checks in a table.");
     updateRunTimeline("observe", "done", "Visible page content collected");
-    updateRunTimeline("think", "done", "Response prepared");
+    updateRunTimeline("think", "done", "Scope and plan resolved in one request");
     updateRunTimeline("tools", "skipped", "No tool execution");
     updateRunTimeline("actions", "skipped", "No page actions");
     updateRunTimeline("verify", "done", "Current-page evidence verified");

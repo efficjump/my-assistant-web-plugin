@@ -141,6 +141,49 @@ test("decision contract distinguishes the visual viewport from hidden DOM metada
   assert.match(contract, /offscreen, clipped, occluded, or hidden DOM/i);
 });
 
+test("initial decision contract resolves turn intent and planning in one structured response", () => {
+  const initialDecision = {
+    turnIntent: {
+      version: "1.0",
+      mode: "standalone",
+      objective: "Summarize the current page.",
+      contextSummary: "",
+      repeatPolicy: "once",
+      repeatLimit: 1,
+      deliverable: {
+        kind: "answer",
+        itemDescription: "",
+        targetCount: null,
+        fields: [],
+        includeCriteria: [],
+        formats: []
+      },
+      completionCriteria: ["The response contains the current-page summary."],
+      reason: "The latest message is a complete standalone request."
+    },
+    version: "1.0",
+    status: "answer",
+    message: "The current page contains a search form.",
+    summary: "Current-page summary",
+    progress: "Visible content reviewed",
+    doneReason: "",
+    completionEvidence: [],
+    needsUserApproval: false,
+    plan: ["Review visible evidence", "Return the summary"],
+    elementSearch: { query: "", roles: [], nearText: "", reason: "" },
+    toolCalls: [],
+    actions: [],
+    verification: { required: false, expectedChange: "", successCriteria: [] }
+  };
+
+  assert.deepEqual(
+    Core.validateJsonAgainstSchema(initialDecision, Core.INITIAL_DECISION_SCHEMA),
+    []
+  );
+  assert.match(Core.buildInitialDecisionContractText(), /same object/i);
+  assert.ok(Core.INITIAL_DECISION_SCHEMA.required.includes("turnIntent"));
+});
+
 test("accepts local element search and removes stale search metadata from executable decisions", () => {
   const discovery = Core.normalizeDecision(baseDecision({
     status: "discover",
@@ -288,7 +331,8 @@ test("turn intent defaults to a standalone single-effect boundary and validates 
       itemDescription: "",
       targetCount: null,
       fields: [],
-      includeCriteria: []
+      includeCriteria: [],
+      formats: []
     },
     completionCriteria: [],
     reason: ""
@@ -306,7 +350,8 @@ test("turn intent defaults to a standalone single-effect boundary and validates 
       itemDescription: "",
       targetCount: null,
       fields: [],
-      includeCriteria: []
+      includeCriteria: [],
+      formats: []
     },
     completionCriteria: ["Three additional pages were inspected."],
     reason: "The latest request contains an explicit numeric bound."
@@ -336,7 +381,8 @@ test("collection cardinality stays separate from semantic effect repetition", ()
       itemDescription: "board post",
       targetCount: 40,
       fields: ["title"],
-      includeCriteria: ["Exclude pinned notices."]
+      includeCriteria: ["Exclude pinned notices."],
+      formats: ["XLSX", "xlsx"]
     },
     completionCriteria: ["Exactly 40 unique normal post titles are collected."],
     reason: "The number describes output rows, not repeated permission."
@@ -347,6 +393,57 @@ test("collection cardinality stays separate from semantic effect repetition", ()
   assert.equal(intent.repeatLimit, 1);
   assert.equal(intent.deliverable.targetCount, 40);
   assert.deepEqual(intent.deliverable.fields, ["title"]);
+  assert.deepEqual(intent.deliverable.formats, ["xlsx"]);
+});
+
+test("element search relaxations remove one semantic constraint at a time without jumping to an unfiltered search", () => {
+  const relaxations = Core.buildElementSearchRelaxations({
+    query: "2",
+    roles: ["link"],
+    nearText: "게시판 페이지 이동",
+    reason: "Find the next result page."
+  });
+  assert.deepEqual(relaxations[0], {
+    query: "2",
+    roles: ["link"],
+    nearText: "",
+    reason: "Find the next result page."
+  });
+  assert.ok(relaxations.every((search) => (
+    search.query || search.roles.length || search.nearText
+  )));
+  assert.equal(new Set(relaxations.map((search) => Core.stableStringify(search))).size, relaxations.length);
+
+  const relational = Core.buildElementSearchRelaxations({
+    query: "",
+    roles: ["button"],
+    nearText: "Request type",
+    reason: "Find the unlabeled lookup control."
+  });
+  assert.deepEqual(relational[0], {
+    query: "",
+    roles: [],
+    nearText: "Request type",
+    reason: "Find the unlabeled lookup control."
+  });
+});
+
+test("normalization discards collection-only fields from unrelated actions", () => {
+  const decision = Core.normalizeDecision(baseDecision({
+    actions: [{
+      id: "next-page",
+      type: "click",
+      ref: "e1",
+      collectionId: "posts",
+      collectionName: "Posts",
+      targetCount: 60,
+      reason: "Open the next page."
+    }]
+  }));
+  assert.equal(decision.actions[0].collectionId, undefined);
+  assert.equal(decision.actions[0].collectionName, undefined);
+  assert.equal(decision.actions[0].targetCount, undefined);
+  assert.equal(Core.validateDecision(decision, { context }).valid, true);
 });
 
 test("accepts only runtime-issued completion evidence IDs", () => {

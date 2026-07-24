@@ -417,6 +417,9 @@ test("tool-only effects stay bound to the exact planning observation", () => {
 
 test("terminal response verification uses one immutable turn intent and current visual evidence", () => {
   const script = fs.readFileSync(path.join(root, "panel.js"), "utf8");
+  const executeStart = script.indexOf("async function executeAgentInstruction");
+  const executeEnd = script.indexOf("function prefetchInitialDecisionContext", executeStart);
+  const executeFunction = script.slice(executeStart, executeEnd);
   const completionStart = script.indexOf("async function requestCompletionVerification");
   const groundingStart = script.indexOf("async function requestAnswerGroundingVerification");
   const groundingEnd = script.indexOf("async function requestExecutionPolicy", groundingStart);
@@ -444,7 +447,10 @@ test("terminal response verification uses one immutable turn intent and current 
   assert.match(completionFunction, /completion, response-delivery, and grounding verifier/);
   assert.match(script, /discarded_unissued_ids/);
   assert.match(script, /allowVerifierEvidenceBinding:\s*false/);
-  assert.match(script, /resolveAgentTurnIntent\(state\.agentSession\)/);
+  assert.doesNotMatch(executeFunction, /resolveAgentTurnIntent/);
+  assert.match(script, /session\.turnIntentResolved === false/);
+  assert.match(script, /AgentCore\.INITIAL_DECISION_SCHEMA/);
+  assert.match(script, /shouldResolveTurnIntent \? "intent-and-decision" : "decision"/);
   assert.match(script, /repeatPolicy === "until_condition"/);
   assert.match(script, /recordExecutionOutcomes/);
 });
@@ -459,7 +465,8 @@ test("malformed decision output and internal JSON stay out of user-facing chat",
   assert.doesNotMatch(parserFunctions, /message:\s*String\(text/);
   assert.match(script, /looksLikeInternalDecisionPayload\(decision\.message\)/);
   assert.match(script, /사용자에게 표시할 message에는 내부 판단 JSON을 넣을 수 없습니다/);
-  assert.match(script, /AI 응답을 안전한 실행 계획으로 변환하지 못해/);
+  assert.match(script, /실행 계획이 현재 화면과 실행 계약의 안전 검증을 통과하지 못해/);
+  assert.doesNotMatch(script, /잠시 후 다시 요청해 주세요/);
   assert.match(script, /normalizeUserFacingErrorMessage/);
   assert.match(script, /looksLikeInternalContractDiagnostic\(message\)/);
   assert.match(script, /Object\.keys\(AgentCore\.DECISION_SCHEMA\?\.properties/);
