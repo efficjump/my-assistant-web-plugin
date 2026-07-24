@@ -13,7 +13,11 @@ const assistantPageState = {
   observedRoots: new WeakSet(),
   mutationObservers: [],
   visualOccluderCache: new WeakMap(),
-  includeChildFrames: true
+  includeChildFrames: true,
+  collectionCache: null,
+  observationProbe: null,
+  visualRevision: 0,
+  visualListenersInstalled: false
 };
 
 const INTERACTIVE_ROLES = new Set([
@@ -39,6 +43,7 @@ const INTERACTIVE_ROLES = new Set([
 
 const NATIVE_INTERACTIVE_TAGS = new Set([
   "a",
+  "area",
   "audio",
   "button",
   "input",
@@ -64,6 +69,12 @@ async function handleContentMessage(message) {
       return { ready: true };
     case "COLLECT_PAGE_CONTEXT":
       return collectPageContext(message.options || {});
+    case "COLLECT_FRAME_CONTEXT":
+      return collectFrameContext(message.options || {});
+    case "VERIFY_OBSERVATION_PROBE":
+      return verifyObservationProbe();
+    case "WAIT_FOR_PAGE_SETTLE":
+      return waitForPageSettle(message.options || {});
     case "EXECUTE_PAGE_ACTIONS":
       return executePageActions(message.actions || []);
     case "VERIFY_PAGE_ACTION_EFFECT":
@@ -78,10 +89,16 @@ async function handleContentMessage(message) {
 }
 
 function collectPageContext(options) {
+  const collectionStartedAt = performance.now();
+  assistantPageState.collectionCache = createCollectionCache();
+  try {
   assistantPageState.elementsByRef.clear();
   assistantPageState.visualOccluderCache = new WeakMap();
   assistantPageState.includeChildFrames = options.includeChildFrames !== false;
-  assistantPageState.scopes = collectDomScopes(assistantPageState.includeChildFrames);
+  assistantPageState.scopes = measureCollectionPhase(
+    "domScopes",
+    () => collectDomScopes(assistantPageState.includeChildFrames)
+  );
   observeDomScopes(assistantPageState.scopes);
 
   const maxTextChars = clampNumber(options.maxTextChars, 4000, 50000, 16000);
@@ -93,26 +110,62 @@ function collectPageContext(options) {
     nearText: options.elementNearText
   });
   const redactSensitiveData = options.redactSensitiveData !== false;
-  const interactiveElementCollection = collectInteractiveElements({
-    limit: maxElements,
-    offset: elementOffset,
-    search: elementSearch,
-    redactSensitiveData
-  });
+  const interactiveElementCollection = measureCollectionPhase(
+    "interactiveElements",
+    () => collectInteractiveElements({
+      limit: maxElements,
+      offset: elementOffset,
+      search: elementSearch,
+      redactSensitiveData
+    })
+  );
   const interactiveElements = interactiveElementCollection.elements;
-  const scrollRegions = collectScrollRegions(Math.max(6, Math.min(24, Math.ceil(maxElements / 4))), redactSensitiveData);
-  const visualSurfaces = collectVisualSurfaces(Math.max(4, Math.min(16, Math.ceil(maxElements / 5))), redactSensitiveData);
-  const frameBoundaries = collectFrameBoundaries(36, redactSensitiveData);
+  const scrollRegions = measureCollectionPhase(
+    "scrollRegions",
+    () => collectScrollRegions(
+      Math.max(6, Math.min(24, Math.ceil(maxElements / 4))),
+      redactSensitiveData
+    )
+  );
+  const visualSurfaces = measureCollectionPhase(
+    "visualSurfaces",
+    () => collectVisualSurfaces(
+      Math.max(4, Math.min(16, Math.ceil(maxElements / 5))),
+      redactSensitiveData
+    )
+  );
+  const frameBoundaries = measureCollectionPhase(
+    "frameBoundaries",
+    () => collectFrameBoundaries(36, redactSensitiveData)
+  );
   const iframes = collectIframes(frameBoundaries, 12);
-  const collectedVisibleText = collectVisibleText(maxTextChars);
+  const collectedVisibleText = measureCollectionPhase(
+    "visibleText",
+    () => collectVisibleText(maxTextChars)
+  );
   const visibleText = redactSensitiveData
     ? redactSensitiveText(collectedVisibleText)
     : collectedVisibleText;
+  const semanticContext = measureCollectionPhase("semanticContext", () => ({
+    headings: collectHeadings(24, redactSensitiveData),
+    landmarks: collectLandmarks(24, redactSensitiveData),
+    forms: collectForms(12, redactSensitiveData),
+    tables: collectTables(10, redactSensitiveData),
+    liveRegions: collectLiveRegions(20, redactSensitiveData)
+  }));
+  const observationProbe = measureCollectionPhase(
+    "observationProbe",
+    () => createObservationProbe()
+  );
+  const collectionCache = assistantPageState.collectionCache;
 
-  return {
+  const context = {
     documentId: assistantPageState.documentId,
     url: sanitizeUrlForContext(location.href, redactSensitiveData),
     title: redactSensitiveData ? redactSensitiveText(document.title) : document.title,
+    frameName: redactSensitiveData ? redactSensitiveText(window.name || "") : window.name || "",
+    frameNameBinding: window.name || "",
+    frameNameDigest: window.name ? hashState(String(window.name)) : "",
     language: document.documentElement.lang || "",
     timestamp: new Date().toISOString(),
     pageState: collectPageState(redactSensitiveData),
@@ -132,13 +185,13 @@ function collectPageContext(options) {
       includes: ["painted text", "visually exposed controls", "visible scroll regions", "visible visual surfaces"],
       excludes: ["offscreen content", "clipped content", "occluded content", "hidden DOM"]
     },
-    headings: collectHeadings(24, redactSensitiveData),
-    landmarks: collectLandmarks(24, redactSensitiveData),
-    forms: collectForms(12, redactSensitiveData),
-    tables: collectTables(10, redactSensitiveData),
+    headings: semanticContext.headings,
+    landmarks: semanticContext.landmarks,
+    forms: semanticContext.forms,
+    tables: semanticContext.tables,
     iframes,
     frameBoundaries,
-    liveRegions: collectLiveRegions(20, redactSensitiveData),
+    liveRegions: semanticContext.liveRegions,
     domScopes: assistantPageState.scopes.map((scope) => ({
       id: scope.id,
       kind: scope.kind,
@@ -153,8 +206,308 @@ function collectPageContext(options) {
       scrollRegions,
       visualSurfaces,
       iframes
-    })
+    }),
+    observationProbe,
+    collectionDiagnostics: {
+      durationMs: roundDuration(performance.now() - collectionStartedAt),
+      phaseDurationsMs: Object.fromEntries(
+        Array.from(collectionCache.phaseDurations.entries())
+          .map(([name, duration]) => [name, roundDuration(duration)])
+      ),
+      domScopeCount: assistantPageState.scopes.length,
+      scannedElementCount: collectionCache.scannedElementCount,
+      queryCount: collectionCache.queryCount,
+      cacheHits: { ...collectionCache.cacheHits }
+    }
   };
+  return context;
+  } finally {
+    for (const scope of assistantPageState.scopes) {
+      scope.elements = null;
+    }
+    assistantPageState.collectionCache = null;
+  }
+}
+
+function createObservationProbe() {
+  const targets = Array.from(assistantPageState.elementsByRef.entries())
+    .map(([ref, record]) => ({ ref, element: record.element }))
+    .filter((entry) => entry.element?.isConnected);
+  const frameElements = queryAllDom("iframe,frame");
+  const probe = {
+    version: "1.0",
+    documentId: assistantPageState.documentId,
+    targets,
+    frameElements,
+    baseline: null
+  };
+  probe.baseline = readObservationProbeDescriptor(probe);
+  assistantPageState.observationProbe = probe;
+  return {
+    version: probe.version,
+    documentId: probe.documentId,
+    digest: probe.baseline.digest,
+    targetCount: targets.length,
+    frameBoundaryCount: frameElements.length
+  };
+}
+
+function verifyObservationProbe() {
+  const probe = assistantPageState.observationProbe;
+  if (!probe || probe.documentId !== assistantPageState.documentId) {
+    return {
+      version: "1.0",
+      documentId: assistantPageState.documentId,
+      digest: "",
+      matchesBaseline: false,
+      reason: "observation_probe_missing"
+    };
+  }
+  const currentHeader = readObservationProbeHeader();
+  if (
+    currentHeader.domRevision !== probe.baseline.header.domRevision
+    || currentHeader.visualRevision !== probe.baseline.header.visualRevision
+    || currentHeader.viewportWidth !== probe.baseline.header.viewportWidth
+    || currentHeader.viewportHeight !== probe.baseline.header.viewportHeight
+    || currentHeader.scrollX !== probe.baseline.header.scrollX
+    || currentHeader.scrollY !== probe.baseline.header.scrollY
+  ) {
+    return {
+      version: probe.version,
+      documentId: probe.documentId,
+      digest: hashObservationProbe(currentHeader),
+      matchesBaseline: false,
+      reason: "observation_header_changed"
+    };
+  }
+
+  assistantPageState.collectionCache = createCollectionCache();
+  assistantPageState.visualOccluderCache = new WeakMap();
+  try {
+    const descriptor = readObservationProbeDescriptor(probe);
+    return {
+      version: probe.version,
+      documentId: probe.documentId,
+      digest: descriptor.digest,
+      matchesBaseline: descriptor.digest === probe.baseline.digest,
+      reason: descriptor.digest === probe.baseline.digest
+        ? ""
+        : "observation_geometry_changed"
+    };
+  } finally {
+    assistantPageState.collectionCache = null;
+  }
+}
+
+function waitForPageSettle(options = {}) {
+  const quietMs = clampNumber(options.quietMs, 80, 1000, 180);
+  const timeoutMs = clampNumber(options.timeoutMs, quietMs, 5000, Math.max(quietMs * 5, 900));
+  const pollMs = clampNumber(options.pollMs, 25, Math.min(100, quietMs), Math.min(50, quietMs));
+  const startedAt = performance.now();
+  let lastChangedAt = startedAt;
+  let lastSignal = readPageSettleSignal();
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (timedOut) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      window.clearInterval(intervalId);
+      window.clearTimeout(timeoutId);
+      const now = performance.now();
+      resolve({
+        settled: !timedOut,
+        timedOut: Boolean(timedOut),
+        elapsedMs: roundDuration(now - startedAt),
+        stableForMs: roundDuration(now - lastChangedAt),
+        signal: readPageSettleSignal()
+      });
+    };
+    const check = () => {
+      const now = performance.now();
+      const signal = readPageSettleSignal();
+      if (JSON.stringify(signal) !== JSON.stringify(lastSignal)) {
+        lastSignal = signal;
+        lastChangedAt = now;
+      }
+      if (
+        signal.readyState !== "loading"
+        && now - lastChangedAt >= quietMs
+      ) {
+        finish(false);
+      }
+    };
+    const intervalId = window.setInterval(check, pollMs);
+    const timeoutId = window.setTimeout(() => finish(true), timeoutMs);
+    check();
+  });
+}
+
+function readPageSettleSignal() {
+  return {
+    documentId: assistantPageState.documentId,
+    url: sanitizeUrlForContext(location.href, true),
+    readyState: document.readyState,
+    domRevision: assistantPageState.domRevision,
+    visualRevision: assistantPageState.visualRevision,
+    scrollX: Math.round(window.scrollX),
+    scrollY: Math.round(window.scrollY)
+  };
+}
+
+function readObservationProbeDescriptor(probe) {
+  const header = readObservationProbeHeader();
+  const targets = probe.targets.map(({ ref, element }) => {
+    if (!element?.isConnected) {
+      return { ref, connected: false };
+    }
+    const point = findExposedPoint(element);
+    const rect = getGlobalRect(element);
+    return {
+      ref,
+      connected: true,
+      exposed: Boolean(point),
+      rect: compactProbeRect(rect),
+      hitPoint: point
+        ? { x: Math.round(point.globalX), y: Math.round(point.globalY) }
+        : null,
+      scrollTop: ref.startsWith("s") ? Math.round(element.scrollTop) : null,
+      scrollLeft: ref.startsWith("s") ? Math.round(element.scrollLeft) : null
+    };
+  });
+  const frames = probe.frameElements.map((element, index) => ({
+    index,
+    connected: Boolean(element?.isConnected),
+    exposed: Boolean(element?.isConnected && findExposedPoint(element)),
+    rect: element?.isConnected ? compactProbeRect(getGlobalRect(element)) : null,
+    src: element?.isConnected
+      ? sanitizeFrameBoundaryUrl(
+          element.getAttribute("src")
+            || (element.hasAttribute("srcdoc") ? "about:srcdoc" : element.src || "about:blank"),
+          true
+        )
+      : ""
+  }));
+  const payload = { header, targets, frames };
+  return {
+    header,
+    digest: hashObservationProbe(payload)
+  };
+}
+
+function readObservationProbeHeader() {
+  return {
+    documentId: assistantPageState.documentId,
+    url: sanitizeUrlForContext(location.href, true),
+    domRevision: assistantPageState.domRevision,
+    visualRevision: assistantPageState.visualRevision,
+    viewportWidth: window.innerWidth,
+    viewportHeight: window.innerHeight,
+    scrollX: Math.round(window.scrollX),
+    scrollY: Math.round(window.scrollY)
+  };
+}
+
+function compactProbeRect(rect) {
+  return {
+    x: Math.round(rect.left),
+    y: Math.round(rect.top),
+    width: Math.round(rect.width),
+    height: Math.round(rect.height)
+  };
+}
+
+function hashObservationProbe(value) {
+  const text = JSON.stringify(value);
+  const hashes = [2166136261, 2246822507, 3266489909, 668265263];
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    for (let hashIndex = 0; hashIndex < hashes.length; hashIndex += 1) {
+      hashes[hashIndex] ^= code + hashIndex * 97;
+      hashes[hashIndex] = Math.imul(hashes[hashIndex], 16777619 + hashIndex * 2);
+    }
+  }
+  return hashes.map((hash) => (hash >>> 0).toString(16).padStart(8, "0")).join("");
+}
+
+function collectFrameContext(options = {}) {
+  assistantPageState.collectionCache = createCollectionCache();
+  try {
+    assistantPageState.visualOccluderCache = new WeakMap();
+    assistantPageState.includeChildFrames = false;
+    assistantPageState.scopes = collectDomScopes(false);
+    observeDomScopes(assistantPageState.scopes);
+    const redactSensitiveData = options.redactSensitiveData !== false;
+    return {
+      documentId: assistantPageState.documentId,
+      url: sanitizeUrlForContext(location.href, redactSensitiveData),
+      frameName: redactSensitiveData ? redactSensitiveText(window.name || "") : window.name || "",
+      frameNameBinding: window.name || "",
+      frameNameDigest: window.name ? hashState(String(window.name)) : "",
+      viewport: {
+        width: window.innerWidth,
+        height: window.innerHeight,
+        scrollX: Math.round(window.scrollX),
+        scrollY: Math.round(window.scrollY)
+      },
+      pageState: {
+        domRevision: assistantPageState.domRevision,
+        visualRevision: assistantPageState.visualRevision
+      },
+      frameBoundaries: collectFrameBoundaries(72, redactSensitiveData)
+    };
+  } finally {
+    for (const scope of assistantPageState.scopes) {
+      scope.elements = null;
+    }
+    assistantPageState.collectionCache = null;
+  }
+}
+
+function createCollectionCache() {
+  return {
+    queryResults: new Map(),
+    styles: new WeakMap(),
+    rects: new WeakMap(),
+    globalRects: new WeakMap(),
+    rendered: new WeakMap(),
+    exposedPoints: new WeakMap(),
+    textExposure: new WeakMap(),
+    imageMapGeometries: new WeakMap(),
+    phaseDurations: new Map(),
+    scannedElementCount: 0,
+    queryCount: 0,
+    cacheHits: {
+      query: 0,
+      style: 0,
+      rect: 0,
+      globalRect: 0,
+      rendered: 0,
+      exposedPoint: 0,
+      textExposure: 0
+    }
+  };
+}
+
+function measureCollectionPhase(name, callback) {
+  const startedAt = performance.now();
+  try {
+    return callback();
+  } finally {
+    const cache = assistantPageState.collectionCache;
+    if (cache) {
+      cache.phaseDurations.set(
+        name,
+        (cache.phaseDurations.get(name) || 0) + performance.now() - startedAt
+      );
+    }
+  }
+}
+
+function roundDuration(value) {
+  return Math.round(Number(value || 0) * 10) / 10;
 }
 
 function createDocumentId() {
@@ -181,11 +534,16 @@ function collectDomScopes(includeChildFrames = true) {
       id: descriptor.id,
       kind: descriptor.kind,
       parentId: descriptor.parentId || "",
-      sameOrigin: descriptor.sameOrigin !== false
+      sameOrigin: descriptor.sameOrigin !== false,
+      elements: []
     };
     scopes.push(scope);
 
     const elements = Array.from(root.querySelectorAll("*"));
+    scope.elements = assistantPageState.collectionCache ? elements : null;
+    if (assistantPageState.collectionCache) {
+      assistantPageState.collectionCache.scannedElementCount += elements.length;
+    }
     let shadowIndex = 0;
     let frameIndex = 0;
     for (const element of elements) {
@@ -197,14 +555,14 @@ function collectDomScopes(includeChildFrames = true) {
           parentId: scope.id
         });
       }
-      if (includeChildFrames && element.tagName?.toLowerCase() === "iframe") {
+      if (includeChildFrames && ["iframe", "frame"].includes(element.tagName?.toLowerCase())) {
         frameIndex += 1;
         try {
           const frameDocument = element.contentDocument;
           if (frameDocument?.documentElement) {
             visit(frameDocument, {
               id: `${scope.id}/frame-${frameIndex}`,
-              kind: "iframe",
+              kind: element.tagName.toLowerCase(),
               parentId: scope.id,
               sameOrigin: true
             });
@@ -227,16 +585,28 @@ function getDomScopes() {
 }
 
 function queryAllDom(selector) {
+  const cache = assistantPageState.collectionCache;
+  if (cache?.queryResults.has(selector)) {
+    cache.cacheHits.query += 1;
+    return cache.queryResults.get(selector);
+  }
   const results = [];
   const seen = new Set();
+  if (cache) {
+    cache.queryCount += 1;
+  }
   for (const scope of getDomScopes()) {
-    for (const element of Array.from(scope.root.querySelectorAll(selector))) {
+    const scopedElements = selector === "*" && Array.isArray(scope.elements)
+      ? scope.elements
+      : Array.from(scope.root.querySelectorAll(selector));
+    for (const element of scopedElements) {
       if (!seen.has(element)) {
         seen.add(element);
         results.push(element);
       }
     }
   }
+  cache?.queryResults.set(selector, results);
   return results;
 }
 
@@ -260,7 +630,19 @@ function findScopeForElement(element) {
 }
 
 function getGlobalRect(element) {
-  const rect = element.getBoundingClientRect();
+  const cache = assistantPageState.collectionCache;
+  if (cache?.globalRects.has(element)) {
+    cache.cacheHits.globalRect += 1;
+    return cache.globalRects.get(element);
+  }
+  if (element.tagName?.toLowerCase() === "area") {
+    const imageMapGeometry = getImageMapAreaGeometry(element);
+    if (imageMapGeometry?.globalRect) {
+      cache?.globalRects.set(element, imageMapGeometry.globalRect);
+      return imageMapGeometry.globalRect;
+    }
+  }
+  const rect = getElementRect(element);
   let x = rect.left;
   let y = rect.top;
   let width = rect.width;
@@ -273,7 +655,7 @@ function getGlobalRect(element) {
     if (!frame) {
       break;
     }
-    const frameRect = frame.getBoundingClientRect();
+    const frameRect = getElementRect(frame);
     const scaleX = frame.offsetWidth ? frameRect.width / frame.offsetWidth : 1;
     const scaleY = frame.offsetHeight ? frameRect.height / frame.offsetHeight : 1;
     x = frameRect.left + (frame.clientLeft + x) * scaleX;
@@ -282,7 +664,31 @@ function getGlobalRect(element) {
     height *= scaleY;
     currentWindow = frame.ownerDocument?.defaultView;
   }
-  return { left: x, top: y, right: x + width, bottom: y + height, width, height };
+  const globalRect = { left: x, top: y, right: x + width, bottom: y + height, width, height };
+  cache?.globalRects.set(element, globalRect);
+  return globalRect;
+}
+
+function getElementStyle(element) {
+  const cache = assistantPageState.collectionCache;
+  if (cache?.styles.has(element)) {
+    cache.cacheHits.style += 1;
+    return cache.styles.get(element);
+  }
+  const style = (element.ownerDocument?.defaultView || window).getComputedStyle(element);
+  cache?.styles.set(element, style);
+  return style;
+}
+
+function getElementRect(element) {
+  const cache = assistantPageState.collectionCache;
+  if (cache?.rects.has(element)) {
+    cache.cacheHits.rect += 1;
+    return cache.rects.get(element);
+  }
+  const rect = element.getBoundingClientRect();
+  cache?.rects.set(element, rect);
+  return rect;
 }
 
 function isDomInstance(element, constructorName) {
@@ -299,16 +705,28 @@ function collectInteractiveElements(options) {
   const seen = new Set();
   const candidates = [];
   const contextCache = new WeakMap();
+  const identityPrefilterActive = Boolean(
+    searchActive
+    && (
+      search.roles.length
+      || (search.query && search.nearText)
+    )
+  );
+  let potentialCandidateCount = 0;
   for (const [discoveryIndex, rawElement] of queryAllDom("*").entries()) {
     if (!isPotentiallyInteractive(rawElement)) {
       continue;
     }
-    const rawHitPoint = findExposedPoint(rawElement);
-    if (!rawHitPoint) {
-      continue;
-    }
     const element = canonicalInteractiveCandidate(rawElement);
     if (!element || seen.has(element)) {
+      continue;
+    }
+    potentialCandidateCount += 1;
+    if (identityPrefilterActive && !matchesInteractiveSearchIdentity(element, search)) {
+      continue;
+    }
+    const rawHitPoint = findExposedPoint(rawElement);
+    if (!rawHitPoint) {
       continue;
     }
     const hitPoint = element === rawElement ? rawHitPoint : findExposedPoint(element);
@@ -366,7 +784,9 @@ function collectInteractiveElements(options) {
     elements,
     stats: {
       total: matchingCandidates.length,
-      availableTotal: candidates.length,
+      availableTotal: identityPrefilterActive ? null : candidates.length,
+      potentialTotal: potentialCandidateCount,
+      identityPrefilterApplied: identityPrefilterActive,
       included: elements.length,
       offset,
       query: search.query,
@@ -375,6 +795,38 @@ function collectInteractiveElements(options) {
       truncated: offset + elements.length < matchingCandidates.length
     }
   };
+}
+
+function matchesInteractiveSearchIdentity(element, search) {
+  const record = buildInteractiveSearchRecord(element, new WeakMap(), {
+    includeContext: false
+  });
+  const roleValues = new Set([
+    record.normalizedFields.role,
+    record.normalizedFields.tag,
+    record.normalizedFields.type
+  ].filter(Boolean));
+  if (
+    search.roles.length
+    && !search.roles.some((role) => roleValues.has(normalizeSearchText(role)))
+  ) {
+    return false;
+  }
+  if (!search.query || !search.nearText) {
+    return true;
+  }
+  return scoreSearchTerms(search.query, record, {
+    label: 360,
+    role: 180,
+    tag: 120,
+    type: 150,
+    name: 170,
+    placeholder: 220,
+    title: 220,
+    description: 180,
+    testId: 130,
+    context: 0
+  }).matched;
 }
 
 function digestInteractiveCandidateOrder(candidates) {
@@ -414,7 +866,7 @@ function isLocalElementSearchActive(search) {
   return Boolean(search.query || search.nearText || search.roles.length);
 }
 
-function buildInteractiveSearchRecord(element, contextCache) {
+function buildInteractiveSearchRecord(element, contextCache, options = {}) {
   const tag = element.tagName?.toLowerCase() || "";
   const inputType = tag === "input" ? String(element.type || "").toLowerCase() : "";
   const controlType = "type" in element
@@ -435,7 +887,9 @@ function buildInteractiveSearchRecord(element, contextCache) {
       || element.getAttribute("data-cy")
       || ""
   };
-  const contextParts = collectInteractiveSearchContext(element, contextCache);
+  const contextParts = options.includeContext === false
+    ? []
+    : collectInteractiveSearchContext(element, contextCache);
   return {
     fields,
     normalizedFields: Object.fromEntries(
@@ -540,10 +994,10 @@ function findNearestContextHeading(element, container) {
   if (!headings.length) {
     return null;
   }
-  const elementRect = element.getBoundingClientRect();
+  const elementRect = getElementRect(element);
   const preceding = headings
-    .filter((heading) => heading.getBoundingClientRect().top <= elementRect.top + 1)
-    .sort((left, right) => right.getBoundingClientRect().top - left.getBoundingClientRect().top);
+    .filter((heading) => getElementRect(heading).top <= elementRect.top + 1)
+    .sort((left, right) => getElementRect(right).top - getElementRect(left).top);
   return preceding[0] || headings[0];
 }
 
@@ -730,7 +1184,7 @@ function isPotentiallyInteractive(element) {
   }
 
   const ownerWindow = element.ownerDocument?.defaultView || window;
-  const rect = element.getBoundingClientRect();
+  const rect = getElementRect(element);
   if (
     rect.width <= 0 ||
     rect.height <= 0 ||
@@ -741,13 +1195,13 @@ function isPotentiallyInteractive(element) {
   ) {
     return false;
   }
-  return ownerWindow.getComputedStyle(element).cursor === "pointer" && hasActionDescriptor(element);
+  return getElementStyle(element).cursor === "pointer" && hasActionDescriptor(element);
 }
 
 function hasStrongInteractionSignal(element) {
   const tag = element.tagName?.toLowerCase() || "";
 
-  if (tag === "a" && element.hasAttribute("href")) {
+  if (["a", "area"].includes(tag) && hasElementHref(element)) {
     return true;
   }
   if (tag === "label") {
@@ -756,7 +1210,7 @@ function hasStrongInteractionSignal(element) {
   if (["audio", "video"].includes(tag) && !element.hasAttribute("controls")) {
     return false;
   }
-  if (NATIVE_INTERACTIVE_TAGS.has(tag) && tag !== "a") {
+  if (NATIVE_INTERACTIVE_TAGS.has(tag) && !["a", "area"].includes(tag)) {
     return String(element.getAttribute("type") || "").toLowerCase() !== "hidden";
   }
 
@@ -781,6 +1235,28 @@ function hasStrongInteractionSignal(element) {
   return false;
 }
 
+function hasElementHref(element) {
+  return Boolean(
+    element.hasAttribute?.("href")
+    || element.hasAttribute?.("xlink:href")
+    || String(element.href?.baseVal || "").trim()
+  );
+}
+
+function readElementHref(element) {
+  const raw = typeof element.href === "string"
+    ? element.href
+    : element.href?.baseVal
+      || element.getAttribute?.("href")
+      || element.getAttribute?.("xlink:href")
+      || "";
+  try {
+    return raw ? new URL(String(raw), element.ownerDocument?.baseURI || location.href).href : "";
+  } catch {
+    return String(raw || "");
+  }
+}
+
 function canonicalInteractiveCandidate(element) {
   if (element.tagName?.toLowerCase() === "label" && element.control && isElementVisuallyExposed(element.control)) {
     return element.control;
@@ -800,10 +1276,51 @@ function canonicalInteractiveCandidate(element) {
   const ownerWindow = element.ownerDocument?.defaultView || window;
   const hasPointerChild = Array.from(element.children || []).some((child) => (
     !shouldSkipElement(child) &&
-    ownerWindow.getComputedStyle(child).cursor === "pointer" &&
+    getElementStyle(child).cursor === "pointer" &&
     hasActionDescriptor(child)
   ));
   return hasPointerChild ? null : element;
+}
+
+function findConcreteCompositeControl(element) {
+  const role = String(element.getAttribute?.("role") || "").trim().toLowerCase();
+  if (!["menuitem", "treeitem"].includes(role)) {
+    return null;
+  }
+  const controls = Array.from(element.querySelectorAll?.(
+    "a[href],area[href],button,input:not([type='hidden']),select,textarea,[role='link'],[role='button']"
+  ) || []).filter((candidate) => {
+    const style = getElementStyle(candidate);
+    return (
+      candidate !== element
+      && hasStrongInteractionSignal(candidate)
+      && !shouldSkipElement(candidate)
+      && style.display !== "none"
+      && !["hidden", "collapse"].includes(style.visibility)
+      && clampNumber(style.opacity, 0, 1, 1) > 0.01
+    );
+  });
+  if (controls.length !== 1) {
+    return null;
+  }
+  const parentLabel = normalizeWhitespace(getAccessibleName(element));
+  const controlLabel = normalizeWhitespace(
+    getAccessibleName(controls[0])
+    || controls[0].innerText
+    || controls[0].textContent
+  );
+  if (
+    !controlLabel
+    || !findExposedPoint(element)
+    || (
+      parentLabel
+      && parentLabel !== controlLabel
+      && !parentLabel.includes(controlLabel)
+    )
+  ) {
+    return null;
+  }
+  return controls[0];
 }
 
 function hasActionDescriptor(element) {
@@ -821,14 +1338,19 @@ function hasActionDescriptor(element) {
 
 function describeInteractiveElement(element, ref, options = {}) {
   const tag = element.tagName.toLowerCase();
+  const compositeControl = findConcreteCompositeControl(element);
+  const actionControl = compositeControl || element;
+  const actionTag = actionControl.tagName?.toLowerCase() || tag;
   const rect = options.rect || getGlobalRect(element);
   const inputType = tag === "input" ? String(element.getAttribute("type") || "text").toLowerCase() : "";
   const controlType = "type" in element ? String(element.getAttribute("type") || element.type || "").toLowerCase() : "";
   const rawValue = readElementValue(element, inputType);
   const value = options.redactSensitiveData ? redactSensitiveValue(rawValue, element, inputType) : rawValue;
-  const href = tag === "a" ? element.href : "";
-  const formAction = readFormAction(element);
-  const form = isDomInstance(element, "HTMLFormElement") ? element : element.form || element.closest?.("form");
+  const href = ["a", "area"].includes(actionTag) ? readElementHref(actionControl) : "";
+  const formAction = readFormAction(actionControl);
+  const form = isDomInstance(actionControl, "HTMLFormElement")
+    ? actionControl
+    : actionControl.form || actionControl.closest?.("form");
   const autocomplete = element.getAttribute("autocomplete") || "";
   const accessibleName = getAccessibleName(element);
   const label = options.redactSensitiveData ? redactSensitiveText(accessibleName) : accessibleName;
@@ -838,6 +1360,7 @@ function describeInteractiveElement(element, ref, options = {}) {
     scope: options.scope?.id || "top",
     tag,
     role: element.getAttribute("role") || inferredRole(element, inputType),
+    activationTag: compositeControl ? actionTag : undefined,
     type: inputType || controlType || undefined,
     label,
     value,
@@ -932,7 +1455,7 @@ function isScrollableRegion(element) {
     return false;
   }
   const ownerWindow = element.ownerDocument?.defaultView || window;
-  const style = ownerWindow.getComputedStyle(element);
+  const style = getElementStyle(element);
   const scrollableY = element.scrollHeight > element.clientHeight + 2
     && ["auto", "scroll", "overlay"].includes(String(style.overflowY || "").toLowerCase());
   const scrollableX = element.scrollWidth > element.clientWidth + 2
@@ -1023,7 +1546,7 @@ function readFormAction(element) {
 
 function inferredRole(element, inputType) {
   const tag = element.tagName.toLowerCase();
-  if (tag === "a") {
+  if (["a", "area"].includes(tag)) {
     return "link";
   }
   if (tag === "button" || inputType === "button" || inputType === "submit" || inputType === "reset") {
@@ -1149,37 +1672,55 @@ function collectTables(limit, redactSensitiveData) {
 }
 
 function collectFrameBoundaries(limit, redactSensitiveData) {
-  return queryAllDom("iframe")
+  return queryAllDom("iframe,frame")
     .slice(0, limit)
-    .map((iframe, index) => {
-      const visuallyExposed = isElementVisuallyExposed(iframe);
-      const rect = getGlobalRect(iframe);
-      const scaleX = iframe.offsetWidth ? rect.width / iframe.offsetWidth : 1;
-      const scaleY = iframe.offsetHeight ? rect.height / iframe.offsetHeight : 1;
-      const declaredSource = iframe.getAttribute("src")
-        || (iframe.hasAttribute("srcdoc") ? "about:srcdoc" : iframe.src || "about:blank");
+    .map((frameElement, index) => {
+      const tag = frameElement.tagName.toLowerCase();
+      const visuallyExposed = isElementVisuallyExposed(frameElement);
+      const rect = getGlobalRect(frameElement);
+      const scaleX = frameElement.offsetWidth ? rect.width / frameElement.offsetWidth : 1;
+      const scaleY = frameElement.offsetHeight ? rect.height / frameElement.offsetHeight : 1;
+      const declaredSource = frameElement.getAttribute("src")
+        || (frameElement.hasAttribute("srcdoc") ? "about:srcdoc" : frameElement.src || "about:blank");
       return removeEmptyValues({
         id: `frame-boundary-${index + 1}`,
+        tag,
+        name: redactContextText(
+          frameElement.getAttribute("name") || "",
+          180,
+          redactSensitiveData
+        ),
+        nameDigest: frameElement.getAttribute("name")
+          ? hashState(String(frameElement.getAttribute("name")))
+          : "",
+        nameBinding: frameElement.getAttribute("name") || "",
         src: truncate(sanitizeFrameBoundaryUrl(declaredSource, redactSensitiveData), 220),
         visuallyExposed,
-        fullyExposed: visuallyExposed && isElementFullyExposed(iframe),
-        contentAccess: getIframeContentAccess(iframe),
+        fullyExposed: visuallyExposed && isElementFullyExposed(frameElement),
+        contentAccess: getIframeContentAccess(frameElement),
         title: visuallyExposed
-          ? redactContextText(iframe.title || iframe.getAttribute("aria-label") || "", 260, redactSensitiveData)
+          ? redactContextText(
+              frameElement.title
+                || frameElement.getAttribute("aria-label")
+                || frameElement.getAttribute("name")
+                || "",
+              260,
+              redactSensitiveData
+            )
           : undefined,
         rect: visuallyExposed ? rectToJson(rect) : undefined,
         contentRect: visuallyExposed
           ? {
-              x: Math.round(rect.left + iframe.clientLeft * scaleX),
-              y: Math.round(rect.top + iframe.clientTop * scaleY),
-              width: Math.round(iframe.clientWidth * scaleX),
-              height: Math.round(iframe.clientHeight * scaleY)
+              x: Math.round(rect.left + frameElement.clientLeft * scaleX),
+              y: Math.round(rect.top + frameElement.clientTop * scaleY),
+              width: Math.round(frameElement.clientWidth * scaleX),
+              height: Math.round(frameElement.clientHeight * scaleY)
             }
           : undefined,
         childViewport: visuallyExposed
           ? {
-              width: Math.round(iframe.clientWidth),
-              height: Math.round(iframe.clientHeight)
+              width: Math.round(frameElement.clientWidth),
+              height: Math.round(frameElement.clientHeight)
             }
           : undefined
       });
@@ -1223,7 +1764,7 @@ function isElementFullyExposed(element) {
   if (!isElementBoxRendered(element)) {
     return false;
   }
-  const rect = element.getBoundingClientRect();
+  const rect = getElementRect(element);
   const visibleRect = clipLocalRectForElement(element, rect);
   if (
     !visibleRect
@@ -1235,8 +1776,8 @@ function isElementFullyExposed(element) {
     return false;
   }
 
-  const columns = Math.max(2, Math.min(64, Math.ceil(rect.width / 12)));
-  const rows = Math.max(2, Math.min(64, Math.ceil(rect.height / 12)));
+  const columns = Math.max(2, Math.min(24, Math.ceil(rect.width / 12)));
+  const rows = Math.max(2, Math.min(24, Math.ceil(rect.height / 12)));
   for (let row = 0; row < rows; row += 1) {
     for (let column = 0; column < columns; column += 1) {
       const x = rect.left + rect.width * (column + 0.5) / columns;
@@ -1260,6 +1801,7 @@ function collectPageState(redactSensitiveData) {
     readyState: document.readyState,
     visibilityState: document.visibilityState,
     domRevision: assistantPageState.domRevision,
+    visualRevision: assistantPageState.visualRevision,
     scrollWidth: Math.max(document.documentElement?.scrollWidth || 0, document.body?.scrollWidth || 0),
     scrollHeight: Math.max(document.documentElement?.scrollHeight || 0, document.body?.scrollHeight || 0),
     activeElement: active && active !== document.body && isElementVisuallyExposed(active)
@@ -1300,8 +1842,16 @@ function collectVisibleText(maxChars) {
     if (!root) {
       continue;
     }
-    const walker = ownerDocument.createTreeWalker(root, ownerWindow.NodeFilter.SHOW_TEXT, {
+    const walker = ownerDocument.createTreeWalker(
+      root,
+      ownerWindow.NodeFilter.SHOW_ELEMENT | ownerWindow.NodeFilter.SHOW_TEXT,
+      {
       acceptNode(node) {
+        if (node.nodeType === ownerWindow.Node.ELEMENT_NODE) {
+          return shouldSkipElement(node) || isElementSubtreeDefinitelyHidden(node)
+            ? ownerWindow.NodeFilter.FILTER_REJECT
+            : ownerWindow.NodeFilter.FILTER_SKIP;
+        }
         const text = normalizeWhitespace(node.nodeValue || "");
         if (!text) {
           return ownerWindow.NodeFilter.FILTER_REJECT;
@@ -1312,7 +1862,8 @@ function collectVisibleText(maxChars) {
         }
         return ownerWindow.NodeFilter.FILTER_ACCEPT;
       }
-    });
+      }
+    );
 
     while (walker.nextNode() && length < maxChars) {
       const text = normalizeWhitespace(walker.currentNode.nodeValue || "");
@@ -1337,15 +1888,24 @@ function collectVisibleTextWithin(element, maxChars) {
 
   const parts = [];
   let length = 0;
-  const walker = ownerDocument.createTreeWalker(element, ownerWindow.NodeFilter.SHOW_TEXT, {
+  const walker = ownerDocument.createTreeWalker(
+    element,
+    ownerWindow.NodeFilter.SHOW_ELEMENT | ownerWindow.NodeFilter.SHOW_TEXT,
+    {
     acceptNode(node) {
+      if (node.nodeType === ownerWindow.Node.ELEMENT_NODE) {
+        return shouldSkipElement(node) || isElementSubtreeDefinitelyHidden(node)
+          ? ownerWindow.NodeFilter.FILTER_REJECT
+          : ownerWindow.NodeFilter.FILTER_SKIP;
+      }
       const text = normalizeWhitespace(node.nodeValue || "");
       if (!text || !isTextNodeVisuallyExposed(node)) {
         return ownerWindow.NodeFilter.FILTER_REJECT;
       }
       return ownerWindow.NodeFilter.FILTER_ACCEPT;
     }
-  });
+    }
+  );
 
   while (walker.nextNode() && length < maxChars) {
     const text = normalizeWhitespace(walker.currentNode.nodeValue || "");
@@ -1354,6 +1914,15 @@ function collectVisibleTextWithin(element, maxChars) {
     length += text.length + 1;
   }
   return normalizeWhitespace(parts.join("\n"));
+}
+
+function isElementSubtreeDefinitelyHidden(element) {
+  const style = getElementStyle(element);
+  return (
+    style.display === "none"
+    || style.contentVisibility === "hidden"
+    || clampNumber(style.opacity, 0, 1, 1) <= 0.01
+  );
 }
 
 async function executePageActions(actions) {
@@ -1368,10 +1937,9 @@ async function executePageActions(actions) {
       const before = captureActionState(normalized);
       const undo = buildUndoForAction(normalized);
       const result = await executeSingleAction(normalized);
-      if (!result?.mayNavigate) {
-        await delay(normalized.type === "wait" ? 50 : 220);
-      }
-      const after = result?.mayNavigate ? null : captureActionState(normalized);
+      const after = result?.mayNavigate
+        ? null
+        : await observeInitialActionState(before, normalized);
       const verification = compareActionStates(before, after, result);
       results.push({ index, ok: true, action: normalized, result, undo, verification });
       if (result?.mayNavigate || normalized.type === "navigate" || normalized.type === "submit") {
@@ -1388,10 +1956,52 @@ async function executePageActions(actions) {
       });
       break;
     }
-    await delay(120);
+    if (index < actions.length - 1) {
+      await delay(30);
+    }
   }
 
   return { results };
+}
+
+async function observeInitialActionState(before, action) {
+  if (action?.type !== "wait") {
+    await waitForRenderOpportunity();
+  }
+  let after = captureActionState(action);
+  if (before?.fingerprint !== after.fingerprint || action?.type === "wait") {
+    return after;
+  }
+
+  const initialSignal = JSON.stringify(readPageSettleSignal());
+  const deadline = performance.now() + 220;
+  while (performance.now() < deadline) {
+    await delay(Math.min(25, Math.max(1, deadline - performance.now())));
+    if (JSON.stringify(readPageSettleSignal()) === initialSignal) {
+      continue;
+    }
+    after = captureActionState(action);
+    if (before?.fingerprint !== after.fingerprint) {
+      return after;
+    }
+  }
+  return captureActionState(action);
+}
+
+function waitForRenderOpportunity() {
+  return new Promise((resolve) => {
+    let finished = false;
+    const finish = () => {
+      if (finished) {
+        return;
+      }
+      finished = true;
+      window.clearTimeout(timeoutId);
+      resolve();
+    };
+    const timeoutId = window.setTimeout(finish, 50);
+    window.requestAnimationFrame(finish);
+  });
 }
 
 async function undoPageActions(undoActions) {
@@ -1811,7 +2421,9 @@ function clickElement(action) {
       "A canvas or application surface requires a screenshot-bound visual action."
     );
   }
-  const mayNavigate = actionMayUnloadPage(element);
+  const compositeControl = findConcreteCompositeControl(element);
+  const actionControl = compositeControl || element;
+  const mayNavigate = actionMayUnloadPage(actionControl);
   prepareElementForAction(element);
   assistantPageState.visualOccluderCache = new WeakMap();
   const point = findExposedPoint(element);
@@ -1822,7 +2434,7 @@ function clickElement(action) {
     );
   }
   dispatchPointerSequence(element, point, { activate: true });
-  const mainWorldActivation = buildMainWorldAnchorActivation(element, point);
+  const mainWorldActivation = buildMainWorldAnchorActivation(actionControl, point);
   if (mainWorldActivation) {
     return {
       clicked: getAccessibleName(element) || element.tagName.toLowerCase(),
@@ -1832,7 +2444,7 @@ function clickElement(action) {
       mainWorldActivation
     };
   }
-  const activate = () => activateDeepestHitTarget(element, point);
+  const activate = () => activateDeepestHitTarget(actionControl, point);
   if (mayNavigate) {
     window.setTimeout(activate, 80);
   } else {
@@ -1847,7 +2459,10 @@ function clickElement(action) {
 }
 
 function buildMainWorldAnchorActivation(element, point) {
-  if (!isDomInstance(element, "HTMLAnchorElement")) {
+  if (
+    !isDomInstance(element, "HTMLAnchorElement")
+    && !isDomInstance(element, "HTMLAreaElement")
+  ) {
     return null;
   }
   const declaredHref = String(element.getAttribute("href") || "").trim();
@@ -2068,14 +2683,14 @@ function visualClickSurface(action) {
       "Visual coordinates must be normalized numbers from 0 through 1000."
     );
   }
-  const visibleRect = clipLocalRectForElement(surface, surface.getBoundingClientRect());
+  const visibleRect = clipLocalRectForElement(surface, getElementRect(surface));
   if (!visibleRect) {
     throw createContentControlError(
       "visual_surface_not_exposed",
       "The referenced visual surface is no longer exposed in the current viewport."
     );
   }
-  const localRect = surface.getBoundingClientRect();
+  const localRect = getElementRect(surface);
   const x = localRect.left + localRect.width * xNormalized / 1000;
   const y = localRect.top + localRect.height * yNormalized / 1000;
   if (
@@ -2225,15 +2840,19 @@ function prepareElementForAction(element) {
   if (element.getAttribute("aria-disabled") === "true") {
     throw new Error("Resolved target is aria-disabled.");
   }
-  if (!isElementBoxRendered(element)) {
+  const imageMapGeometry = element.tagName.toLowerCase() === "area"
+    ? getImageMapAreaGeometry(element)
+    : null;
+  const renderedTarget = imageMapGeometry?.image || element;
+  if (!isElementBoxRendered(renderedTarget)) {
     throw new Error("Resolved target is not rendered.");
   }
 
-  if (isDomInstance(element, "HTMLElement")) {
-    element.scrollIntoView({ block: "center", inline: "center", behavior: "auto" });
+  if (isDomInstance(renderedTarget, "HTMLElement")) {
+    renderedTarget.scrollIntoView({ block: "center", inline: "center", behavior: "auto" });
     element.focus({ preventScroll: true });
   } else {
-    element.scrollIntoView({ block: "center", inline: "center", behavior: "auto" });
+    renderedTarget.scrollIntoView({ block: "center", inline: "center", behavior: "auto" });
   }
 
   highlightElement(element);
@@ -2315,7 +2934,10 @@ function activateDeepestHitTarget(element, point) {
 }
 
 function actionMayUnloadPage(element) {
-  if (isDomInstance(element, "HTMLAnchorElement") && element.href) {
+  if (
+    (isDomInstance(element, "HTMLAnchorElement") || isDomInstance(element, "HTMLAreaElement"))
+    && readElementHref(element)
+  ) {
     const declaredHref = String(element.getAttribute("href") || "").trim();
     if (/^javascript:/i.test(declaredHref) || declaredHref.startsWith("#")) {
       return false;
@@ -2418,6 +3040,7 @@ function observePageMutations() {
     if (!document.documentElement) {
       return;
     }
+    installVisualRevisionListeners();
     assistantPageState.scopes = collectDomScopes(assistantPageState.includeChildFrames);
     observeDomScopes(assistantPageState.scopes);
   };
@@ -2426,6 +3049,24 @@ function observePageMutations() {
   } else {
     document.addEventListener("DOMContentLoaded", start, { once: true });
   }
+}
+
+function installVisualRevisionListeners() {
+  if (assistantPageState.visualListenersInstalled) {
+    return;
+  }
+  assistantPageState.visualListenersInstalled = true;
+  const markVisualChange = () => {
+    assistantPageState.visualRevision += 1;
+  };
+  window.addEventListener("scroll", markVisualChange, true);
+  window.addEventListener("resize", markVisualChange, true);
+  window.addEventListener("orientationchange", markVisualChange, true);
+  document.addEventListener("animationstart", markVisualChange, true);
+  document.addEventListener("animationiteration", markVisualChange, true);
+  document.addEventListener("animationend", markVisualChange, true);
+  document.addEventListener("transitionrun", markVisualChange, true);
+  document.addEventListener("transitionend", markVisualChange, true);
 }
 
 function observeDomScopes(scopes) {
@@ -2663,6 +3304,11 @@ function getAccessibleName(element) {
     return truncate(normalizeWhitespace(title), 260);
   }
 
+  const alt = element.getAttribute("alt");
+  if (alt) {
+    return truncate(normalizeWhitespace(alt), 260);
+  }
+
   if (isDomInstance(element, "HTMLInputElement") && ["submit", "button", "reset"].includes(element.type)) {
     return truncate(normalizeWhitespace(element.value), 260);
   }
@@ -2710,7 +3356,7 @@ function buildCssSelector(element) {
 }
 
 function getStableAttribute(element) {
-  for (const name of ["data-testid", "data-test", "data-cy", "name", "aria-label", "placeholder", "title"]) {
+  for (const name of ["data-testid", "data-test", "data-cy", "name", "aria-label", "placeholder", "title", "alt"]) {
     const value = element.getAttribute(name);
     if (value && value.length <= 90) {
       return { name, value };
@@ -2723,34 +3369,42 @@ function isElementTreeRendered(element) {
   if (!element?.ownerDocument || !element?.tagName) {
     return false;
   }
+  const cache = assistantPageState.collectionCache;
+  if (cache?.rendered.has(element)) {
+    cache.cacheHits.rendered += 1;
+    return cache.rendered.get(element);
+  }
+  const remember = (value) => {
+    cache?.rendered.set(element, value);
+    return value;
+  };
 
   let current = element;
   let cumulativeOpacity = 1;
   while (current?.ownerDocument) {
-    const ownerWindow = current.ownerDocument.defaultView || window;
-    const style = ownerWindow.getComputedStyle(current);
+    const style = getElementStyle(current);
     if (
       style.display === "none" ||
       style.contentVisibility === "hidden" ||
       (current === element && ["hidden", "collapse"].includes(style.visibility))
     ) {
-      return false;
+      return remember(false);
     }
     cumulativeOpacity *= clampNumber(style.opacity, 0, 1, 1);
     if (cumulativeOpacity <= 0.01) {
-      return false;
+      return remember(false);
     }
     current = getComposedParentElement(current);
   }
 
-  return true;
+  return remember(true);
 }
 
 function isElementBoxRendered(element) {
   if (!isElementTreeRendered(element)) {
     return false;
   }
-  const rect = element.getBoundingClientRect();
+  const rect = getElementRect(element);
   return rect.width > 0 && rect.height > 0;
 }
 
@@ -2758,12 +3412,217 @@ function isElementVisuallyExposed(element) {
   return Boolean(findExposedPoint(element));
 }
 
-function findExposedPoint(element) {
-  if (!isElementBoxRendered(element)) {
+function getImageMapAreaGeometry(area) {
+  const cache = assistantPageState.collectionCache;
+  if (cache?.imageMapGeometries.has(area)) {
+    return cache.imageMapGeometries.get(area);
+  }
+  const remember = (value) => {
+    cache?.imageMapGeometries.set(area, value);
+    return value;
+  };
+  const map = area.closest?.("map");
+  const mapName = String(map?.name || map?.id || "").trim();
+  if (!mapName || !hasElementHref(area)) {
+    return remember(null);
+  }
+  const normalizedMapName = `#${mapName}`.toLowerCase();
+  const image = queryAllDom("img[usemap],input[type='image'][usemap],object[usemap]")
+    .find((candidate) => (
+      candidate.ownerDocument === area.ownerDocument
+      && String(candidate.getAttribute("usemap") || "").trim().toLowerCase() === normalizedMapName
+      && isElementBoxRendered(candidate)
+    ));
+  if (!image) {
+    return remember(null);
+  }
+
+  const imageRect = getElementRect(image);
+  const coordinateWidth = Math.max(1, Number(image.naturalWidth || image.width || image.clientWidth || imageRect.width));
+  const coordinateHeight = Math.max(1, Number(image.naturalHeight || image.height || image.clientHeight || imageRect.height));
+  const localArea = resolveImageMapShape(
+    String(area.shape || area.getAttribute("shape") || "rect").toLowerCase(),
+    String(area.coords || area.getAttribute("coords") || ""),
+    coordinateWidth,
+    coordinateHeight
+  );
+  if (!localArea) {
+    return remember(null);
+  }
+  const scaleX = imageRect.width / coordinateWidth;
+  const scaleY = imageRect.height / coordinateHeight;
+  const localRect = {
+    left: imageRect.left + localArea.left * scaleX,
+    top: imageRect.top + localArea.top * scaleY,
+    right: imageRect.left + localArea.right * scaleX,
+    bottom: imageRect.top + localArea.bottom * scaleY,
+    width: Math.max(0, (localArea.right - localArea.left) * scaleX),
+    height: Math.max(0, (localArea.bottom - localArea.top) * scaleY)
+  };
+  const localPoint = {
+    x: imageRect.left + localArea.pointX * scaleX,
+    y: imageRect.top + localArea.pointY * scaleY
+  };
+  const imageGlobalRect = getGlobalRect(image);
+  const globalRect = {
+    left: imageGlobalRect.left + localArea.left * (imageGlobalRect.width / coordinateWidth),
+    top: imageGlobalRect.top + localArea.top * (imageGlobalRect.height / coordinateHeight),
+    right: imageGlobalRect.left + localArea.right * (imageGlobalRect.width / coordinateWidth),
+    bottom: imageGlobalRect.top + localArea.bottom * (imageGlobalRect.height / coordinateHeight),
+    width: Math.max(0, (localArea.right - localArea.left) * (imageGlobalRect.width / coordinateWidth)),
+    height: Math.max(0, (localArea.bottom - localArea.top) * (imageGlobalRect.height / coordinateHeight))
+  };
+  return remember({ image, localRect, localPoint, globalRect });
+}
+
+function resolveImageMapShape(shape, coordsSource, width, height) {
+  const coords = String(coordsSource || "")
+    .split(/[\s,]+/u)
+    .map(Number)
+    .filter(Number.isFinite);
+  if (shape === "default") {
+    return { left: 0, top: 0, right: width, bottom: height, pointX: width / 2, pointY: height / 2 };
+  }
+  if (shape === "circle" && coords.length >= 3) {
+    const [centerX, centerY, radius] = coords;
+    if (radius <= 0) return null;
+    return {
+      left: Math.max(0, centerX - radius),
+      top: Math.max(0, centerY - radius),
+      right: Math.min(width, centerX + radius),
+      bottom: Math.min(height, centerY + radius),
+      pointX: centerX,
+      pointY: centerY
+    };
+  }
+  if (["poly", "polygon"].includes(shape) && coords.length >= 6) {
+    const points = [];
+    for (let index = 0; index + 1 < coords.length; index += 2) {
+      points.push({ x: coords[index], y: coords[index + 1] });
+    }
+    const left = Math.max(0, Math.min(...points.map((point) => point.x)));
+    const top = Math.max(0, Math.min(...points.map((point) => point.y)));
+    const right = Math.min(width, Math.max(...points.map((point) => point.x)));
+    const bottom = Math.min(height, Math.max(...points.map((point) => point.y)));
+    const centroid = {
+      x: points.reduce((sum, point) => sum + point.x, 0) / points.length,
+      y: points.reduce((sum, point) => sum + point.y, 0) / points.length
+    };
+    const fallback = findPointInsidePolygon(points, { left, top, right, bottom });
+    const point = isPointInsidePolygon(centroid, points) ? centroid : fallback;
+    return point && right > left && bottom > top
+      ? { left, top, right, bottom, pointX: point.x, pointY: point.y }
+      : null;
+  }
+  if (coords.length >= 4) {
+    const left = Math.max(0, Math.min(coords[0], coords[2]));
+    const top = Math.max(0, Math.min(coords[1], coords[3]));
+    const right = Math.min(width, Math.max(coords[0], coords[2]));
+    const bottom = Math.min(height, Math.max(coords[1], coords[3]));
+    return right > left && bottom > top
+      ? { left, top, right, bottom, pointX: (left + right) / 2, pointY: (top + bottom) / 2 }
+      : null;
+  }
+  return null;
+}
+
+function findPointInsidePolygon(points, bounds) {
+  const columns = 7;
+  const rows = 7;
+  for (let row = 0; row < rows; row += 1) {
+    for (let column = 0; column < columns; column += 1) {
+      const point = {
+        x: bounds.left + (bounds.right - bounds.left) * (column + 0.5) / columns,
+        y: bounds.top + (bounds.bottom - bounds.top) * (row + 0.5) / rows
+      };
+      if (isPointInsidePolygon(point, points)) {
+        return point;
+      }
+    }
+  }
+  return null;
+}
+
+function isPointInsidePolygon(point, polygon) {
+  let inside = false;
+  for (let index = 0, previous = polygon.length - 1; index < polygon.length; previous = index++) {
+    const currentPoint = polygon[index];
+    const previousPoint = polygon[previous];
+    const intersects = (
+      (currentPoint.y > point.y) !== (previousPoint.y > point.y)
+      && point.x < (
+        (previousPoint.x - currentPoint.x) * (point.y - currentPoint.y)
+        / ((previousPoint.y - currentPoint.y) || Number.EPSILON)
+        + currentPoint.x
+      )
+    );
+    if (intersects) inside = !inside;
+  }
+  return inside;
+}
+
+function findImageMapAreaPoint(area) {
+  const geometry = getImageMapAreaGeometry(area);
+  if (!geometry) {
     return null;
   }
-  const visibleRect = clipLocalRectForElement(element, element.getBoundingClientRect());
+  const visibleRect = clipLocalRectForElement(geometry.image, geometry.localRect, { includeSelf: true });
+  if (
+    !visibleRect
+    || geometry.localPoint.x < visibleRect.left
+    || geometry.localPoint.x > visibleRect.right
+    || geometry.localPoint.y < visibleRect.top
+    || geometry.localPoint.y > visibleRect.bottom
+  ) {
+    return null;
+  }
+  const hitTarget = hitTestForElement(geometry.image, geometry.localPoint.x, geometry.localPoint.y);
+  if (
+    !hitTarget
+    || !(
+      hitTarget === area
+      || hitTarget === geometry.image
+      || geometry.image.contains(hitTarget)
+    )
+    || hasPointerTransparentOccluder(geometry.image, geometry.localPoint.x, geometry.localPoint.y)
+  ) {
+    return null;
+  }
+  const framePoint = exposePointThroughFrameChain(
+    geometry.image,
+    geometry.localPoint.x,
+    geometry.localPoint.y
+  );
+  return framePoint
+    ? {
+        ...geometry.localPoint,
+        ...framePoint,
+        hitTarget: hitTarget === area ? area : geometry.image,
+        targetRect: geometry.globalRect
+      }
+    : null;
+}
+
+function findExposedPoint(element) {
+  const cache = assistantPageState.collectionCache;
+  if (cache?.exposedPoints.has(element)) {
+    cache.cacheHits.exposedPoint += 1;
+    return cache.exposedPoints.get(element);
+  }
+  const imageMapPoint = element.tagName?.toLowerCase() === "area"
+    ? findImageMapAreaPoint(element)
+    : null;
+  if (imageMapPoint) {
+    cache?.exposedPoints.set(element, imageMapPoint);
+    return imageMapPoint;
+  }
+  if (!isElementBoxRendered(element)) {
+    cache?.exposedPoints.set(element, null);
+    return null;
+  }
+  const visibleRect = clipLocalRectForElement(element, getElementRect(element));
   if (!visibleRect) {
+    cache?.exposedPoints.set(element, null);
     return null;
   }
 
@@ -2777,16 +3636,25 @@ function findExposedPoint(element) {
     }
     const framePoint = exposePointThroughFrameChain(element, point.x, point.y);
     if (framePoint) {
-      return { ...point, ...framePoint, hitTarget };
+      const exposedPoint = { ...point, ...framePoint, hitTarget };
+      cache?.exposedPoints.set(element, exposedPoint);
+      return exposedPoint;
     }
   }
+  cache?.exposedPoints.set(element, null);
   return null;
 }
 
 function isTextNodeVisuallyExposed(textNode) {
+  const cache = assistantPageState.collectionCache;
+  if (cache?.textExposure.has(textNode)) {
+    cache.cacheHits.textExposure += 1;
+    return cache.textExposure.get(textNode);
+  }
   const ownerDocument = textNode.ownerDocument || document;
   const element = textNode.parentElement;
   if (!element || !isElementTreeRendered(element)) {
+    cache?.textExposure.set(textNode, false);
     return false;
   }
   const range = ownerDocument.createRange();
@@ -2794,7 +3662,7 @@ function isTextNodeVisuallyExposed(textNode) {
   const rects = Array.from(range.getClientRects());
   range.detach?.();
 
-  return rects.some((rect) => {
+  const exposed = rects.some((rect) => {
     const visibleRect = clipLocalRectForElement(element, rect, { includeSelf: true });
     if (!visibleRect) {
       return false;
@@ -2810,6 +3678,8 @@ function isTextNodeVisuallyExposed(textNode) {
       return Boolean(exposePointThroughFrameChain(element, point.x, point.y));
     });
   });
+  cache?.textExposure.set(textNode, exposed);
+  return exposed;
 }
 
 function clipLocalRectForElement(element, sourceRect, options = {}) {
@@ -2826,7 +3696,7 @@ function clipLocalRectForElement(element, sourceRect, options = {}) {
 
   let ancestor = options.includeSelf ? element : getLocalComposedParentElement(element);
   while (ancestor?.ownerDocument === element.ownerDocument) {
-    const style = ownerWindow.getComputedStyle(ancestor);
+    const style = getElementStyle(ancestor);
     const clipsX = clipsOverflow(style.overflowX) || String(style.contain || "").includes("paint");
     const clipsY = clipsOverflow(style.overflowY) || String(style.contain || "").includes("paint");
     const ownerDocument = element.ownerDocument;
@@ -2836,7 +3706,7 @@ function clipLocalRectForElement(element, sourceRect, options = {}) {
       || ancestor === ownerDocument.scrollingElement
     );
     if ((clipsX || clipsY) && !isViewportScroller) {
-      const ancestorRect = normalizeRect(ancestor.getBoundingClientRect());
+      const ancestorRect = normalizeRect(getElementRect(ancestor));
       clipped = intersectRects(clipped, {
         left: clipsX ? ancestorRect.left + ancestor.clientLeft : clipped.left,
         right: clipsX ? ancestorRect.left + ancestor.clientLeft + ancestor.clientWidth : clipped.right,
@@ -2940,7 +3810,7 @@ function hasPointerTransparentOccluder(target, x, y, options = {}) {
     ) {
       continue;
     }
-    const rect = occluder.getBoundingClientRect();
+    const rect = getElementRect(occluder);
     if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) {
       continue;
     }
@@ -2960,9 +3830,25 @@ function getPointerTransparentOccluders(root) {
   const elements = [];
   const ownerDocument = root.nodeType === 9 ? root : root.ownerDocument;
   const ownerWindow = ownerDocument?.defaultView || window;
-  for (const element of Array.from(root.querySelectorAll?.("*") || [])) {
-    const style = ownerWindow.getComputedStyle(element);
-    if (style.pointerEvents !== "none" || !isElementBoxRendered(element) || !elementHasVisualPaint(element, style)) {
+  const scopeElements = getDomScopes().find((scope) => scope.root === root)?.elements;
+  for (const element of (
+    Array.isArray(scopeElements)
+      ? scopeElements
+      : Array.from(root.querySelectorAll?.("*") || [])
+  )) {
+    const rect = getElementRect(element);
+    if (
+      rect.width <= 0
+      || rect.height <= 0
+      || rect.bottom <= 0
+      || rect.right <= 0
+      || rect.top >= ownerWindow.innerHeight
+      || rect.left >= ownerWindow.innerWidth
+    ) {
+      continue;
+    }
+    const style = getElementStyle(element);
+    if (style.pointerEvents !== "none" || !isElementTreeRendered(element) || !elementHasVisualPaint(element, style)) {
       continue;
     }
     elements.push(element);
@@ -2998,7 +3884,7 @@ function elementHasVisualPaint(element, style) {
 
 function elementPaintsAtPoint(element, x, y) {
   const ownerWindow = element.ownerDocument?.defaultView || window;
-  const style = ownerWindow.getComputedStyle(element);
+  const style = getElementStyle(element);
   if (backgroundPaints(style)) {
     return true;
   }
@@ -3006,7 +3892,7 @@ function elementPaintsAtPoint(element, x, y) {
     return true;
   }
 
-  const rect = element.getBoundingClientRect();
+  const rect = getElementRect(element);
   if (pointTouchesPaintedBorder(style, rect, x, y)) {
     return true;
   }
@@ -3125,7 +4011,7 @@ function getStackingContextChain(element) {
   const chain = [];
   let current = element;
   while (current?.ownerDocument) {
-    const style = (current.ownerDocument.defaultView || window).getComputedStyle(current);
+    const style = getElementStyle(current);
     if (createsStackingContext(current, style)) {
       chain.unshift(paintLayer(current, style));
     }
@@ -3138,7 +4024,7 @@ function createsStackingContext(element, style) {
   const position = style.position;
   const zIndex = style.zIndex;
   const parentDisplay = element.parentElement
-    ? (element.ownerDocument.defaultView || window).getComputedStyle(element.parentElement).display
+    ? getElementStyle(element.parentElement).display
     : "";
   return (
     element === element.ownerDocument.documentElement ||
@@ -3157,7 +4043,7 @@ function createsStackingContext(element, style) {
 }
 
 function paintLayer(element, providedStyle) {
-  const style = providedStyle || (element.ownerDocument.defaultView || window).getComputedStyle(element);
+  const style = providedStyle || getElementStyle(element);
   const parsedZIndex = Number.parseInt(style.zIndex, 10);
   const zIndex = Number.isFinite(parsedZIndex) ? parsedZIndex : 0;
   let layer;
@@ -3206,7 +4092,7 @@ function exposePointThroughFrameChain(element, localX, localY) {
     if (!frame || !isElementBoxRendered(frame)) {
       return null;
     }
-    const frameRect = frame.getBoundingClientRect();
+    const frameRect = getElementRect(frame);
     const scaleX = frame.offsetWidth ? frameRect.width / frame.offsetWidth : 1;
     const scaleY = frame.offsetHeight ? frameRect.height / frame.offsetHeight : 1;
     x = frameRect.left + (frame.clientLeft + x) * scaleX;

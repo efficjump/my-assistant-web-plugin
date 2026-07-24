@@ -393,7 +393,7 @@ h2 {
   line-height: 1.45;
   text-align: center;
   white-space: pre-wrap;
-  content: "무엇을 도와드릴까요?";
+  content: attr(data-empty-label);
 }
 
 .message {

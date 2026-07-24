@@ -4,7 +4,7 @@ A Manifest V3 browser extension that turns a configured language model into a bo
 
 ![Agent side panel](docs/assets/agent-panel.png)
 
-Version `0.9.6` with Bridge protocol `2.3` targets Chromium-based browsers version 116 or later. This repository contains a source-loaded development build rather than a store package. The screenshots in this README were regenerated from the current version with a temporary browser profile and local fixtures.
+Version `0.9.8` with Bridge protocol `2.3` targets Chromium-based browsers version 116 or later. This repository contains a source-loaded development build rather than a store package. The extension UI screenshots in this README were regenerated from the current version with a temporary browser profile and local fixtures.
 
 ## Choose the workflow
 
@@ -12,8 +12,8 @@ The extension has three related but distinct integration paths:
 
 | What you want to do | Use | Where the model runs | Does it control the page? |
 | --- | --- | --- | --- |
-| Give browser tasks directly in the extension | **Built-in agent** | At the AI endpoint configured in **Settings → AI 연결** | Yes, through the extension's observe → approve → act → verify loop |
-| Let a local MCP-capable development tool use the current browser tab | **Local Bridge** | In the external development tool; visual targeting uses the extension's configured model | Yes, but only for the tab explicitly shared in **Settings → 개발 도구** |
+| Give browser tasks directly in the extension | **Built-in agent** | At the AI endpoint configured in **Settings → AI connection** | Yes, through the extension's observe → approve → act → verify loop |
+| Let a local MCP-capable development tool use the current browser tab | **Local Bridge** | In the external development tool; visual targeting uses the extension's configured model | Yes, but only for the tab explicitly shared in **Settings → Developer tools** |
 | Let the built-in agent call a remote tool server | **Outbound MCP client** | At the configured AI endpoint | No direct browser sharing; it calls the configured Streamable HTTP MCP tools |
 
 The Bridge is not required for normal use of the built-in agent. Conversely, enabling outbound MCP does not register this browser extension in a development tool; that is the Bridge's job.
@@ -42,16 +42,17 @@ The planner may cite only IDs already present in the runtime evidence ledger, bu
 
 - Observes the URL and only the text, controls, forms, tables, and live regions that are visually exposed in the current viewport
 - Exposes dense visible controls through observation-bound windows and dynamic label/role search instead of treating the configured element count as a browser limit
-- Traverses open Shadow DOM and visually verified same-origin or permission-granted cross-origin frames, while keeping every child-frame ref bound to its document
+- Traverses open Shadow DOM and visually verified same-origin or permission-granted `iframe` and legacy `frame` documents, while keeping every child-frame ref bound to its document
 - Discovers visible nested scroll regions and scrolls the intended container before observing newly revealed controls
 - Supports `click`, screenshot-bound `visual_click`, `fill`, `select`, `focus`, `hover`, `submit`, `press`, `scroll`, `navigate`, `wait`, `wait_for`, `extract`, and `upload`
 - Uses visual coordinates only inside an observed canvas or application surface; coordinates are created inside the extension, require approval, and are independently verified against a fresh screenshot before execution
-- Recognizes semantic controls and visible custom pointer controls, then sends a pointer/mouse sequence before click activation
+- Recognizes semantic controls, visible custom pointer controls, legacy image-map areas, and SVG links, then sends a pointer/mouse sequence before click activation
+- Resolves semantic menu or tree-item containers to their single rendered child link or button when the container owns the visible label, so icon hit points do not replace the intended navigation effect
 - Supports `tab_open`, `tab_focus`, `tab_adopt`, `tab_close`, `download`, and `download_wait`
 - Waits for element state, text, URL, title, live-region, and DOM-stability conditions
 - Compares observable state before and after every effect
 - Validates element references, runtime-issued evidence, and MCP input schemas
-- Runs an independent policy decision before execution
+- Applies the shared deterministic safety contract to provably read-only or structural UI actions, and runs an independent policy decision for actions that may change external state
 - Requires approval for sensitive or externally visible effects
 - Supports Streamable HTTP MCP tools, resources, prompts, protocol negotiation, and session recovery
 - Supports MCP OAuth 2.1 Authorization Code with PKCE S256 and refresh-token rotation
@@ -64,9 +65,19 @@ The planner may cite only IDs already present in the runtime evidence ledger, bu
 - Renders CommonMark and GFM assistant output as structured headings, emphasis, nested and task lists, tables, quotes, code, and safe links instead of exposing source delimiters
 - Switches the extension-owned interface between browser-detected language, Korean, and English without a reload
 
-The **Context** inspector shows what the current browser observation actually contains: visible text and controls, mapped frames, nested scroll regions, visual surfaces, automation constraints, selection, and recent logs. It is useful for distinguishing a model-planning problem from a browser-permission or page-structure boundary.
+The **Context** inspector shows what the current browser observation actually contains: visible text and controls, mapped frames, nested scroll regions, visual surfaces, automation constraints, collection time, selection, and recent logs. It is useful for distinguishing a model-planning problem from a browser-permission, page-structure, or collection-performance boundary.
 
 ![Context inspector populated by the real-browser compatibility fixture](docs/assets/web-compatibility.png)
+
+### Recognition and latency model
+
+Recognition remains structure-driven rather than site-specific. A focused element search first filters generic identity fields such as accessible name, role, tag, input type, placeholder, title, and safe attributes, and only then performs the more expensive visibility and nearby-context checks. Full observations still enumerate all currently exposed controls so broad cursor paging remains complete.
+
+One observation reuses query, style, rectangle, exposure, text, and image-map geometry results for the duration of that collection. Embedded-origin permission discovery uses a lightweight frame-boundary pass instead of collecting every control in every frame. A normal semantic DOM page does not send a screenshot with every planning request; the configured screenshot path activates when the DOM has no usable evidence, a visual surface is present, or a fresh screenshot is explicitly required. When a screenshot is required, a compact observation probe verifies that the DOM, viewport, frame boundaries, and bound targets have not changed; an unchanged page does not need a second full collection.
+
+The built-in model loop also avoids serial work that does not add evidence. A fresh standalone request does not call a separate conversation-intent model, planner input excludes duplicate page text and evidence payloads, and a successful terminal decision uses one verifier for completion evidence and current-page grounding. Read-only actions, disclosure controls, and same-origin navigation links use the same deterministic state-change classification as the execution gate instead of making a second policy-model request; unknown clicks, submissions, cross-origin movement, tools, and other consequential effects still use the independent policy path. Action verification returns after the first observable state change and waits up to a bounded grace period only when no change appears; it no longer adds fixed 220 ms and trailing 120 ms sleeps to every action. After execution, the runtime observes document readiness and DOM, visual, URL, and scroll revisions until the page is quiet instead of always sleeping for a fixed interval. If a navigation replaces the document before the content response arrives, the runtime accepts it only when the browser proves that the bound frame's document ID or sanitized URL actually changed. Explicit continuations, changed screenshots, and uncertain terminal claims still take the conservative full path.
+
+The optional authenticated local-site smoke test was last run on 2026-07-24 with the unpacked extension in real Chromium. Login completed in 912 ms. Two disclosure-menu actions spent 14 ms each in page-action execution and 203 ms each waiting for the resulting DOM to become quiet. The subsequent route clicks spent 5 ms each in execution and settled in 708 ms and 704 ms, with fresh observations confirming `/processes` and `/api-history`. The same run collected the 8,000-node compatibility fixture in 114 ms. These are local diagnostic measurements rather than cross-machine performance guarantees; the settle interval intentionally includes real page and API updates, while model and network latency remain separate.
 
 ## API profiles
 
@@ -117,7 +128,7 @@ After pulling a newer source revision, return to the extension management page a
 
 ### 2. Connect a model
 
-Open **Settings → AI 연결** and configure:
+Open **Settings → AI connection** and configure:
 
 1. **API format** matching the endpoint protocol.
 2. **Endpoint URL** and **Model**.
@@ -133,7 +144,7 @@ Authentication values are session-only by default and are persisted only when th
 2. Enter a complete goal, including the result or evidence you expect.
 3. Review approval cards for state-changing, sensitive, or externally visible effects.
 4. Keep the target tab open while the task runs.
-5. Check the final answer and **작업 흐름** card. A task is complete only after the extension has re-observed the result and verified the returned evidence.
+5. Check the final answer and **Task flow** card. A task is complete only after the extension has re-observed the result and verified the returned evidence.
 
 The agent can dynamically request another visible-control window with a `discover` decision. It searches accessible labels, roles, safe attributes, and nearby table/row/form/dialog/region text locally, similar to using a targeted source search instead of loading an entire file. Only matched control descriptors are sent to the model. If the target is outside the viewport, the agent must scroll and observe again; local search does not expose offscreen or hidden content.
 
@@ -147,15 +158,13 @@ The settings dialog starts with a live overview of the model, automation mode, e
 
 ### Display language
 
-Open **Settings → General → Display language** (`설정 → 일반 → 표시 언어`) and choose:
+Open **Settings → General → Display language** and choose:
 
 - **Browser language** to use Korean when the browser's first preferred language is Korean and English otherwise
 - **Korean** to keep the interface in Korean regardless of the browser language
 - **English** to keep the interface in English regardless of the browser language
 
 The selection is saved with the other extension settings and applies immediately to the panel, settings, approval controls, runtime status messages, and built-in task templates. Reloading the extension or target page is not required. Switching the display language does not translate user input, saved personal templates, page titles or content, or model-generated answers; those values remain byte-for-byte user or source content. The model's response language is controlled separately by the request and system instruction.
-
-![English display language selected in the settings overview](docs/assets/language-settings-en.png)
 
 The browser action is not limited to a right-side panel:
 
@@ -167,23 +176,23 @@ A toolbar popup is technically possible, but Chrome closes it as soon as focus m
 
 ## Using the panel controls
 
-The panel keeps only the current page, element picker, settings, and request composer visible. Less frequent actions such as context inspection, undo, export, and clearing the conversation are under **더보기**. Manual context refresh is available inside the context dialog, where it is relevant, rather than as a duplicate toolbar action. The layout has no fixed desktop minimum width, so browser zoom and narrow side panels keep the primary actions and send control inside the viewport; long page and status labels use an ellipsis while their full text remains available as a tooltip.
+The panel keeps only the current page, element picker, settings, and request composer visible. Less frequent actions such as context inspection, undo, export, and clearing the conversation are under **More**. Manual context refresh is available inside the context dialog, where it is relevant, rather than as a duplicate toolbar action. The layout has no fixed desktop minimum width, so browser zoom and narrow side panels keep the primary actions and send control inside the viewport; long page and status labels use an ellipsis while their full text remains available as a tooltip.
 
 Assistant messages use a bundled GitHub-Flavored Markdown parser for syntax recognition, then build a separate allowlisted DOM tree. The renderer covers headings, paragraphs and hard breaks, bold and italic emphasis, strikethrough, escaped characters and HTML character references, ordered, unordered, nested, and task lists, block quotes, horizontal rules, inline and fenced code, tables, inline and reference links, and automatic HTTP(S) links. Tables remain semantic tables inside a keyboard-focusable horizontal scroll region, and long code blocks are keyboard-scrollable. Remote images are represented as labeled links rather than fetched automatically, while raw HTML is displayed as inert source text; unsafe link protocols are never inserted into the live DOM. User messages and extension-owned status messages remain plain text.
 
-**Templates** are reusable request text, not an automatic workflow. Open **템플릿** above the composer to create a template or select an existing one, then edit its title and request text directly. **변경 저장** updates the selected item instead of creating a duplicate. Personal-template deletion and built-in-template restoration both use a two-step confirmation. **현재 입력 가져오기** copies the composer draft into the editor without saving it, and **입력창에 넣기** preserves the existing draft while inserting the edited template at the current cursor or selection.
+**Templates** are reusable request text, not an automatic workflow. Open **Templates** above the composer to create a template or select an existing one, then edit its title and request text directly. **Save changes** updates the selected item instead of creating a duplicate. Personal-template deletion and built-in-template restoration both use a two-step confirmation. **Use current input** copies the composer draft into the editor without saving it, and **Insert into composer** preserves the existing draft while inserting the edited template at the current cursor or selection.
 
-Each submitted message becomes one immutable agent objective. A complete new request does not inherit unfinished effects from an earlier failed run, while an explicit continuation can reuse only the prior context needed to finish that named task. Reusable instructions belong in **템플릿**, where they remain visible and editable before being inserted into the composer; there is no hidden persistent goal that can silently broaden a later message. The Bridge still retains the explicit `goal` passed to `browser_begin` for the lifetime of that one external browser task because it is the execution and repetition boundary, not cross-message memory.
+Each submitted message becomes one immutable agent objective. A complete new request does not inherit unfinished effects from an earlier failed run, while an explicit continuation can reuse only the prior context needed to finish that named task. Reusable instructions belong in **Templates**, where they remain visible and editable before being inserted into the composer; there is no hidden persistent goal that can silently broaden a later message. The Bridge still retains the explicit `goal` passed to `browser_begin` for the lifetime of that one external browser task because it is the execution and repetition boundary, not cross-message memory.
 
 ![Template editor with a selected personal template](docs/assets/template-manager.png)
 
-Global settings are saved when a field changes, so there is no separate global save button; site-specific profiles still use their own apply action. The full reset action is under **Settings → 고급**. While a local action plan is waiting for approval, the new-request composer is hidden because the running task cannot accept another request; rejecting or completing the approval restores the unchanged draft. External Bridge approvals do not hide the composer.
+Global settings are saved when a field changes, so there is no separate global save button; site-specific profiles still use their own apply action. The full reset action is under **Settings → Advanced**. While a local action plan is waiting for approval, the new-request composer is hidden because the running task cannot accept another request; rejecting or completing the approval restores the unchanged draft. External Bridge approvals do not hide the composer.
 
-The **작업 흐름** card summarizes the complete run rather than only the final turn, so an earlier tool call or page action is not replaced with “none” when the terminal turn needs no further effect. Successful low-level result payloads stay in the internal evidence and trace instead of appearing as raw JSON chat messages. Malformed decision objects and provider error envelopes are repaired or reduced to concise user-facing errors; internal schema messages such as an invalid `elementSearch` placement remain in diagnostics instead of the conversation.
+The **Task flow** card summarizes the complete run rather than only the final turn, so an earlier tool call or page action is not replaced with “none” when the terminal turn needs no further effect. Successful low-level result payloads stay in the internal evidence and trace instead of appearing as raw JSON chat messages. Malformed decision objects and provider error envelopes are repaired or reduced to concise user-facing errors; internal schema messages such as an invalid `elementSearch` placement remain in diagnostics instead of the conversation.
 
-**Settings → 사이트별** is an agent-behavior profile for the exact origin shown in the panel; it does not change browser permissions. Enable the profile only when that site needs different behavior. Each field can independently inherit the global setting or override the action mode, screenshot use, and MCP use for that origin. The effective values are shown before saving, and **기본 설정으로 되돌리기** removes the origin-specific profile.
+**Settings → Per-site** is an agent-behavior profile for the exact origin shown in the panel; it does not change browser permissions. Enable the profile only when that site needs different behavior. Each field can independently inherit the global setting or override the action mode, screenshot use, and MCP use for that origin. The effective values are shown before saving, and **Revert to defaults** removes the origin-specific profile.
 
-The screenshot switch covers both screenshots sent with AI decisions and target previews shown in approval cards. A site-specific screenshot override takes precedence over the global switch. Turning screenshots off does not disable DOM-based viewport observation; visible text and controls are still collected subject to the privacy filters and configured limits.
+The screenshot switch permits screenshots for both AI decisions and target previews shown in approval cards. On a normal page with usable DOM text or controls, planning remains DOM-first and does not attach a screenshot merely because the switch is on. Screenshots are added when visual surfaces are present, DOM evidence is insufficient, or the runtime explicitly requires fresh visual evidence. A site-specific override takes precedence over the global switch. Turning screenshots off disables every optional screenshot path but does not disable DOM-based viewport observation; visible text and controls are still collected subject to the privacy filters and configured limits.
 
 ## MCP connections
 
@@ -255,10 +264,10 @@ Extension setup: ws://127.0.0.1:<PORT>/extension#pair=<ONE_TIME_CODE>
 Finish the browser side once:
 
 1. Bring the intended normal web page to the foreground.
-2. Open the extension and choose **Settings → 개발 도구**.
+2. Open the extension and choose **Settings → Developer tools**.
 3. Paste the complete `Extension setup` value, including `#pair=...`.
-4. Select **연결하고 현재 탭 공유**.
-5. Confirm that the panel shows **연결됨** and names the intended shared tab.
+4. Select **Connect and share current tab**.
+5. Confirm that the panel shows **Connected** and names the intended shared tab.
 6. Retry the original Bridge call in the development tool.
 
 The one-time code is consumed during pairing and stripped before the endpoint is stored. The companion remembers its loopback port, so later launches normally reconnect without repeating these steps while the browser-side credential remains available. Sharing a different tab or stopping sharing is always an explicit extension action.
@@ -308,9 +317,11 @@ The first page snapshot is deliberately bounded, but that is not an 80-element b
 }
 ```
 
-The extension searches accessible names, roles, tags, input types, placeholders, titles, safe attributes, and bounded context from the nearest visible cell, row, collection, form, dialog, or region. Only relevant descriptors cross the Bridge boundary. Each result includes `searchMatch` evidence explaining the matched fields and redacted context.
+The extension searches accessible names, roles, tags, input types, placeholders, titles, safe attributes, and bounded context from the nearest visible cell, row, collection, form, dialog, or region. It applies cheap identity filters before expensive visibility and context scoring when the query permits it. Only relevant descriptors cross the Bridge boundary. Each result includes `searchMatch` evidence explaining the matched fields and redacted context.
 
 When `hasMore` is true, continue the returned opaque `nextCursor` with the same search. The cursor is bound to the query, role and context filters, document and frame identities, DOM revisions, viewport, and ranked result digest. If page state changes, it resets instead of silently rebinding a ref. A target outside the viewport still requires scrolling and a fresh observation.
+
+For an optimized targeted search, `availableTotal` is `null` and `availableTotalExact` is `false` because the extension intentionally does not run a second full unfiltered visibility pass. `potentialTotal` is the number of inexpensive identity candidates considered, while `total` is the number that passed complete exposure and search scoring. Broad observations and unfiltered cursor paging continue to report an exact available total.
 
 Short labels on older pages can be disambiguated with nearby text. For example, a numeric page link can be requested as:
 
@@ -318,7 +329,7 @@ Short labels on older pages can be disambiguated with nearby text. For example, 
 {
   "query": "2",
   "roles": ["link"],
-  "near_text": "[1/5] [총 484건]"
+  "near_text": "[1/5] [Total: 484]"
 }
 ```
 
@@ -326,11 +337,11 @@ When `near_text` is present, `query` is matched against the control itself while
 
 For a canvas or application surface with no DOM ref, use `browser_visual_act` with a current surface ref and precise visible description. Do not send coordinates. The extension's configured model locates the point, an independent verifier checks the same screenshot evidence, and approval-time re-observation repeats the resolution before execution.
 
-### Legacy Korean page validation
+### Legacy Korean-language page validation
 
-The live Bridge path was exercised on 2026-07-23 against [DART 최근공시](https://dart.fss.or.kr/dsac001/mainAll.do), a Korean public site with a large server-rendered table, a `body` document scroller, an AJAX paginator exposed as `javascript:search(2)`, continuous list updates, and a framed disclosure viewer. At the validation moment the list contained 484 disclosures across five pages.
+The live Bridge path was exercised on 2026-07-23 against [DART Recent Disclosures](https://dart.fss.or.kr/dsac001/mainAll.do), a Korean-language public site with a large server-rendered table, a `body` document scroller, an AJAX paginator exposed as `javascript:search(2)`, continuous list updates, and a framed disclosure viewer. At the validation moment the list contained 484 disclosures across five pages.
 
-The complete run observed page 1, reached the paginator through viewport-scoped scrolling, found the literal `2` link with the structured query above, obtained deterministic approval, and executed the page-owned legacy handler. The operation reported `activation: "page-owned-legacy-handler"` only after the visible state fingerprint changed. A fresh observation showed `[2/5]`; the run then opened the first page-2 report in the same shared tab and verified the viewer title `알이씨데이터센터/특수관계인에대한담보제공`. These values are live evidence, not selectors or expected answers embedded in the extension.
+The complete run observed page 1, reached the paginator through viewport-scoped scrolling, found the literal `2` link with a structured query, obtained deterministic approval, and executed the page-owned legacy handler. The operation reported `activation: "page-owned-legacy-handler"` only after the visible state fingerprint changed. A fresh observation showed page 2 of 5; the run then opened the first page-2 report in the same shared tab and verified the disclosure viewer title. These values came from live evidence, not selectors or expected answers embedded in the extension.
 
 ![DART disclosure viewer reached through the live Bridge agent loop](docs/assets/dart-legacy-agent-loop.jpg)
 
@@ -380,9 +391,9 @@ Never put the token in the URL or commit it to the repository. The exact HTTP tr
 | Symptom | What to check |
 | --- | --- |
 | `pnpm: command not found` | Use `npm install` and `npm run bridge:config`; pnpm is optional. |
-| First call says the extension is not connected | Copy the complete new `Extension setup` value into **Settings → 개발 도구**, share the intended tab, and retry `browser_begin`. |
+| First call says the extension is not connected | Copy the complete new `Extension setup` value into **Settings → Developer tools**, share the intended tab, and retry `browser_begin`. |
 | Setup value is invalid or expired | Restart or reconnect the MCP server to generate a new one-time value. |
-| Connected, but the wrong tab is shared | Focus the intended web page and select **현재 탭으로 변경** in the Bridge settings. |
+| Connected, but the wrong tab is shared | Focus the intended web page and select **Switch to current tab** in the Bridge settings. |
 | Operation remains `approval_required` | Approve or reject it in the extension, then call `browser_continue`; do not call `browser_act` again for the same proposal. |
 | A ref or proposal becomes `stale` | Refresh with `browser_continue` and plan from the latest refs. |
 | A response is `failed`, `blocked`, `rejected`, `cancelled`, or `unknown_after_restart` | Call `browser_end`; do not send another action in that task. Start a new complete goal if the user wants to proceed. |
@@ -393,7 +404,7 @@ Never put the token in the URL or commit it to the repository. The exact HTTP tr
 | `uv_spawn`, `ENOENT`, or a stop-hook spawn error appears | This normally comes from the development tool's local hook process, not from the Bridge protocol. Check that hook's executable and `PATH`, or disable the broken hook; verify the Bridge separately from the extension's connected/shared indicators and actual MCP call log. |
 | Streamable HTTP returns `401` | Send the current MCP token as `Authorization: Bearer ...`; the one-time extension setup code is not that token. |
 
-All documentation screenshots are generated by `npm run capture:docs` against a temporary browser profile and local fixtures. They contain no user session, private page, persistent credential, or machine-specific filesystem path. Loopback ports and synthetic fixture URLs may vary between captures.
+Extension UI screenshots are generated by `npm run capture:docs` against a temporary browser profile and local fixtures. They contain no user session, private page, persistent credential, or machine-specific filesystem path. Loopback ports and synthetic fixture URLs may vary between captures. The separate legacy-site image records a public-page compatibility run and contains only information that was publicly visible on that page.
 
 See [Local MCP companion](docs/bridge.md) for complete startup options, portable MCP client configuration patterns, the tool workflow, security properties, and troubleshooting.
 See [Web structure compatibility](docs/web-compatibility.md) for frame, Shadow DOM, nested-scroll, visual-surface, permission, and browser-policy boundaries.
@@ -420,7 +431,7 @@ The production manifest does not require `<all_urls>`. Site and endpoint origins
 
 - Page text, DOM labels, MCP results, resources, and prompts are treated as untrusted data.
 - Offscreen, clipped, fully occluded, fully transparent, and hidden DOM content is excluded from model-visible page observations until it is revealed and observed again.
-- Child-frame content is merged only when one fully exposed iframe boundary maps unambiguously to one browser frame; clipped, covered, hidden, or ambiguous frames remain an explicit capability gap.
+- Child-frame content is merged only when one fully exposed `iframe` or legacy `frame` boundary maps unambiguously to one browser frame; named duplicate-URL frames can be distinguished by their document binding, while anonymous ambiguous frames remain an explicit capability gap.
 - The model can use only element references and tools present in the current observation.
 - Each run is pinned to an exact tab and document identity.
 - External development tools can access only the tab explicitly shared in the Bridge panel, and detaching it closes their active sessions.
@@ -445,7 +456,7 @@ Exported traces and audit logs may still contain page-derived information. Revie
 
 ## Limitations
 
-- Browser-internal pages, policy-restricted pages, and closed Shadow DOM internals remain unavailable. A cross-origin frame is available only when it is visibly and unambiguously mapped and the user has granted its origin.
+- Browser-internal pages, policy-restricted pages, and closed Shadow DOM internals remain unavailable. A cross-origin frame is available only when it is visibly and unambiguously mapped and the user has granted its origin. Anonymous sibling frames that share the same URL can remain unavailable when the browser exposes no stable way to distinguish them.
 - Canvas and application surfaces can use guarded visual targeting when the configured model accepts screenshots, but ambiguous targets, CAPTCHAs, trusted-event checks, and page-specific anti-automation behavior still require direct user interaction.
 - The extension does not provide arbitrary local-file access or native shell execution.
 - External control requires the local companion process to remain running, an authenticated extension connection, and an explicitly shared tab.
@@ -463,6 +474,12 @@ npm run test:bridge
 npm run test:e2e
 # Optional: requires a compatible local CLI already routed to an OpenAI-compatible local endpoint.
 LOCAL_HARNESS_BIN="<COMPATIBLE_CLI>" npm run test:e2e:local-harness
+# Optional: exercise semantic login and menu navigation against a running local site.
+WEB_PLUGIN_LIVE_URL="http://localhost/login" \
+WEB_PLUGIN_LIVE_USERNAME="<LOCAL_TEST_USER>" \
+WEB_PLUGIN_LIVE_PASSWORD="<LOCAL_TEST_PASSWORD>" \
+WEB_PLUGIN_LIVE_STEPS='[{"label":"Menu group"},{"label":"Nested group"},{"label":"Destination","path":"/expected-path"}]' \
+npm run test:e2e
 # Regenerates the privacy-safe documentation screenshots from a temporary profile.
 npm run capture:docs
 ```
@@ -475,7 +492,7 @@ Run the local panel harness with:
 npm run serve:test
 ```
 
-The command reports the temporary development address. The E2E suite exercises the Manifest V3 service worker, document replacement, viewport-scoped deep DOM observation, contextual element retrieval, structured-search cursor binding, approval-time search-window reconstruction, dense-control pagination, cursor invalidation after DOM changes, internal-model `discover` continuation, immutable turn resolution after a failed run, semantic page and MCP-tool repetition boundaries, malformed-response containment, visible cross-origin frame routing, hidden-frame exclusion, nested scroll regions, guarded visual-surface clicks, extension-owned Bridge visual targeting, terminal Bridge failures, occlusion and clipping filters, file handoff, tab lifecycle, worker restart, and empty-response protection. The opt-in local-harness scenario additionally launches a compatible CLI, loads a temporary secret-protected MCP configuration, confirms that every assistant turn reports the local `default` model alias, and requires the model to complete the guided begin → act → approval/continue → verification → end workflow against a temporary browser profile.
+The command reports the temporary development address. The E2E suite exercises the Manifest V3 service worker, document replacement during an action response, semantic menu containers with nested links, cached viewport-scoped deep DOM observation on an 8,000-node fixture, lightweight frame-origin discovery, screenshot observation probes, DOM-first screenshot selection, deterministic low-risk policy fast paths, event-driven page settling, first-change action verification, contextual element retrieval, structured-search cursor binding, approval-time search-window reconstruction, dense-control pagination, cursor invalidation after DOM changes, internal-model `discover` continuation, standalone-intent fast paths, compact planner input, combined terminal verification, semantic page and MCP-tool repetition boundaries, malformed-response containment, visible cross-origin frame routing, named duplicate-URL legacy frames, image-map actions, SVG links, hidden-frame exclusion, nested scroll regions, guarded visual-surface clicks, extension-owned Bridge visual targeting, terminal Bridge failures, occlusion and clipping filters, file handoff, tab lifecycle, worker restart, and empty-response protection. The optional live-site variables add a temporary-profile smoke test that discovers credential fields semantically, logs in, and follows the supplied visible menu labels while asserting expected paths; credential values are never printed. The opt-in local-harness scenario additionally launches a compatible CLI, loads a temporary secret-protected MCP configuration, confirms that every assistant turn reports the local `default` model alias, and requires the model to complete the guided begin → act → approval/continue → verification → end workflow against a temporary browser profile.
 
 ## Public-release audit
 

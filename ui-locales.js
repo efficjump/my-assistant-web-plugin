@@ -2,7 +2,7 @@
   "use strict";
 
   const SUPPORTED_PREFERENCES = new Set(["auto", "ko", "en"]);
-  const TRANSLATABLE_ATTRIBUTES = ["title", "aria-label", "placeholder", "alt", "label"];
+  const TRANSLATABLE_ATTRIBUTES = ["title", "aria-label", "placeholder", "alt", "label", "data-empty-label"];
   const IGNORED_CONTENT_SELECTOR = [
     "script",
     "style",
@@ -118,7 +118,7 @@
     "AI가 한 번에 확인할 수 있는 페이지 정보의 범위를 정합니다.": "Set how much page information the AI can inspect at once.",
     "화면 텍스트 한도": "Page text limit",
     "요소 한도": "Element limit",
-    "AI 판단과 승인 미리보기에 스크린샷 사용": "Use screenshots for AI decisions and approval previews",
+    "DOM으로 부족할 때 AI 판단과 승인 미리보기에 스크린샷 사용": "Use screenshots for AI decisions and approval previews when DOM evidence is insufficient",
     "안전": "Safety",
     "민감정보와 상태 변경 작업에 적용할 보호 장치입니다.": "Safeguards for sensitive data and state-changing actions.",
     "민감 입력 감지 시 중단": "Stop when sensitive input is detected",
@@ -186,6 +186,7 @@
     "승인 대기 작업": "Actions awaiting approval",
     "검토할 외부 승인 요청": "External approval request to review",
     "작업 템플릿": "Task templates",
+    "무엇을 도와드릴까요?": "How can I help?",
     "목록에 표시할 제목": "Title shown in the list",
     "입력창에 넣을 요청 문구": "Prompt inserted into the composer",
     "무엇을 할까요?": "What would you like to do?",
@@ -229,7 +230,7 @@
     "API 형식 미지정": "API format not set",
     "모델 미지정": "Model not set",
     "동작 모드 미지정": "Run mode not set",
-    "화면 요소와 스크린샷으로 판단": "Uses page elements and screenshots",
+    "화면 요소 우선 · 필요할 때 스크린샷": "Prioritizes page elements and uses screenshots when needed",
     "화면 요소로만 판단": "Uses page elements only",
     "외부 연동 꺼짐": "External integrations off",
     "상태 변경 작업 승인 사용": "Approval required for state-changing actions",
@@ -436,6 +437,7 @@
     "컨텍스트를 갱신했습니다.": "Context refreshed.",
     "페이지": "Page",
     "텍스트": "Text",
+    "수집 시간": "Collection time",
     "프레임": "Frames",
     "내부 스크롤": "Nested scrolling",
     "시각 surface": "Visual surfaces",

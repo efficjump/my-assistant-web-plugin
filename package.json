@@ -1,6 +1,6 @@
 {
   "name": "my-assistant-web-plugin",
-  "version": "0.9.6",
+  "version": "0.9.8",
   "private": true,
   "license": "UNLICENSED",
   "description": "A verifiable AI browser agent for Chrome and Edge.",

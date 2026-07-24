@@ -54,13 +54,23 @@ test("assistant Markdown uses token parsing and an allowlisted DOM renderer", ()
 test("display language is a persisted immediate setting", () => {
   const html = fs.readFileSync(path.join(root, "panel.html"), "utf8");
   const script = fs.readFileSync(path.join(root, "panel.js"), "utf8");
+  const styles = fs.readFileSync(path.join(root, "styles.css"), "utf8");
+  const locales = fs.readFileSync(path.join(root, "ui-locales.js"), "utf8");
   const select = readOpeningTag(html, "select", "uiLanguageInput");
+  const messageList = readOpeningTag(html, "section", "messageList");
 
   assert.ok(select);
   assert.match(html, /id="uiLanguageInput"[\s\S]*value="auto"[\s\S]*value="ko"[\s\S]*value="en"/);
   assert.match(script, /uiLanguage:\s*"auto"/);
   assert.match(script, /UiI18n\.normalizePreference\(elements\.inputs\.uiLanguage\.value\)/);
   assert.match(script, /UiI18n\.applyDocument\(document,\s*state\.settings\.uiLanguage\)/);
+  assert.match(messageList, /data-empty-label="무엇을 도와드릴까요\?"/);
+  assert.match(styles, /\.chat-log:empty::before\s*\{[\s\S]*content:\s*attr\(data-empty-label\)/);
+  assert.match(locales, /TRANSLATABLE_ATTRIBUTES[\s\S]*"data-empty-label"/);
+  assert.match(locales, /"무엇을 도와드릴까요\?":\s*"How can I help\?"/);
+  assert.match(script, /UiI18n\.setElementAttribute\(\s*elements\.messageList,\s*"data-empty-label"/);
+  assert.match(script, /setLocalizedElementText\(\s*elements\.bridgeConnectionStatus/);
+  assert.match(script, /localizeUiText\(`승인 사유:/);
 });
 
 test("the design does not use a left accent bar", () => {
@@ -157,9 +167,45 @@ test("screenshot-disabled mode gates both AI input and approval previews", () =>
     "the effective setting must be checked before requesting a screenshot"
   );
   assert.match(script, /previewToken !== state\.approvalPreviewToken/);
-  assert.match(annotationFunction, /collectContextWithRetry\(decision\.observationRequest \|\| \{\}\)/);
-  assert.match(annotationFunction, /isSameVisualObservation\(annotationContext, confirmedContext\)/);
-  assert.match(annotationFunction, /areAnnotationTargetsStable\(decision, annotationContext, confirmedContext\)/);
+  assert.match(annotationFunction, /verifyCurrentObservationProbe\(annotationContext\)/);
+  assert.doesNotMatch(annotationFunction, /collectContextWithRetry/);
+});
+
+test("normal DOM turns use latency fast paths without weakening state-changing policy", () => {
+  const panel = fs.readFileSync(path.join(root, "panel.js"), "utf8");
+  const background = fs.readFileSync(path.join(root, "background.js"), "utf8");
+  const content = fs.readFileSync(path.join(root, "content.js"), "utf8");
+  const screenshotStart = panel.indexOf("function shouldCaptureDecisionScreenshot");
+  const screenshotEnd = panel.indexOf("async function verifyCurrentObservationProbe", screenshotStart);
+  const screenshotFunction = panel.slice(screenshotStart, screenshotEnd);
+  const policyStart = panel.indexOf("function buildDeterministicLowRiskPolicy");
+  const policyEnd = panel.indexOf("function appendDecisionMessage", policyStart);
+  const policyFunction = panel.slice(policyStart, policyEnd);
+  const settleStart = panel.indexOf("async function waitAfterExecution");
+  const settleEnd = panel.indexOf("function updateAgentButtons", settleStart);
+  const settleFunction = panel.slice(settleStart, settleEnd);
+
+  assert.match(screenshotFunction, /visualSurfaces\.length/);
+  assert.match(screenshotFunction, /gap\?\.code === "visual_surface"/);
+  assert.match(screenshotFunction, /const hasDomEvidence/);
+  assert.match(screenshotFunction, /return !hasDomEvidence/);
+  assert.match(policyFunction, /ExecutionContract\.actionChangesState\(action,\s*target,\s*context\) === false/);
+  assert.match(policyFunction, /decision\.toolCalls\?\.length/);
+  assert.match(settleFunction, /type:\s*"WAIT_FOR_PAGE_SETTLE"/);
+  assert.doesNotMatch(settleFunction, /delay\(mayNavigate\s*\?\s*1200\s*:\s*450\)/);
+  assert.match(background, /case "WAIT_FOR_PAGE_SETTLE"/);
+  assert.match(background, /function recoverNavigationInterruptedAction/);
+  assert.match(background, /didActionFrameNavigate\(before,\s*after\)/);
+  assert.match(background, /responseInterruptedByNavigation:\s*true/);
+  assert.match(content, /case "WAIT_FOR_PAGE_SETTLE"/);
+  assert.match(content, /signal\.readyState !== "loading"/);
+  assert.match(content, /function findConcreteCompositeControl/);
+  assert.match(content, /\["menuitem",\s*"treeitem"\]\.includes\(role\)/);
+  assert.match(content, /controls\.length !== 1/);
+  assert.match(content, /async function observeInitialActionState/);
+  assert.match(content, /before\?\.fingerprint !== after\.fingerprint/);
+  assert.doesNotMatch(content, /delay\(normalized\.type === "wait" \? 50 : 220\)/);
+  assert.doesNotMatch(content, /await delay\(120\)/);
 });
 
 test("template tool is a closed popover above a single-row composer", () => {
@@ -312,9 +358,11 @@ test("terminal response verification uses one immutable turn intent and current 
   assert.match(groundingFunction, /merely promising future work/);
   assert.doesNotMatch(groundingFunction, /slice\(-2\)/);
   assert.match(groundingFunction, /screenshotDataUrl,/);
-  assert.match(script, /\["answer", "completed"\]\.includes\(decision\.status\)/);
+  assert.match(script, /decision\.status === "answer"/);
   assert.match(script, /decision\.status === "completed"[\s\S]*decision\.verifier\?\.status !== "verified"/);
   assert.match(script, /function bindVerifiedCompletionEvidence/);
+  assert.match(script, /function bindCompletionVerifierAsGrounding/);
+  assert.match(completionFunction, /current-page-grounding verifier/);
   assert.match(script, /discarded_unissued_ids/);
   assert.match(script, /allowVerifierEvidenceBinding:\s*false/);
   assert.match(script, /resolveAgentTurnIntent\(state\.agentSession\)/);

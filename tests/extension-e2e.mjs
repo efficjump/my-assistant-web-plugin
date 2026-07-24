@@ -247,6 +247,234 @@ try {
       firstContext.data.interactiveElements.some((element) => /Covered action|Clipped action|Offscreen action/.test(element.label || "")),
       false
     );
+    assert.ok(firstContext.data.collectionDiagnostics.wallDurationMs >= 0);
+    assert.ok(firstContext.data.collectionDiagnostics.phaseDurationsMs.interactiveElements >= 0);
+    assert.ok(firstContext.data.collectionDiagnostics.cacheHits.style > 0);
+    const observationProbe = await extensionMessage(cdp, panelSessionId, {
+      type: "VERIFY_PAGE_OBSERVATION",
+      targetTabId: firstTabId
+    });
+    assert.equal(observationProbe.ok, true);
+    assert.equal(
+      observationProbe.data.frames.find((frame) => frame.frameId === 0)?.matchesBaseline,
+      true
+    );
+    const settleStartedAt = performance.now();
+    const settledPage = await extensionMessage(cdp, panelSessionId, {
+      type: "WAIT_FOR_PAGE_SETTLE",
+      targetTabId: firstTabId,
+      options: { quietMs: 80, timeoutMs: 1000 }
+    });
+    const settleElapsedMs = performance.now() - settleStartedAt;
+    assert.equal(settledPage.ok, true);
+    assert.equal(settledPage.data.settled, true);
+    assert.equal(settledPage.data.timedOut, false);
+    assert.ok(settledPage.data.stableForMs >= 80);
+    assert.ok(
+      settledPage.data.contentElapsedMs < 1500,
+      `an already-stable page should settle without an unbounded content wait: ${settledPage.data.contentElapsedMs}ms`
+    );
+    assert.ok(
+      settleElapsedMs < 3000,
+      `the extension round trip should remain bounded around the settle timeout: ${Math.round(settleElapsedMs)}ms`
+    );
+    const navigationTargetUrl = `${origin}/page-a?navigation-source=1`;
+    const navigationTargetId = await createPage(cdp, navigationTargetUrl);
+    try {
+      const navigationSessionId = await attach(cdp, navigationTargetId);
+      await evaluate(cdp, navigationSessionId, `(() => {
+        const button = document.createElement("button");
+        button.id = "document-navigation-action";
+        button.type = "button";
+        button.textContent = "Document navigation action";
+        Object.assign(button.style, {
+          position: "fixed",
+          left: "12px",
+          top: "320px",
+          zIndex: "2147483000"
+        });
+        button.addEventListener("click", () => {
+          location.assign(${JSON.stringify(`${origin}/page-b?navigation-interrupt=1`)});
+        });
+        document.body.append(button);
+        return true;
+      })()`);
+      const navigationTabId = await queryTabId(cdp, panelSessionId, navigationTargetUrl);
+      const navigationContext = await extensionMessage(cdp, panelSessionId, {
+        type: "COLLECT_PAGE_CONTEXT",
+        targetTabId: navigationTabId,
+        options: {
+          maxTextChars: 4000,
+          maxElements: 20,
+          elementQuery: "Document navigation action",
+          redactSensitiveData: true
+        }
+      });
+      const navigationTarget = navigationContext.data.interactiveElements.find(
+        (element) => element.label === "Document navigation action"
+      );
+      assert.ok(navigationTarget?.ref);
+      const interruptedNavigation = await extensionMessage(cdp, panelSessionId, {
+        type: "EXECUTE_PAGE_ACTIONS",
+        targetTabId: navigationTabId,
+        actions: [{
+          id: "document-navigation",
+          type: "click",
+          ref: navigationTarget.ref,
+          reason: "exercise document replacement before the content response returns"
+        }]
+      });
+      assert.equal(interruptedNavigation.ok, true);
+      assert.equal(interruptedNavigation.data.results[0].ok, true);
+      if (interruptedNavigation.data.results[0].result.responseInterruptedByNavigation) {
+        assert.equal(interruptedNavigation.data.results[0].verification.documentChanged, true);
+      }
+      const navigationSettled = await extensionMessage(cdp, panelSessionId, {
+        type: "WAIT_FOR_PAGE_SETTLE",
+        targetTabId: navigationTabId,
+        options: { quietMs: 80, timeoutMs: 1200 }
+      });
+      assert.equal(navigationSettled.ok, true);
+      const navigatedContext = await extensionMessage(cdp, panelSessionId, {
+        type: "COLLECT_PAGE_CONTEXT",
+        targetTabId: navigationTabId,
+        options: { maxTextChars: 4000, maxElements: 20, redactSensitiveData: true }
+      });
+      assert.equal(new URL(navigatedContext.data.url).pathname, "/page-b");
+      await evaluate(cdp, navigationSessionId, `(() => {
+        const menuItem = document.createElement("li");
+        menuItem.setAttribute("role", "menuitem");
+        Object.assign(menuItem.style, {
+          position: "fixed",
+          left: "210px",
+          top: "320px",
+          zIndex: "2147483000"
+        });
+        const menuLink = document.createElement("a");
+        menuLink.href = ${JSON.stringify(`${origin}/page-a?composite-navigation=1`)};
+        menuLink.textContent = "Composite navigation link";
+        menuLink.style.pointerEvents = "none";
+        menuItem.append(menuLink);
+        document.body.append(menuItem);
+        return true;
+      })()`);
+      const compositeContext = await extensionMessage(cdp, panelSessionId, {
+        type: "COLLECT_PAGE_CONTEXT",
+        targetTabId: navigationTabId,
+        options: {
+          maxTextChars: 4000,
+          maxElements: 20,
+          elementQuery: "Composite navigation link",
+          redactSensitiveData: true
+        }
+      });
+      const compositeTarget = compositeContext.data.interactiveElements.find(
+        (element) => element.label === "Composite navigation link"
+      );
+      assert.equal(compositeTarget?.tag, "li");
+      assert.equal(compositeTarget.activationTag, "a");
+      assert.equal(new URL(compositeTarget.href).pathname, "/page-a");
+      const compositeNavigation = await extensionMessage(cdp, panelSessionId, {
+        type: "EXECUTE_PAGE_ACTIONS",
+        targetTabId: navigationTabId,
+        actions: [{
+          id: "composite-navigation",
+          type: "click",
+          ref: compositeTarget.ref,
+          reason: "exercise a visible semantic menu item with one nested navigation link"
+        }]
+      });
+      assert.equal(compositeNavigation.ok, true);
+      assert.equal(compositeNavigation.data.results[0].ok, true);
+      assert.equal(compositeNavigation.data.results[0].result.mayNavigate, true);
+      const compositeSettled = await extensionMessage(cdp, panelSessionId, {
+        type: "WAIT_FOR_PAGE_SETTLE",
+        targetTabId: navigationTabId,
+        options: { quietMs: 80, timeoutMs: 1200 }
+      });
+      assert.equal(compositeSettled.ok, true);
+      const compositeNavigatedContext = await poll(
+        async () => {
+          const response = await extensionMessage(cdp, panelSessionId, {
+            type: "COLLECT_PAGE_CONTEXT",
+            targetTabId: navigationTabId,
+            options: { maxTextChars: 4000, maxElements: 20, redactSensitiveData: true }
+          });
+          return response.data;
+        },
+        (context) => new URL(context.url).pathname === "/page-a",
+        5000
+      );
+      assert.equal(new URL(compositeNavigatedContext.url).pathname, "/page-a");
+    } finally {
+      await cdp.send("Target.closeTarget", { targetId: navigationTargetId }).catch(() => {});
+    }
+
+    const frameAccessStartedAt = performance.now();
+    const frameAccess = await extensionMessage(cdp, panelSessionId, {
+      type: "GET_FRAME_ORIGINS",
+      targetTabId: firstTabId
+    });
+    const frameAccessElapsedMs = performance.now() - frameAccessStartedAt;
+    assert.equal(frameAccess.ok, true);
+    assert.ok(frameAccess.data.visibleFrameCount >= 1);
+    assert.ok(
+      frameAccessElapsedMs < 3000,
+      `frame-origin discovery should stay on the lightweight boundary path: ${Math.round(frameAccessElapsedMs)}ms`
+    );
+
+    await evaluate(cdp, panelSessionId, `(async () => {
+      await chrome.scripting.executeScript({
+        target: { tabId: ${JSON.stringify(firstTabId)} },
+        func: () => {
+          const fixture = document.createElement("div");
+          fixture.id = "large-dom-fixture";
+          const action = document.createElement("button");
+          action.type = "button";
+          action.textContent = "Large DOM action";
+          action.style.position = "fixed";
+          action.style.left = "12px";
+          action.style.top = "170px";
+          action.style.zIndex = "10";
+          fixture.append(action);
+          const fragment = document.createDocumentFragment();
+          for (let index = 0; index < 8000; index += 1) {
+            const record = document.createElement("div");
+            record.textContent = \`Record \${index + 1} Value \${index + 1}\`;
+            fragment.append(record);
+          }
+          fixture.append(fragment);
+          document.body.append(fixture);
+        }
+      });
+      await new Promise((resolve) => setTimeout(resolve, 60));
+    })()`);
+    const largeDomStartedAt = performance.now();
+    const largeDomContext = await extensionMessage(cdp, panelSessionId, {
+      type: "COLLECT_PAGE_CONTEXT",
+      targetTabId: firstTabId,
+      options: { maxTextChars: 8000, maxElements: 40, redactSensitiveData: true }
+    });
+    const largeDomElapsedMs = performance.now() - largeDomStartedAt;
+    assert.equal(largeDomContext.ok, true);
+    assert.ok(
+      largeDomContext.data.interactiveElements.some((element) => element.label === "Large DOM action"),
+      "a control must remain discoverable without scanning rules tailored to the fixture"
+    );
+    assert.ok(largeDomContext.data.collectionDiagnostics.scannedElementCount >= 8000);
+    assert.ok(largeDomContext.data.collectionDiagnostics.cacheHits.rect > 0);
+    assert.ok(
+      largeDomElapsedMs < 3000,
+      `large visible-page observation exceeded the bounded performance budget: ${Math.round(largeDomElapsedMs)}ms`
+    );
+    process.stdout.write(`Large DOM context collection: ${Math.round(largeDomElapsedMs)}ms\n`);
+    await evaluate(cdp, panelSessionId, `(async () => {
+      await chrome.scripting.executeScript({
+        target: { tabId: ${JSON.stringify(firstTabId)} },
+        func: () => document.querySelector("#large-dom-fixture")?.remove()
+      });
+      await new Promise((resolve) => setTimeout(resolve, 60));
+    })()`);
 
     const panelContracts = await exercisePanelContracts({
       cdp,
@@ -432,6 +660,7 @@ try {
     assert.equal(verificationContracts.repairedStatus, "completed");
     assert.equal(verificationContracts.completionVerified, true);
     assert.equal(verificationContracts.terminalGroundingVerified, true);
+    assert.equal(verificationContracts.terminalGroundingCombined, true);
     assert.equal(verificationContracts.completionVerifierSawTurnIntent, true);
     assert.equal(verificationContracts.groundingVerifierSawTurnIntent, true);
     assert.equal(verificationContracts.completionEvidenceBound, true);
@@ -440,6 +669,7 @@ try {
     assert.equal(verificationContracts.inventedCompletionEvidenceDiscarded, true);
     assert.equal(verificationContracts.promiseReplanOccurred, true);
     assert.equal(verificationContracts.promiseCompletionVerifierCalls, 2);
+    assert.equal(verificationContracts.promiseUsedSeparateGroundingVerifier, false);
     assert.equal(verificationContracts.promiseFinalStatus, "completed");
     assert.match(verificationContracts.promiseFinalMessage, /다음과 같습니다/);
     assert.equal(verificationContracts.timelinePreservedEarlierAction, true);
@@ -480,11 +710,18 @@ try {
       tabId: firstTabId,
       context: firstContext.data
     });
+    assert.equal(turnBoundaryContracts.freshIntentModelCalls, 0);
+    assert.equal(turnBoundaryContracts.freshIntentMode, "standalone");
     assert.equal(turnBoundaryContracts.intentMode, "standalone");
     assert.equal(turnBoundaryContracts.intentRepeatPolicy, "once");
     assert.equal(turnBoundaryContracts.standaloneObjectiveStayedExact, true);
     assert.equal(turnBoundaryContracts.resolverSawFailedPriorRun, true);
     assert.equal(turnBoundaryContracts.plannerExcludedRawConversation, true);
+    assert.equal(turnBoundaryContracts.plannerContextCompacted, true);
+    assert.ok(
+      turnBoundaryContracts.formattedPageContextChars
+        < turnBoundaryContracts.rawPageContextChars
+    );
     assert.equal(turnBoundaryContracts.malformedRawHidden, true);
     assert.equal(turnBoundaryContracts.internalJsonRejected, true);
     assert.equal(turnBoundaryContracts.staleElementSearchCleared, true);
@@ -496,6 +733,21 @@ try {
     assert.equal(turnBoundaryContracts.completionEvidenceDiagnosticHidden, true);
     assert.equal(turnBoundaryContracts.elementSearchDiagnosticHidden, true);
     assert.equal(turnBoundaryContracts.providerStatusErrorPreserved, true);
+
+    const latencyFastPaths = await exerciseLatencyFastPathContracts({
+      cdp,
+      panelSessionId,
+      context: firstContext.data
+    });
+    assert.deepEqual(latencyFastPaths, {
+      normalDomScreenshotSkipped: true,
+      visualSurfaceScreenshotRetained: true,
+      explicitScreenshotRetained: true,
+      disabledScreenshotSkipped: true,
+      disclosurePolicyAllowed: true,
+      readOnlyPolicyAllowed: true,
+      unresolvedClickNeedsPolicy: true
+    });
 
     const transitionContracts = await exerciseTabTransitionContracts({ cdp, panelSessionId });
     assert.equal(transitionContracts.preservedRunningSession, true);
@@ -603,6 +855,200 @@ try {
     });
     assert.match(legacyPageContext.data.visibleText, /Legacy page 2 loaded/);
 
+    await evaluate(cdp, panelSessionId, `(async () => {
+      await chrome.scripting.executeScript({
+        target: { tabId: ${JSON.stringify(firstTabId)} },
+        world: "MAIN",
+        args: [${JSON.stringify(`${origin}/legacy-frameset`)}],
+        func: (frameUrl) => {
+          const fixture = document.createElement("div");
+          fixture.id = "legacy-compat-fixture";
+          const imageShell = document.createElement("div");
+          imageShell.id = "legacy-image-map-shell";
+          Object.assign(imageShell.style, {
+            position: "fixed",
+            left: "8px",
+            top: "8px",
+            zIndex: "2147483000",
+            width: "220px",
+            padding: "4px",
+            background: "white",
+            font: "11px sans-serif"
+          });
+          const title = document.createElement("div");
+          title.textContent = "Legacy image menu";
+          const image = document.createElement("img");
+          image.id = "legacy-image-map";
+          image.alt = "Legacy image menu";
+          image.useMap = "#legacy-image-actions";
+          image.width = 200;
+          image.height = 40;
+          image.style.display = "block";
+          image.src = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='40'%3E%3Crect width='200' height='40' fill='%23dbeafe'/%3E%3Ctext x='100' y='25' text-anchor='middle' font-size='14'%3ELegacy map action%3C/text%3E%3C/svg%3E";
+          const map = document.createElement("map");
+          map.name = "legacy-image-actions";
+          const area = document.createElement("area");
+          area.shape = "rect";
+          area.coords = "0,0,200,40";
+          area.href = "javascript:void(0)";
+          area.alt = "Legacy image map action";
+          area.setAttribute("onclick", "legacyMapAction(); return false;");
+          map.append(area);
+          const status = document.createElement("div");
+          status.id = "legacy-image-map-status";
+          status.setAttribute("role", "status");
+          status.textContent = "Legacy image map ready";
+          imageShell.append(title, image, map, status);
+
+          const frame = document.createElement("iframe");
+          frame.id = "legacy-frameset";
+          frame.title = "Legacy frameset";
+          frame.src = frameUrl;
+          Object.assign(frame.style, {
+            position: "fixed",
+            left: "250px",
+            top: "8px",
+            zIndex: "2147483000",
+            width: "280px",
+            height: "96px",
+            background: "white"
+          });
+          fixture.append(imageShell, frame);
+          document.body.append(fixture);
+          window.legacyMapAction = () => {
+            document.querySelector("#legacy-image-map-status").textContent = "Legacy image map complete";
+          };
+        }
+      });
+      await new Promise((resolve) => setTimeout(resolve, 240));
+    })()`);
+    const legacyImageMapContext = await extensionMessage(cdp, panelSessionId, {
+      type: "COLLECT_PAGE_CONTEXT",
+      targetTabId: firstTabId,
+      options: {
+        maxTextChars: 8000,
+        maxElements: 20,
+        elementQuery: "Legacy image map action",
+        elementRoles: ["link"],
+        elementNearText: "Legacy image menu",
+        redactSensitiveData: true
+      }
+    });
+    const legacyImageMapAction = legacyImageMapContext.data.interactiveElements.find(
+      (element) => element.label === "Legacy image map action"
+    );
+    assert.equal(legacyImageMapAction?.tag, "area");
+    assert.ok(legacyImageMapAction?.rect?.width > 0);
+    assert.ok(legacyImageMapAction?.hitPoint);
+    const legacyImageMapResult = await extensionMessage(cdp, panelSessionId, {
+      type: "EXECUTE_PAGE_ACTIONS",
+      targetTabId: firstTabId,
+      actions: [{
+        id: "legacy-image-map-action",
+        type: "click",
+        ref: legacyImageMapAction.ref,
+        reason: "exercise a visible legacy image-map control"
+      }]
+    });
+    assert.equal(legacyImageMapResult.ok, true);
+    assert.equal(
+      legacyImageMapResult.data.results[0].ok,
+      true,
+      JSON.stringify(legacyImageMapResult.data.results[0])
+    );
+    assert.equal(
+      legacyImageMapResult.data.results[0].result.activation,
+      "page-owned-legacy-handler"
+    );
+    const legacyImageMapDomStatus = await evaluate(cdp, panelSessionId, `(async () => {
+      const [result] = await chrome.scripting.executeScript({
+        target: { tabId: ${JSON.stringify(firstTabId)} },
+        func: () => {
+          const element = document.querySelector("#legacy-image-map-status");
+          const rect = element?.getBoundingClientRect();
+          const point = rect ? { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 } : null;
+          const hit = point ? document.elementFromPoint(point.x, point.y) : null;
+          return {
+            text: element?.textContent || "",
+            rect: rect ? { x: rect.x, y: rect.y, width: rect.width, height: rect.height } : null,
+            hit: hit?.id || hit?.tagName || ""
+          };
+        }
+      });
+      return result?.result || null;
+    })()`);
+    assert.equal(
+      legacyImageMapDomStatus?.text,
+      "Legacy image map complete",
+      JSON.stringify(legacyImageMapResult.data.results[0])
+    );
+    const legacyImageMapVerified = await extensionMessage(cdp, panelSessionId, {
+      type: "COLLECT_PAGE_CONTEXT",
+      targetTabId: firstTabId,
+      options: { maxTextChars: 8000, maxElements: 40, redactSensitiveData: true }
+    });
+    assert.match(
+      legacyImageMapVerified.data.visibleText,
+      /Legacy image map complete/,
+      JSON.stringify(legacyImageMapDomStatus)
+    );
+
+    const legacyFrameContext = await extensionMessage(cdp, panelSessionId, {
+      type: "COLLECT_PAGE_CONTEXT",
+      targetTabId: firstTabId,
+      options: {
+        maxTextChars: 8000,
+        maxElements: 20,
+        elementQuery: "Legacy legacy-left action",
+        elementRoles: ["button"],
+        redactSensitiveData: true
+      }
+    });
+    const legacyFrameAction = legacyFrameContext.data.interactiveElements.find(
+      (element) => element.label === "Legacy legacy-left action"
+    );
+    assert.ok(
+      legacyFrameAction?.frameId > 0,
+      `named duplicate-URL <frame> content should map to a browser frame: ${JSON.stringify(
+        legacyFrameContext.data.automationCapabilities.frames
+      )}`
+    );
+    assert.equal(
+      JSON.stringify(legacyFrameContext.data).includes("frameNameBinding"),
+      false,
+      "the raw frame-name binding must remain internal to frame resolution"
+    );
+    assert.match(legacyFrameAction.scope || "", /top/);
+    const legacyFrameResult = await extensionMessage(cdp, panelSessionId, {
+      type: "EXECUTE_PAGE_ACTIONS",
+      targetTabId: firstTabId,
+      actions: [{
+        id: "legacy-frame-action",
+        type: "click",
+        ref: legacyFrameAction.ref,
+        reason: "exercise a named legacy frame with a duplicate navigation URL"
+      }]
+    });
+    assert.equal(legacyFrameResult.ok, true);
+    assert.equal(legacyFrameResult.data.results[0].ok, true);
+    const legacyFrameVerified = await extensionMessage(cdp, panelSessionId, {
+      type: "COLLECT_PAGE_CONTEXT",
+      targetTabId: firstTabId,
+      options: { maxTextChars: 8000, maxElements: 40, redactSensitiveData: true }
+    });
+    assert.match(legacyFrameVerified.data.visibleText, /Legacy legacy-left complete/);
+    await evaluate(cdp, panelSessionId, `(async () => {
+      await chrome.scripting.executeScript({
+        target: { tabId: ${JSON.stringify(firstTabId)} },
+        world: "MAIN",
+        func: () => {
+          document.querySelector("#legacy-compat-fixture")?.remove();
+          delete window.legacyMapAction;
+        }
+      });
+      await new Promise((resolve) => setTimeout(resolve, 80));
+    })()`);
+
     const limitedContext = await extensionMessage(cdp, panelSessionId, {
       type: "COLLECT_PAGE_CONTEXT",
       targetTabId: firstTabId,
@@ -667,8 +1113,11 @@ try {
       queriedElements.data.interactiveElements.some((element) => element.label === "Dense grid next page"),
       "goal-derived visible-element search should find the paginator without a page-specific hardcoded rule"
     );
+    assert.equal(queriedElements.data.elementDiscovery.availableTotalExact, false);
+    assert.equal(queriedElements.data.elementDiscovery.availableTotal, null);
     assert.ok(
-      queriedElements.data.elementDiscovery.availableTotal > queriedElements.data.elementDiscovery.total
+      queriedElements.data.elementDiscovery.potentialTotal
+        > queriedElements.data.elementDiscovery.total
     );
     assert.deepEqual(queriedElements.data.elementDiscovery.search, {
       query: "Dense grid next page",
@@ -1210,17 +1659,17 @@ try {
           ...operation,
           actions: operation.actions.map((action) => ({
             ...action,
-            reason: "공유된 테스트 페이지의 비민감성 입력란을 변경합니다."
+            reason: "Change a non-sensitive field on the shared test page."
           })),
           policy: {
             ...(operation.policy || {}),
-            message: "확장 프로그램의 정책 검증 결과, 공유된 페이지의 상태 변경에 명시적인 승인이 필요합니다."
+            message: "The extension policy requires explicit approval for this shared-page state change."
           }
         }));
         renderExternalApprovalPanel();
         closeSettings();
         hideRestrictedPage();
-        elements.statusLine.textContent = "Bridge · 테스트 탭 공유 중";
+        elements.statusLine.textContent = "Bridge · Sharing test tab";
         elements.externalApprovalPanel.scrollIntoView({ block: "start" });
         await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
         return true;
@@ -1339,6 +1788,9 @@ try {
         firstTargetId,
         panelSessionId,
       });
+    }
+    if (process.env.WEB_PLUGIN_LIVE_URL) {
+      await runConfiguredLiveSiteSmoke({ cdp, panelSessionId });
     }
 
     const detachedBridge = await extensionMessage(cdp, panelSessionId, {
@@ -1572,6 +2024,30 @@ async function startFixtureServer() {
     response.setHeader("content-type", "text/html; charset=utf-8");
     if (request.url?.startsWith("/frame")) {
       response.end(`<!doctype html><html><body><label for="frame-name">Frame Name</label><input id="frame-name"></body></html>`);
+      return;
+    }
+    if (request.url?.startsWith("/legacy-frameset")) {
+      response.end(`<!doctype html><html><head><title>Legacy frameset</title></head>
+        <frameset cols="50%,50%">
+          <frame name="legacy-left" src="/legacy-frame">
+          <frame name="legacy-right" src="/legacy-frame">
+        </frameset>
+      </html>`);
+      return;
+    }
+    if (request.url?.startsWith("/legacy-frame")) {
+      response.end(`<!doctype html><html><body style="margin:4px;font:11px sans-serif">
+        <button id="legacy-frame-action" type="button"></button>
+        <div id="legacy-frame-status" role="status"></div>
+        <script>
+          const label = 'Legacy ' + window.name;
+          document.querySelector('#legacy-frame-action').textContent = label + ' action';
+          document.querySelector('#legacy-frame-status').textContent = label + ' ready';
+          document.querySelector('#legacy-frame-action').addEventListener('click', () => {
+            document.querySelector('#legacy-frame-status').textContent = label + ' complete';
+          });
+        </script>
+      </body></html>`);
       return;
     }
     const second = request.url?.startsWith("/page-b");
@@ -2689,6 +3165,23 @@ async function exerciseTurnBoundaryContracts({ cdp, panelSessionId, tabId, conte
         }]
       };
       state.lastContext = currentContext;
+      state.conversation = [{
+        role: "user",
+        text: "현재 화면을 요약해줘.",
+        tone: "",
+        kind: "",
+        taskStatus: ""
+      }];
+      state.evaluationLogs = [];
+      state.agentRunUi = null;
+      createAgentSession("현재 화면을 요약해줘.");
+      let freshIntentModelCalls = 0;
+      requestAiDecision = async () => {
+        freshIntentModelCalls += 1;
+        throw new Error("a fresh standalone request must not need a model intent round trip");
+      };
+      const freshIntent = await resolveAgentTurnIntent(state.agentSession);
+
       state.conversation = [
         {
           role: "user",
@@ -2901,6 +3394,8 @@ async function exerciseTurnBoundaryContracts({ cdp, panelSessionId, tabId, conte
       );
 
       return {
+        freshIntentModelCalls,
+        freshIntentMode: freshIntent.mode,
         intentMode: intent.mode,
         intentRepeatPolicy: intent.repeatPolicy,
         standaloneObjectiveStayedExact: intent.objective
@@ -2909,6 +3404,12 @@ async function exerciseTurnBoundaryContracts({ cdp, panelSessionId, tabId, conte
           && intentRequest?.user.includes('"taskStatus": "failed"'),
         plannerExcludedRawConversation: plannerPrompt.includes("Resolved turn intent JSON")
           && !plannerPrompt.includes("다음 페이지로 넘겨서 내용을 확인해줘."),
+        plannerContextCompacted: plannerPrompt.includes("Current page context JSON")
+          && !plannerPrompt.includes('"documentTextExcerpt"')
+          && !plannerPrompt.includes('"collectionDiagnostics"')
+          && !plannerPrompt.includes('"payload":'),
+        rawPageContextChars: JSON.stringify(currentContext).length,
+        formattedPageContextChars: JSON.stringify(formatPageContextForPrompt(currentContext)).length,
         malformedRawHidden: !malformedText.includes('{"status"')
           && malformedValidation.valid === false,
         internalJsonRejected: internalJsonValidation.valid === false,
@@ -2949,6 +3450,85 @@ async function exerciseTurnBoundaryContracts({ cdp, panelSessionId, tabId, conte
         });
       }
       updateAgentButtons();
+    }
+  })()`);
+}
+
+async function exerciseLatencyFastPathContracts({ cdp, panelSessionId, context }) {
+  return evaluate(cdp, panelSessionId, `(() => {
+    const originalRuntimeSettings = structuredClone(state.runtimeSettings);
+    try {
+      state.runtimeSettings = {
+        ...state.settings,
+        includeScreenshot: true
+      };
+      const domContext = {
+        ...structuredClone(${JSON.stringify(context)}),
+        visibleText: "Visible navigation",
+        forms: [],
+        tables: [],
+        visualSurfaces: [],
+        automationCapabilities: {
+          ...structuredClone(${JSON.stringify(context.automationCapabilities || {})}),
+          gaps: []
+        },
+        interactiveElements: [{
+          ref: "menu-disclosure",
+          scope: "main",
+          tag: "button",
+          role: "menuitem",
+          type: "button",
+          label: "Operations",
+          ariaExpanded: "false",
+          disabled: false,
+          actionability: "interactive"
+        }]
+      };
+      const disclosureDecision = {
+        status: "continue",
+        toolCalls: [],
+        actions: [{ id: "open-menu", type: "click", ref: "menu-disclosure" }]
+      };
+      const readOnlyDecision = {
+        status: "continue",
+        toolCalls: [],
+        actions: [{ id: "read-down", type: "scroll", direction: "down" }]
+      };
+      const unresolvedClickDecision = {
+        status: "continue",
+        toolCalls: [],
+        actions: [{ id: "unknown-click", type: "click", ref: "missing" }]
+      };
+      const normalDomScreenshotSkipped = shouldCaptureDecisionScreenshot(domContext) === false;
+      const visualSurfaceScreenshotRetained = shouldCaptureDecisionScreenshot({
+        ...domContext,
+        visualSurfaces: [{ ref: "v1", kind: "canvas" }]
+      }) === true;
+      const explicitScreenshotRetained = shouldCaptureDecisionScreenshot(
+        domContext,
+        { requireScreenshot: true }
+      ) === true;
+      state.runtimeSettings.includeScreenshot = false;
+      const disabledScreenshotSkipped = shouldCaptureDecisionScreenshot({
+        ...domContext,
+        visualSurfaces: [{ ref: "v1", kind: "canvas" }]
+      }) === false;
+      state.runtimeSettings.includeScreenshot = true;
+
+      return {
+        normalDomScreenshotSkipped,
+        visualSurfaceScreenshotRetained,
+        explicitScreenshotRetained,
+        disabledScreenshotSkipped,
+        disclosurePolicyAllowed:
+          buildDeterministicLowRiskPolicy(disclosureDecision, domContext)?.verdict === "allow",
+        readOnlyPolicyAllowed:
+          buildDeterministicLowRiskPolicy(readOnlyDecision, domContext)?.verdict === "allow",
+        unresolvedClickNeedsPolicy:
+          buildDeterministicLowRiskPolicy(unresolvedClickDecision, domContext) === null
+      };
+    } finally {
+      state.runtimeSettings = originalRuntimeSettings;
     }
   })()`);
 }
@@ -3342,6 +3922,8 @@ async function exerciseAgentVerificationContracts({ cdp, panelSessionId, tabId, 
         repairedStatus: repairedDecision.status,
         completionVerified: repairedDecision.verifier?.status === "verified",
         terminalGroundingVerified: repairedDecision.grounding?.status === "verified",
+        terminalGroundingCombined:
+          repairedDecision.grounding?.combinedWithCompletionVerification === true,
         completionVerifierSawTurnIntent,
         groundingVerifierSawTurnIntent,
         completionEvidenceBound: repairedDecision.completionEvidence.length === 1
@@ -3351,6 +3933,9 @@ async function exerciseAgentVerificationContracts({ cdp, panelSessionId, tabId, 
         inventedCompletionEvidenceDiscarded,
         promiseReplanOccurred: promisePurposes.includes("verification-replan"),
         promiseCompletionVerifierCalls: completionVerifierCalls,
+        promiseUsedSeparateGroundingVerifier: promisePurposes.some(
+          (purpose) => purpose.startsWith("answer-grounding-")
+        ),
         promiseFinalMessage: promiseRepairedDecision.message,
         promiseFinalStatus: promiseRepairedDecision.status,
         timelinePreservedEarlierAction,
@@ -3471,6 +4056,275 @@ async function exerciseTabTransitionContracts({ cdp, panelSessionId }) {
   })()`);
 }
 
+async function runConfiguredLiveSiteSmoke({ cdp, panelSessionId }) {
+  const url = new URL(process.env.WEB_PLUGIN_LIVE_URL);
+  const username = String(process.env.WEB_PLUGIN_LIVE_USERNAME || "");
+  const password = String(process.env.WEB_PLUGIN_LIVE_PASSWORD || "");
+  assert.ok(username, "WEB_PLUGIN_LIVE_USERNAME is required with WEB_PLUGIN_LIVE_URL.");
+  assert.ok(password, "WEB_PLUGIN_LIVE_PASSWORD is required with WEB_PLUGIN_LIVE_URL.");
+  const steps = parseConfiguredLiveSteps(process.env.WEB_PLUGIN_LIVE_STEPS || "[]");
+  assert.ok(steps.length, "WEB_PLUGIN_LIVE_STEPS must contain at least one visible label.");
+
+  const targetId = await createPage(cdp, url.href);
+  try {
+    const tabId = await queryTabId(cdp, panelSessionId, url.origin);
+    assert.ok(tabId, `No browser tab was found for the configured live origin ${url.origin}.`);
+    await evaluate(cdp, panelSessionId, `chrome.tabs.update(${JSON.stringify(tabId)}, { active: true })`);
+
+    const loginContext = await poll(
+      async () => collectLivePageContext(cdp, panelSessionId, tabId),
+      (context) => Boolean(
+        findLivePasswordTarget(context)
+        && findLiveUsernameTarget(context)
+        && findLiveSubmitTarget(context)
+      ),
+      15_000
+    );
+    const usernameTarget = findLiveUsernameTarget(loginContext);
+    const passwordTarget = findLivePasswordTarget(loginContext);
+    const submitTarget = findLiveSubmitTarget(loginContext);
+    const loginStartedAt = performance.now();
+    const loginResult = await extensionMessage(cdp, panelSessionId, {
+      type: "EXECUTE_PAGE_ACTIONS",
+      targetTabId: tabId,
+      actions: [
+        { id: "live-username", type: "fill", ref: usernameTarget.ref, value: username },
+        { id: "live-password", type: "fill", ref: passwordTarget.ref, value: password },
+        { id: "live-submit", type: "click", ref: submitTarget.ref }
+      ]
+    });
+    assert.equal(loginResult.ok, true, loginResult.error?.message || "Live login execution failed.");
+    assert.equal(
+      loginResult.data.results.every((result) => result.ok),
+      true,
+      JSON.stringify(loginResult.data.results)
+    );
+    const loginSettle = await extensionMessage(cdp, panelSessionId, {
+      type: "WAIT_FOR_PAGE_SETTLE",
+      targetTabId: tabId,
+      options: { quietMs: 180, timeoutMs: 4000 }
+    });
+    assert.equal(loginSettle.ok, true);
+    const firstStepLabel = steps[0].label;
+    const authenticatedContext = await poll(
+      async () => collectLivePageContext(cdp, panelSessionId, tabId, {
+        elementQuery: firstStepLabel,
+        maxElements: 80
+      }),
+      (context) => !findLivePasswordTarget(context) && Boolean(findLiveStepTarget(context, steps[0])),
+      15_000
+    );
+    const loginElapsedMs = Math.round(performance.now() - loginStartedAt);
+    const stepResults = [];
+    let currentContext = authenticatedContext;
+
+    for (const [index, step] of steps.entries()) {
+      const observedAt = performance.now();
+      currentContext = await collectLivePageContext(cdp, panelSessionId, tabId, {
+        elementQuery: step.label,
+        elementRoles: step.role ? [step.role] : [],
+        maxElements: 80
+      });
+      const observeMs = Math.round(performance.now() - observedAt);
+      const target = findLiveStepTarget(currentContext, step);
+      assert.ok(
+        target?.ref,
+        `Live step ${index + 1} could not find a visible target labelled "${step.label}".`
+      );
+
+      const actionStartedAt = performance.now();
+      const actionResult = await extensionMessage(cdp, panelSessionId, {
+        type: "EXECUTE_PAGE_ACTIONS",
+        targetTabId: tabId,
+        actions: [{
+          id: `live-step-${index + 1}`,
+          type: "click",
+          ref: target.ref,
+          reason: "Configured live-site semantic navigation smoke test"
+        }]
+      });
+      const actionMs = Math.round(performance.now() - actionStartedAt);
+      assert.equal(actionResult.ok, true, actionResult.error?.message || `Live step ${index + 1} failed.`);
+      assert.equal(
+        actionResult.data.results[0]?.ok,
+        true,
+        JSON.stringify(actionResult.data.results[0])
+      );
+
+      const settleStartedAt = performance.now();
+      const settleResult = await extensionMessage(cdp, panelSessionId, {
+        type: "WAIT_FOR_PAGE_SETTLE",
+        targetTabId: tabId,
+        options: {
+          quietMs: actionResult.data.results[0]?.result?.mayNavigate ? 240 : 120,
+          timeoutMs: 4000
+        }
+      });
+      const settleMs = Math.round(performance.now() - settleStartedAt);
+      assert.equal(settleResult.ok, true);
+      currentContext = await collectLivePageContext(cdp, panelSessionId, tabId);
+      process.stdout.write(
+        `Configured live-site step ${index + 1}: ${JSON.stringify({
+          label: step.label,
+          target: {
+            tag: target.tag || "",
+            role: target.role || "",
+            href: target.href ? readUrlPath(target.href) : ""
+          },
+          result: actionResult.data.results[0]?.result || null,
+          verification: actionResult.data.results[0]?.verification || null,
+          path: readUrlPath(currentContext.url),
+          observeMs,
+          actionMs,
+          settleMs
+        })}\n`
+      );
+      if (step.path) {
+        currentContext = await poll(
+          async () => collectLivePageContext(cdp, panelSessionId, tabId),
+          (context) => readUrlPath(context.url) === step.path,
+          15_000
+        );
+      }
+      stepResults.push({
+        label: step.label,
+        target: `${target.tag || ""}/${target.role || ""}`,
+        path: readUrlPath(currentContext.url),
+        observeMs,
+        actionMs,
+        settleMs,
+        stableForMs: settleResult.data.stableForMs
+      });
+    }
+
+    process.stdout.write(
+      `Configured live-site extension smoke passed: login=${loginElapsedMs}ms, steps=${JSON.stringify(stepResults)}\n`
+    );
+  } finally {
+    await cdp.send("Target.closeTarget", { targetId }).catch(() => {});
+  }
+}
+
+function parseConfiguredLiveSteps(value) {
+  let parsed;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw new Error("WEB_PLUGIN_LIVE_STEPS must be a JSON array.");
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error("WEB_PLUGIN_LIVE_STEPS must be a JSON array.");
+  }
+  return parsed.map((item, index) => {
+    const source = typeof item === "string" ? { label: item } : item;
+    const label = String(source?.label || "").trim();
+    if (!label) {
+      throw new Error(`WEB_PLUGIN_LIVE_STEPS[${index}] requires a label.`);
+    }
+    const pathValue = String(source?.path || "").trim();
+    if (pathValue && !pathValue.startsWith("/")) {
+      throw new Error(`WEB_PLUGIN_LIVE_STEPS[${index}].path must start with "/".`);
+    }
+    return {
+      label,
+      role: String(source?.role || "").trim().toLowerCase(),
+      path: pathValue
+    };
+  });
+}
+
+async function collectLivePageContext(cdp, panelSessionId, tabId, options = {}) {
+  const response = await extensionMessage(cdp, panelSessionId, {
+    type: "COLLECT_PAGE_CONTEXT",
+    targetTabId: tabId,
+    options: {
+      maxTextChars: 12_000,
+      maxElements: options.maxElements || 120,
+      elementQuery: options.elementQuery || "",
+      elementRoles: options.elementRoles || [],
+      redactSensitiveData: true
+    }
+  });
+  if (!response?.ok) {
+    throw new Error(response?.error?.message || "Live page observation failed.");
+  }
+  return response.data;
+}
+
+function findLiveUsernameTarget(context) {
+  const candidates = (context?.interactiveElements || []).filter((target) => {
+    const type = String(target.type || "text").toLowerCase();
+    return target.tag === "input"
+      && ["", "text", "email", "tel"].includes(type)
+      && !target.disabled;
+  });
+  return candidates
+    .map((target, index) => ({
+      target,
+      index,
+      score: [
+        String(target.autocomplete || "").toLowerCase() === "username" ? 8 : 0,
+        /user|account|login|email|아이디|사용자|계정/i.test(
+          [target.label, target.name, target.placeholder].filter(Boolean).join(" ")
+        ) ? 5 : 0,
+        String(target.type || "").toLowerCase() === "email" ? 2 : 0
+      ].reduce((sum, value) => sum + value, 0)
+    }))
+    .sort((left, right) => right.score - left.score || left.index - right.index)[0]?.target || null;
+}
+
+function findLivePasswordTarget(context) {
+  return (context?.interactiveElements || []).find((target) => (
+    target.tag === "input"
+    && String(target.type || "").toLowerCase() === "password"
+    && !target.disabled
+  )) || null;
+}
+
+function findLiveSubmitTarget(context) {
+  const candidates = (context?.interactiveElements || []).filter((target) => (
+    !target.disabled
+    && (
+      target.tag === "button"
+      || (target.tag === "input" && ["button", "submit"].includes(String(target.type || "").toLowerCase()))
+    )
+  ));
+  return candidates
+    .map((target, index) => ({
+      target,
+      index,
+      score: [
+        String(target.type || "").toLowerCase() === "submit" ? 6 : 0,
+        /sign.?in|log.?in|로그인|접속/i.test(String(target.label || "")) ? 5 : 0
+      ].reduce((sum, value) => sum + value, 0)
+    }))
+    .filter((candidate) => candidate.score > 0)
+    .sort((left, right) => right.score - left.score || left.index - right.index)[0]?.target || null;
+}
+
+function findLiveStepTarget(context, step) {
+  const expected = normalizeLiveLabel(step.label);
+  const candidates = (context?.interactiveElements || []).filter((target) => (
+    !target.disabled
+    && (!step.role || String(target.role || "").toLowerCase() === step.role)
+  ));
+  return candidates.find((target) => normalizeLiveLabel(target.label) === expected)
+    || candidates.find((target) => normalizeLiveLabel(target.label).includes(expected))
+    || null;
+}
+
+function normalizeLiveLabel(value) {
+  return String(value || "").replace(/\s+/gu, " ").trim().toLocaleLowerCase();
+}
+
+function readUrlPath(value) {
+  try {
+    return new URL(value).pathname;
+  } catch {
+    return "";
+  }
+}
+
 async function extensionMessage(cdp, sessionId, message) {
   return evaluate(cdp, sessionId, `chrome.runtime.sendMessage(${JSON.stringify(message)})`);
 }
@@ -3489,18 +4343,52 @@ async function readInputValue(cdp, targetId) {
 }
 
 async function capturePanelScreenshot(cdp, panelSessionId, filename) {
-  await cdp.send("Emulation.setDeviceMetricsOverride", {
-    width: 420,
-    height: 900,
-    deviceScaleFactor: 1,
-    mobile: false,
-  }, panelSessionId);
-  const { data } = await cdp.send("Page.captureScreenshot", {
-    format: "png",
-    fromSurface: true,
-    captureBeyondViewport: false,
-  }, panelSessionId);
-  await writeFile(path.join(root, "docs", "assets", filename), Buffer.from(data, "base64"));
+  const languageSnapshot = await evaluate(cdp, panelSessionId, `(async () => {
+    const snapshot = {
+      settingsLanguage: state.settings.uiLanguage,
+      runtimeLanguage: state.runtimeSettings?.uiLanguage
+    };
+    state.settings = { ...state.settings, uiLanguage: "en" };
+    state.runtimeSettings = { ...(state.runtimeSettings || state.settings), uiLanguage: "en" };
+    applySettingsToForm();
+    applyUiLanguage();
+    renderBridgeStatus();
+    renderExternalApprovalPanel();
+    renderSettingsOverview();
+    applyUiLanguage();
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    return snapshot;
+  })()`);
+  try {
+    await cdp.send("Emulation.setDeviceMetricsOverride", {
+      width: 420,
+      height: 900,
+      deviceScaleFactor: 1,
+      mobile: false,
+    }, panelSessionId);
+    const { data } = await cdp.send("Page.captureScreenshot", {
+      format: "png",
+      fromSurface: true,
+      captureBeyondViewport: false,
+    }, panelSessionId);
+    await writeFile(path.join(root, "docs", "assets", filename), Buffer.from(data, "base64"));
+  } finally {
+    await evaluate(cdp, panelSessionId, `(() => {
+      const snapshot = ${JSON.stringify(languageSnapshot)};
+      state.settings = { ...state.settings, uiLanguage: snapshot.settingsLanguage };
+      state.runtimeSettings = {
+        ...(state.runtimeSettings || state.settings),
+        uiLanguage: snapshot.runtimeLanguage
+      };
+      applySettingsToForm();
+      applyUiLanguage();
+      renderBridgeStatus();
+      renderExternalApprovalPanel();
+      renderSettingsOverview();
+      applyUiLanguage();
+      return true;
+    })()`);
+  }
 }
 
 async function captureWebCompatibilityDocs(cdp, panelSessionId, context) {
@@ -3524,7 +4412,7 @@ async function captureWebCompatibilityDocs(cdp, panelSessionId, context) {
     hideRestrictedPage();
     openContext();
     renderContextPanel(sanitized);
-    elements.contextStatus.textContent = "실제 브라우저 검증 컨텍스트";
+    elements.contextStatus.textContent = "Real-browser verification context";
     document.querySelector(".context-body")?.scrollTo({ top: 0 });
     await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
     return true;
@@ -3553,11 +4441,11 @@ async function captureTemplateManagerDocs(cdp, panelSessionId) {
     };
     state.settings.taskTemplates = [{
       id: "custom-release-check",
-      title: "배포 전 점검",
-      prompt: "현재 화면에서 배포 전 확인할 항목과 위험을 정리해줘."
+      title: "Pre-release review",
+      prompt: "Summarize the checks and risks visible on the current page before release."
     }];
     elements.chatInput.value = "";
-    elements.statusLine.textContent = "선택한 템플릿 편집 중";
+    elements.statusLine.textContent = "Editing the selected template";
     hideRestrictedPage();
     closeUtilityMenu();
     renderTemplateSelect("custom-release-check");
@@ -3583,23 +4471,23 @@ async function captureTemplateManagerDocs(cdp, panelSessionId) {
 
 async function captureAgentPanelDocs(cdp, panelSessionId) {
   const markdownDemo = [
-    "## 화면 확인 결과",
+    "## Current page review",
     "",
-    "**요약:** 현재 화면 기준이며, *추가 확인*이 필요한 항목도 함께 표시했습니다.",
+    "**Summary:** This result reflects the current page and marks items that *need follow-up*.",
     "",
-    "| 항목 | 상태 |",
+    "| Item | Status |",
     "| --- | --- |",
-    "| 로그인 상태 | 확인됨 |",
-    "| 미처리 요청 | 3건 |",
+    "| Signed-in state | Verified |",
+    "| Pending requests | 3 |",
     "",
-    "- [x] 현재 화면 관찰",
-    "- [ ] 미처리 요청 상세 확인",
+    "- [x] Observe the current page",
+    "- [ ] Review pending-request details",
     "",
-    "> 화면에 표시된 정보만 결과에 포함했습니다.",
+    "> The result includes only information shown on the page.",
     "",
-    "~~이전 상태~~ 대신 현재 관찰 결과를 사용했습니다.",
+    "The current observation replaces the ~~previous state~~.",
     "",
-    "`다음 페이지` 조작은 아직 실행하지 않았습니다."
+    "The `next page` action has not been run."
   ].join("\n");
   await evaluate(cdp, panelSessionId, `(async () => {
     globalThis.__agentPanelCaptureSnapshot = {
@@ -3623,7 +4511,7 @@ async function captureAgentPanelDocs(cdp, panelSessionId) {
     state.runtimeSettings = { ...state.settings };
     applyActiveTabSummary({ id: 1, title: "Example dashboard", url: "https://fixture.invalid/dashboard" });
     state.conversation = [
-      { role: "user", text: "현재 화면에서 확인할 항목을 표로 정리해줘." },
+      { role: "user", text: "Summarize the current-page checks in a table." },
       { role: "assistant", text: ${JSON.stringify(markdownDemo)} }
     ];
     elements.messageList.replaceChildren();
@@ -3640,7 +4528,7 @@ async function captureAgentPanelDocs(cdp, panelSessionId) {
     renderExternalApprovalPanel();
     hideRestrictedPage();
     updateStatusBadges();
-    setStatusLine("요청을 기다리는 중");
+    setStatusLine("Waiting for a request");
     await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
     return true;
   })()`);
@@ -3701,7 +4589,7 @@ async function captureSettingsOverviewDocs(cdp, panelSessionId) {
     applyUiLanguage();
     openSettings();
     activateSettingsTab("general");
-    setSettingsStatus("모든 변경 내용이 저장되었습니다.");
+    setSettingsStatus("All changes have been saved.");
     renderSettingsOverview();
     document.querySelector(".settings-body")?.scrollTo({ top: 0 });
     await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
@@ -3709,17 +4597,6 @@ async function captureSettingsOverviewDocs(cdp, panelSessionId) {
   })()`);
   try {
     await capturePanelScreenshot(cdp, panelSessionId, "settings-overview.png");
-    await evaluate(cdp, panelSessionId, `(async () => {
-      state.settings = { ...state.settings, uiLanguage: "en" };
-      state.runtimeSettings = { ...state.runtimeSettings, uiLanguage: "en" };
-      applySettingsToForm();
-      applyUiLanguage();
-      renderSettingsOverview();
-      document.querySelector(".settings-body")?.scrollTo({ top: 0 });
-      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-      return true;
-    })()`);
-    await capturePanelScreenshot(cdp, panelSessionId, "language-settings-en.png");
   } finally {
     await evaluate(cdp, panelSessionId, `(() => {
       const snapshot = globalThis.__settingsCaptureSnapshot;
