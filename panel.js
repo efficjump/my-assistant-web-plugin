@@ -158,6 +158,7 @@ const elements = {
   restrictedRefreshButton: document.getElementById("restrictedRefreshButton"),
   conversationWorkspace: document.getElementById("conversationWorkspace"),
   messageList: document.getElementById("messageList"),
+  activityDock: document.getElementById("activityDock"),
   approvalStack: document.getElementById("approvalStack"),
   approvalPanel: document.getElementById("approvalPanel"),
   approvalSummary: document.getElementById("approvalSummary"),
@@ -931,7 +932,7 @@ function resetTabScopedState() {
   state.conversation = [];
   state.currentPlan = null;
   state.agentSession = null;
-  state.agentRunUi = null;
+  clearRunTimeline();
   state.lastContext = null;
   state.pickedElement = null;
   state.undoStack = [];
@@ -3072,11 +3073,17 @@ function validateResolvedTurnIntentResponse(responseText, latestUserMessage) {
 }
 
 function startRunTimeline(task) {
-  const article = document.createElement("article");
-  article.className = "message assistant timeline-message";
+  clearRunTimeline();
 
-  const bubble = document.createElement("div");
-  bubble.className = "message-bubble activity-card";
+  const article = document.createElement("details");
+  article.className = "activity-card";
+  article.dataset.status = "pending";
+
+  const summaryControl = document.createElement("summary");
+  summaryControl.className = "activity-summary-control";
+
+  const summaryContent = document.createElement("span");
+  summaryContent.className = "activity-summary-content";
 
   const header = document.createElement("div");
   header.className = "activity-header";
@@ -3087,8 +3094,34 @@ function startRunTimeline(task) {
   const summary = document.createElement("span");
   summary.className = "activity-summary";
   summary.textContent = truncate(task, 72);
+  summary.title = task;
 
   header.append(title, summary);
+
+  const current = document.createElement("span");
+  current.className = "activity-current";
+  current.setAttribute("role", "status");
+  current.setAttribute("aria-live", "polite");
+  current.setAttribute("aria-atomic", "true");
+
+  const currentDot = document.createElement("span");
+  currentDot.className = "activity-current-dot";
+  currentDot.setAttribute("aria-hidden", "true");
+
+  const currentPhase = document.createElement("strong");
+  const currentSeparator = document.createElement("span");
+  currentSeparator.className = "activity-current-separator";
+  currentSeparator.textContent = "·";
+  currentSeparator.setAttribute("aria-hidden", "true");
+  const currentDetail = document.createElement("span");
+  currentDetail.className = "activity-current-detail";
+
+  const progress = document.createElement("span");
+  progress.className = "activity-progress";
+
+  current.append(currentDot, currentPhase, currentSeparator, currentDetail, progress);
+  summaryContent.append(header, current);
+  summaryControl.append(summaryContent);
 
   const list = document.createElement("ol");
   list.className = "activity-list";
@@ -3118,12 +3151,21 @@ function startRunTimeline(task) {
     phaseElements[key] = { item, name, detail, detailSource: "대기 중" };
   }
 
-  bubble.append(header, list);
-  article.append(bubble);
-  elements.messageList.append(article);
+  article.append(summaryControl, list);
+  elements.activityDock.append(article);
+  elements.activityDock.hidden = false;
   elements.messageList.scrollTop = elements.messageList.scrollHeight;
 
-  state.agentRunUi = { article, title, phaseElements };
+  state.agentRunUi = {
+    article,
+    title,
+    phaseElements,
+    currentPhase,
+    currentDetail,
+    currentPhaseKey: "",
+    currentDetailSource: "",
+    progress
+  };
   updateRunTimeline("observe", "active", "현재 화면을 읽는 중");
 }
 
@@ -3135,7 +3177,35 @@ function updateRunTimeline(phase, status, detail) {
   target.item.dataset.status = status;
   target.detailSource = detail || getTimelineStatusLabel(status);
   setLocalizedElementText(target.detail, target.detailSource);
+  syncRunTimelineSummary(phase, status);
   elements.messageList.scrollTop = elements.messageList.scrollHeight;
+}
+
+function syncRunTimelineSummary(phase, status) {
+  const runUi = state.agentRunUi;
+  const target = runUi?.phaseElements?.[phase];
+  if (!runUi || !target) {
+    return;
+  }
+  const phaseIndex = TIMELINE_PHASES.findIndex(([key]) => key === phase);
+  runUi.currentPhaseKey = phase;
+  runUi.currentDetailSource = target.detailSource;
+  runUi.article.dataset.status = status;
+  runUi.currentPhase.textContent = target.name.textContent;
+  runUi.currentDetail.textContent = target.detail.textContent;
+  runUi.progress.textContent = `${Math.max(0, phaseIndex) + 1}/${TIMELINE_PHASES.length}`;
+  for (const { item } of Object.values(runUi.phaseElements)) {
+    item.removeAttribute("aria-current");
+  }
+  if (status === "active") {
+    target.item.setAttribute("aria-current", "step");
+  }
+}
+
+function clearRunTimeline() {
+  state.agentRunUi = null;
+  elements.activityDock.replaceChildren();
+  elements.activityDock.hidden = true;
 }
 
 function markUnusedTimelineEffectsSkipped() {
@@ -6389,7 +6459,7 @@ function clearConversation() {
   state.conversation = [];
   state.currentPlan = null;
   state.agentSession = null;
-  state.agentRunUi = null;
+  clearRunTimeline();
   state.pickedElement = null;
   state.undoStack = [];
   state.evaluationLogs = [];
@@ -6486,6 +6556,10 @@ function applyUiLanguage() {
       setLocalizedElementText(phase.name, label);
       setLocalizedElementText(phase.detail, phase.detailSource);
     }
+    syncRunTimelineSummary(
+      state.agentRunUi.currentPhaseKey,
+      state.agentRunUi.article.dataset.status || "pending"
+    );
   }
 }
 

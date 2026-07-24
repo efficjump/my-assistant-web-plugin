@@ -173,6 +173,9 @@
       onUpdated: { addListener() {} }
     },
     permissions: {
+      async contains() {
+        return true;
+      },
       async request() {
         return true;
       }

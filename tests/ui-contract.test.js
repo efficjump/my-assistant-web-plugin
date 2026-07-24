@@ -142,6 +142,31 @@ test("approval UI shares a bounded workspace with the conversation", () => {
   assert.match(css, /\.conversation-workspace:has\(> \.approval-stack:not\(\[hidden\]\)\)[^{]*\{[\s\S]*?grid-template-rows:\s*minmax\(0, 1fr\) minmax\(0, 1fr\)/);
 });
 
+test("task flow reuses one compact dock outside the conversation", () => {
+  const html = fs.readFileSync(path.join(root, "panel.html"), "utf8");
+  const script = fs.readFileSync(path.join(root, "panel.js"), "utf8");
+  const css = fs.readFileSync(path.join(root, "styles.css"), "utf8");
+  const messageListStart = html.search(/<section\b[^>]*\bid=["']messageList["']/i);
+  const activityDockStart = html.search(/<section\b[^>]*\bid=["']activityDock["']/i);
+  const composerStart = html.search(/<section\b[^>]*\bid=["']composer["']/i);
+  const startTimelineStart = script.indexOf("function startRunTimeline");
+  const startTimelineEnd = script.indexOf("function updateRunTimeline", startTimelineStart);
+  const startTimelineFunction = script.slice(startTimelineStart, startTimelineEnd);
+  const clearTimelineStart = script.indexOf("function clearRunTimeline");
+  const clearTimelineEnd = script.indexOf("function markUnusedTimelineEffectsSkipped", clearTimelineStart);
+  const clearTimelineFunction = script.slice(clearTimelineStart, clearTimelineEnd);
+
+  assert.ok(messageListStart >= 0 && activityDockStart > messageListStart);
+  assert.ok(composerStart > activityDockStart);
+  assert.match(startTimelineFunction, /clearRunTimeline\(\)/);
+  assert.match(startTimelineFunction, /elements\.activityDock\.append\(article\)/);
+  assert.doesNotMatch(startTimelineFunction, /elements\.messageList\.append/);
+  assert.match(clearTimelineFunction, /elements\.activityDock\.replaceChildren\(\)/);
+  assert.match(clearTimelineFunction, /elements\.activityDock\.hidden\s*=\s*true/);
+  assert.match(css, /\.activity-dock\s*\{[\s\S]*?grid-area:\s*activity;/);
+  assert.match(css, /\.activity-list\s*\{[\s\S]*?position:\s*absolute;/);
+});
+
 test("local approval reserves the composer while external-only approval keeps input available", () => {
   const html = fs.readFileSync(path.join(root, "panel.html"), "utf8");
   const script = fs.readFileSync(path.join(root, "panel.js"), "utf8");

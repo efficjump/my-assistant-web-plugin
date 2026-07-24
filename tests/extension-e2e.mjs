@@ -497,6 +497,17 @@ try {
       assert.ok(layout.topbarHeight <= 50, `${viewportLabel} topbar was ${layout.topbarHeight}px tall`);
       assert.ok(layout.composerHeight <= 110, `${viewportLabel} composer was ${layout.composerHeight}px tall`);
       assert.ok(layout.chatHeight >= 120, `${viewportLabel} conversation viewport was only ${layout.chatHeight}px tall`);
+      assert.ok(
+        layout.activityDockHeight >= 50 && layout.activityDockHeight <= 74,
+        `${viewportLabel} task-flow dock was ${layout.activityDockHeight}px tall`
+      );
+      assert.equal(layout.activityDockCardCount, 1, `${viewportLabel} should render one task-flow dock card`);
+      assert.equal(layout.activityDockCollapsed, true, `${viewportLabel} task-flow details should start collapsed`);
+      assert.equal(
+        layout.activityDockNoHorizontalOverflow,
+        true,
+        `${viewportLabel} task-flow dock should not overflow horizontally`
+      );
       assert.ok(layout.externalApprovalHeight >= 120, `${viewportLabel} approval viewport was only ${layout.externalApprovalHeight}px tall`);
       assert.equal(layout.composerVisible, true, `${viewportLabel} composer should remain available for external approval`);
       assert.equal(layout.composerInputSingleRow, true, `${viewportLabel} composer input and send control should share a row`);
@@ -588,6 +599,10 @@ try {
         timelinePhase: "Page observation",
         timelineDetail: "Turn 3 · observing page",
         timelineTaskPreserved: true,
+        timelineDockVisible: true,
+        timelineDockCardCount: 1,
+        timelineDetachedFromConversation: true,
+        timelineCollapsed: true,
         pageTitlePreserved: true,
         userMessage: "이전 대화 1: 승인 화면에서도 확인해야 하는 내용입니다.",
         systemMessage: "Settings saved.",
@@ -673,6 +688,8 @@ try {
     assert.equal(verificationContracts.promiseFinalStatus, "completed");
     assert.match(verificationContracts.promiseFinalMessage, /다음과 같습니다/);
     assert.equal(verificationContracts.timelinePreservedEarlierAction, true);
+    assert.equal(verificationContracts.timelineDockCardCount, 1);
+    assert.equal(verificationContracts.timelineDetachedFromConversation, true);
     assert.equal(verificationContracts.successPayloadHiddenFromChat, true);
     assert.ok(
       verificationContracts.purposes.findIndex((purpose) => purpose === "answer-grounding-repair")
@@ -2369,6 +2386,8 @@ async function exercisePanelContracts({ cdp, panelSessionId, tabId, context }) {
           { record: false }
         );
       }
+      startRunTimeline("좁은 패널 작업 흐름 검증");
+      updateRunTimeline("observe", "active", "현재 화면을 읽는 중");
       const actionTarget = state.lastContext.interactiveElements.find((item) => item.rect)
         || state.lastContext.interactiveElements[0];
       globalThis.__panelContractDecision = {
@@ -2431,6 +2450,7 @@ async function exercisePanelContracts({ cdp, panelSessionId, tabId, context }) {
         const composerRect = elements.composer.getBoundingClientRect();
         const chatRect = elements.messageList.getBoundingClientRect();
         const approvalRect = elements.externalApprovalPanel.getBoundingClientRect();
+        const activityDockRect = elements.activityDock.getBoundingClientRect();
         const inputRect = elements.chatInput.getBoundingClientRect();
         const sendRect = elements.sendButton.getBoundingClientRect();
         const composerStyle = getComputedStyle(elements.composer);
@@ -2442,6 +2462,11 @@ async function exercisePanelContracts({ cdp, panelSessionId, tabId, context }) {
           topbarHeight: Math.round(topbarRect.height),
           composerHeight: Math.round(composerRect.height),
           chatHeight: Math.round(chatRect.height),
+          activityDockHeight: Math.round(activityDockRect.height),
+          activityDockCardCount: elements.activityDock.querySelectorAll(".activity-card").length,
+          activityDockCollapsed: !state.agentRunUi?.article?.open,
+          activityDockNoHorizontalOverflow:
+            elements.activityDock.scrollWidth <= elements.activityDock.clientWidth + 1,
           externalApprovalHeight: Math.round(approvalRect.height),
           composerVisible: !elements.composer.hidden
             && composerStyle.display !== "none"
@@ -2771,6 +2796,10 @@ async function exercisePanelContracts({ cdp, panelSessionId, tabId, context }) {
           timelinePhase: state.agentRunUi.phaseElements.observe.name.textContent,
           timelineDetail: state.agentRunUi.phaseElements.observe.detail.textContent,
           timelineTaskPreserved: state.agentRunUi.article.querySelector(".activity-summary")?.textContent === "사용자 작업 원문",
+          timelineDockVisible: !elements.activityDock.hidden,
+          timelineDockCardCount: elements.activityDock.querySelectorAll(".activity-card").length,
+          timelineDetachedFromConversation: !elements.messageList.querySelector(".activity-card, .timeline-message"),
+          timelineCollapsed: !state.agentRunUi.article.open,
           pageTitlePreserved: elements.pageTitle.textContent === pageTitleBefore,
           userMessage: elements.messageList.querySelector(".message.user .message-text")?.textContent,
           systemMessage: elements.messageList.querySelector(".message.system:last-child .message-text")?.textContent,
@@ -2927,7 +2956,7 @@ async function exercisePanelContracts({ cdp, panelSessionId, tabId, context }) {
         state.undoStack = original.undoStack;
         state.evaluationLogs = original.evaluationLogs;
         state.currentPlan = original.currentPlan;
-        state.agentRunUi = null;
+        clearRunTimeline();
         state.externalApprovals = original.externalApprovals;
         state.selectedExternalOperationId = original.selectedExternalOperationId;
         applySettingsToForm();
@@ -2989,7 +3018,7 @@ async function exerciseInternalElementDiscoveryContract({ cdp, panelSessionId, t
       };
       state.conversation = [{ role: "user", text: "문제점 조회 그리드의 다음 페이지로 이동해줘" }];
       state.evaluationLogs = [];
-      state.agentRunUi = null;
+      clearRunTimeline();
       state.currentPlan = null;
       state.agentSession = {
         runId: "element-discovery-e2e",
@@ -3398,7 +3427,7 @@ async function exerciseInternalElementDiscoveryContract({ cdp, panelSessionId, t
       state.activeTab = originalState.activeTab;
       state.lastContext = originalState.lastContext;
       state.agentSession = originalState.agentSession;
-      state.agentRunUi = originalState.agentRunUi;
+      clearRunTimeline();
       state.currentPlan = originalState.currentPlan;
       state.conversation = originalState.conversation;
       state.evaluationLogs = originalState.evaluationLogs;
@@ -3456,7 +3485,7 @@ async function exerciseTurnBoundaryContracts({ cdp, panelSessionId, tabId, conte
         taskStatus: ""
       }];
       state.evaluationLogs = [];
-      state.agentRunUi = null;
+      clearRunTimeline();
       createAgentSession("현재 화면을 요약해줘.");
       let freshIntentModelCalls = 0;
       requestAiDecision = async () => {
@@ -3562,7 +3591,7 @@ async function exerciseTurnBoundaryContracts({ cdp, panelSessionId, tabId, conte
         }
       ];
       state.evaluationLogs = [];
-      state.agentRunUi = null;
+      clearRunTimeline();
       createAgentSession("현재 페이지에서 다음 페이지로 한 번 이동해줘.");
       const session = state.agentSession;
       let intentRequest = null;
@@ -3930,7 +3959,7 @@ async function exerciseTurnBoundaryContracts({ cdp, panelSessionId, tabId, conte
       state.activeTab = original.activeTab;
       state.lastContext = original.lastContext;
       state.agentSession = original.agentSession;
-      state.agentRunUi = original.agentRunUi;
+      clearRunTimeline();
       state.currentPlan = original.currentPlan;
       state.conversation = original.conversation;
       state.evaluationLogs = original.evaluationLogs;
@@ -4400,6 +4429,8 @@ async function exerciseAgentVerificationContracts({ cdp, panelSessionId, tabId, 
       const actionTimeline = state.agentRunUi.phaseElements.actions;
       const timelinePreservedEarlierAction = actionTimeline.item.dataset.status === "done"
         && actionTimeline.detail.textContent === "2개 액션 완료";
+      const timelineDockCardCount = elements.activityDock.querySelectorAll(".activity-card").length;
+      const timelineDetachedFromConversation = !elements.messageList.querySelector(".activity-card, .timeline-message");
       const messageCountBeforeSuccess = elements.messageList.children.length;
       appendExecutionResultMessage([{
         ok: true,
@@ -4431,6 +4462,8 @@ async function exerciseAgentVerificationContracts({ cdp, panelSessionId, tabId, 
         promiseFinalMessage: promiseRepairedDecision.message,
         promiseFinalStatus: promiseRepairedDecision.status,
         timelinePreservedEarlierAction,
+        timelineDockCardCount,
+        timelineDetachedFromConversation,
         successPayloadHiddenFromChat,
         purposes,
         allVisualVerificationCallsReceivedScreenshot: screenshotChecks.length >= 4 && screenshotChecks.every(Boolean),
@@ -4450,7 +4483,7 @@ async function exerciseAgentVerificationContracts({ cdp, panelSessionId, tabId, 
       state.activeTab = original.activeTab;
       state.lastContext = original.lastContext;
       state.agentSession = original.agentSession;
-      state.agentRunUi = original.agentRunUi;
+      clearRunTimeline();
       state.currentPlan = original.currentPlan;
       state.conversation = original.conversation;
       state.evaluationLogs = original.evaluationLogs;
@@ -5010,6 +5043,13 @@ async function captureAgentPanelDocs(cdp, panelSessionId) {
     for (const message of state.conversation) {
       appendChatMessage(message.role, message.text, { record: false });
     }
+    startRunTimeline("Summarize the current-page checks in a table.");
+    updateRunTimeline("observe", "done", "Visible page content collected");
+    updateRunTimeline("think", "done", "Response prepared");
+    updateRunTimeline("tools", "skipped", "No tool execution");
+    updateRunTimeline("actions", "skipped", "No page actions");
+    updateRunTimeline("verify", "done", "Current-page evidence verified");
+    updateRunTimeline("done", "done", "Summary completed");
     elements.settingsModal.hidden = true;
     elements.contextModal.hidden = true;
     elements.exportModal.hidden = true;
@@ -5036,6 +5076,7 @@ async function captureAgentPanelDocs(cdp, panelSessionId) {
       state.conversation = snapshot.conversation;
       state.externalApprovals = snapshot.externalApprovals;
       state.selectedExternalOperationId = snapshot.selectedExternalOperationId;
+      clearRunTimeline();
       elements.messageList.replaceChildren();
       for (const message of state.conversation) {
         appendChatMessage(message.role, message.text, { tone: message.tone || "", record: false });

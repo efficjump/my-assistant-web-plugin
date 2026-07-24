@@ -4,7 +4,7 @@ A Manifest V3 browser extension that turns a configured language model into a bo
 
 ![Agent side panel](docs/assets/agent-panel.png)
 
-Version `0.9.9` with Bridge protocol `2.3` targets Chromium-based browsers version 116 or later. This repository contains a source-loaded development build rather than a store package. The extension UI screenshots in this README were regenerated from the current version with a temporary browser profile and local fixtures.
+Version `0.9.10` with Bridge protocol `2.3` targets Chromium-based browsers version 116 or later. This repository contains a source-loaded development build rather than a store package. The extension UI screenshots in this README were regenerated from the current version with a temporary browser profile and local fixtures.
 
 ## Choose the workflow
 
@@ -148,7 +148,7 @@ Authentication values are session-only by default and are persisted only when th
 2. Enter a complete goal, including the result or evidence you expect.
 3. Review approval cards for state-changing, sensitive, or externally visible effects.
 4. Keep the target tab open while the task runs.
-5. Check the final answer and **Task flow** card. A task is complete only after the extension has re-observed the result and verified the returned evidence.
+5. Check the final answer and the compact **Task flow** dock above the composer. Expand the dock when you need the full phase history. A task is complete only after the extension has re-observed the result and verified the returned evidence.
 
 The agent can dynamically request another visible-control window with a `discover` decision. It searches accessible labels, roles, safe attributes, and nearby table/row/form/dialog/region text locally, similar to using a targeted source search instead of loading an entire file. Only matched control descriptors are sent to the model. If the target is outside the viewport, the agent must scroll and observe again; local search does not expose offscreen or hidden content.
 
@@ -192,7 +192,7 @@ Each submitted message becomes one immutable agent objective. A complete new req
 
 Global settings are saved when a field changes, so there is no separate global save button; site-specific profiles still use their own apply action. The full reset action is under **Settings → Advanced**. While a local action plan is waiting for approval, the new-request composer is hidden because the running task cannot accept another request; rejecting or completing the approval restores the unchanged draft. External Bridge approvals do not hide the composer.
 
-The **Task flow** card summarizes the complete run rather than only the final turn, so an earlier tool call or page action is not replaced with “none” when the terminal turn needs no further effect. Successful low-level result payloads stay in the internal evidence and trace instead of appearing as raw JSON chat messages. Malformed decision objects and provider error envelopes are repaired or reduced to concise user-facing errors; internal schema messages such as an invalid `elementSearch` placement remain in diagnostics instead of the conversation.
+The **Task flow** dock summarizes the complete run rather than only the final turn, so an earlier tool call or page action is not replaced with “none” when the terminal turn needs no further effect. It is runtime status rather than a chat message: one compact dock is reused for the latest run, and its detailed phases open above the conversation only on request. Successful low-level result payloads stay in the internal evidence and trace instead of appearing as raw JSON chat messages. Malformed decision objects and provider error envelopes are repaired or reduced to concise user-facing errors; internal schema messages such as an invalid `elementSearch` placement remain in diagnostics instead of the conversation.
 
 **Settings → Per-site** is an agent-behavior profile for the exact origin shown in the panel; it does not change browser permissions. Enable the profile only when that site needs different behavior. Each field can independently inherit the global setting or override the action mode, screenshot use, and MCP use for that origin. The effective values are shown before saving, and **Revert to defaults** removes the origin-specific profile.
 
