@@ -73,6 +73,27 @@ test("normalizes a decision and validates an observed element ref", () => {
   assert.equal(decision.actions[0].ref, "e1");
 });
 
+test("rejects duplicate action ids before execution bindings are built", () => {
+  const decision = Core.normalizeDecision(baseDecision({
+    actions: [
+      baseDecision().actions[0],
+      {
+        id: "a1",
+        type: "focus",
+        ref: "e1",
+        reason: "Use a different effect with the same invalid ID"
+      }
+    ]
+  }), { maxEffects: 3 });
+  const validation = Core.validateDecision(decision, {
+    context,
+    availableTools: [],
+    maxEffects: 3
+  });
+  assert.equal(validation.valid, false);
+  assert.match(validation.errors.join(" "), /서로 다른 id/);
+});
+
 test("rejects invented refs and completion without evidence", () => {
   const invented = Core.normalizeDecision(baseDecision({
     actions: [{ ...baseDecision().actions[0], ref: "e99" }]
@@ -423,6 +444,62 @@ test("detects repeated decisions on an unchanged observation", () => {
   const third = Core.updateProgressGuard(session, context, decision, { limit: 2 });
   assert.equal(third.stalled, true);
   assert.equal(third.count, 2);
+});
+
+test("treats planner-only ids and reasons as the same semantic decision", () => {
+  const session = {};
+  const first = Core.normalizeDecision(baseDecision(), { maxEffects: 3 });
+  const second = Core.normalizeDecision(baseDecision({
+    actions: [{
+      ...baseDecision().actions[0],
+      id: "rewritten-id",
+      reason: "같은 입력을 다른 문장으로 설명"
+    }]
+  }), { maxEffects: 3 });
+
+  Core.updateProgressGuard(session, context, first, { limit: 2 });
+  const repeated = Core.updateProgressGuard(session, context, second, { limit: 2 });
+  assert.equal(repeated.repeatedDecision, true);
+  assert.equal(repeated.count, 1);
+});
+
+test("starts a fresh repeat count when the semantic decision changes", () => {
+  const session = {};
+  const first = Core.normalizeDecision(baseDecision(), { maxEffects: 3 });
+  const second = Core.normalizeDecision(baseDecision({
+    actions: [{
+      ...baseDecision().actions[0],
+      value: "different"
+    }]
+  }), { maxEffects: 3 });
+
+  Core.updateProgressGuard(session, context, first, { limit: 2 });
+  Core.updateProgressGuard(session, context, first, { limit: 2 });
+  const changed = Core.updateProgressGuard(session, context, second, { limit: 2 });
+  const repeated = Core.updateProgressGuard(session, context, second, { limit: 2 });
+
+  assert.equal(changed.count, 0);
+  assert.equal(repeated.count, 1);
+  assert.equal(repeated.stalled, false);
+});
+
+test("ignores raw revision churn when visible evidence is unchanged", () => {
+  const session = {};
+  const decision = Core.normalizeDecision(baseDecision(), { maxEffects: 3 });
+  const firstContext = {
+    ...context,
+    documentId: "document-1",
+    pageState: { readyState: "complete", domRevision: 1, visualRevision: 3 }
+  };
+  const secondContext = {
+    ...firstContext,
+    pageState: { ...firstContext.pageState, domRevision: 9, visualRevision: 12 }
+  };
+
+  Core.updateProgressGuard(session, firstContext, decision, { limit: 2 });
+  const repeated = Core.updateProgressGuard(session, secondContext, decision, { limit: 2 });
+  assert.equal(repeated.unchangedObservation, true);
+  assert.equal(repeated.count, 1);
 });
 
 test("context fingerprints are stable across object key order", () => {

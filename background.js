@@ -92,7 +92,11 @@ async function handleMessage(message, sender) {
     case "EXECUTE_PAGE_ACTIONS":
       assertTrustedExtensionSender(sender);
       await assertInternalExecutionLeaseAvailable();
-      return executePageActionsInFrames(message.targetTabId, message.actions || []);
+      return executePageActionsInFrames(
+        message.targetTabId,
+        message.actions || [],
+        message.executionBindings || []
+      );
     case "UNDO_PAGE_ACTIONS":
       assertTrustedExtensionSender(sender);
       await assertInternalExecutionLeaseAvailable();
@@ -294,15 +298,18 @@ function roundRuntimeDuration(value) {
   return Math.round(Number(value || 0) * 10) / 10;
 }
 
-async function executePageActionsInFrames(targetTabId, actions) {
+async function executePageActionsInFrames(targetTabId, actions, executionBindings = []) {
   if (!Array.isArray(actions)) {
     throw new Error("Actions must be an array.");
   }
+  const bindingsByActionId = indexExecutionBindings(actions, executionBindings);
   const tab = await getTargetTab(targetTabId);
   assertInjectableTab(tab);
   const results = [];
   for (const [index, action] of actions.entries()) {
-    const routed = routeFrameAction(action);
+    const actionId = String(action?.id || "");
+    const executionBinding = bindingsByActionId.get(actionId) || null;
+    const routed = routeFrameAction(action, executionBinding);
     try {
       await ensureContentScript(tab.id, routed.frameId);
     } catch (error) {
@@ -313,7 +320,8 @@ async function executePageActionsInFrames(targetTabId, actions) {
     try {
       response = await sendTabMessage(tab.id, {
         type: "EXECUTE_PAGE_ACTIONS",
-        actions: [routed.action]
+        actions: [routed.action],
+        executionBindings: routed.executionBinding ? [routed.executionBinding] : []
       }, { frameId: routed.frameId });
     } catch (error) {
       const recovered = await recoverNavigationInterruptedAction(
@@ -346,6 +354,58 @@ async function executePageActionsInFrames(targetTabId, actions) {
     }
   }
   return { results };
+}
+
+function indexExecutionBindings(actions, executionBindings) {
+  if (!Array.isArray(executionBindings)) {
+    throw new Error("Execution bindings must be an array.");
+  }
+  const bindingsByActionId = new Map();
+  if (!executionBindings.length) {
+    return bindingsByActionId;
+  }
+
+  const actionIds = new Set();
+  for (const action of actions) {
+    const actionId = String(action?.id || "");
+    if (!actionId.trim()) {
+      throw new Error("Every action must have an ID when execution bindings are provided.");
+    }
+    if (actionIds.has(actionId)) {
+      throw new Error(`Duplicate action ID cannot be bound safely: ${actionId}`);
+    }
+    actionIds.add(actionId);
+  }
+
+  for (const binding of executionBindings) {
+    const actionId = String(binding?.actionId || "");
+    if (!actionId.trim()) {
+      throw new Error("Every execution binding must have an action ID.");
+    }
+    if (bindingsByActionId.has(actionId)) {
+      throw new Error(`Duplicate execution binding ID: ${actionId}`);
+    }
+    if (!actionIds.has(actionId)) {
+      throw new Error(`Execution binding has no matching action: ${actionId}`);
+    }
+    assertExecutionFrameId(binding.frameId, `execution binding ${actionId}`);
+    bindingsByActionId.set(actionId, binding);
+  }
+
+  for (const actionId of actionIds) {
+    if (!bindingsByActionId.has(actionId)) {
+      throw new Error(`Action has no matching execution binding: ${actionId}`);
+    }
+  }
+  return bindingsByActionId;
+}
+
+function assertExecutionFrameId(value, label) {
+  const frameId = Number(value);
+  if (!Number.isInteger(frameId) || frameId < 0) {
+    throw new Error(`${label} has an invalid frame ID.`);
+  }
+  return frameId;
 }
 
 async function recoverNavigationInterruptedAction(tabId, frameId, action, before, error) {
@@ -515,18 +575,59 @@ function activateBoundJavascriptAnchor(request) {
   const selector = String(request?.selector || "");
   const declaredHref = String(request?.declaredHref || "");
   const point = request?.point && typeof request.point === "object" ? request.point : {};
-  let target = null;
-  try {
-    target = selector ? document.querySelector(selector) : null;
-  } catch {
-    target = null;
+  const hasBoundPoint = Number.isFinite(point.x) && Number.isFinite(point.y);
+  if (!selector || !hasBoundPoint) {
+    return {
+      activated: false,
+      error: "The bound legacy link is missing its selector or activation point."
+    };
   }
-  if (!target && Number.isFinite(point.x) && Number.isFinite(point.y)) {
-    const hit = document.elementFromPoint(point.x, point.y);
-    target = hit?.closest?.("a,area") || null;
+
+  let candidates = [];
+  try {
+    candidates = Array.from(document.querySelectorAll(selector));
+  } catch {
+    candidates = [];
+  }
+  const hit = document.elementFromPoint(point.x, point.y);
+  const pointAnchor = hit?.closest?.("a,area") || null;
+  let target = pointAnchor && candidates.includes(pointAnchor)
+    ? pointAnchor
+    : null;
+
+  if (!target && hit) {
+    const pointAreas = candidates.filter((candidate) => {
+      if (!(candidate instanceof HTMLAreaElement)) {
+        return false;
+      }
+      const map = candidate.parentElement;
+      if (!map || String(map.tagName || "").toLowerCase() !== "map") {
+        return false;
+      }
+      const mapName = String(
+        map.getAttribute("name")
+        || map.getAttribute("id")
+        || ""
+      ).replace(/^#/u, "");
+      if (!mapName) {
+        return false;
+      }
+      const image = Array.from(document.querySelectorAll("img[usemap],input[type='image'][usemap]"))
+        .find((candidateImage) => (
+          String(candidateImage.getAttribute("usemap") || "")
+            .replace(/^#/u, "") === mapName
+        ));
+      return Boolean(image && (hit === image || image.contains(hit)));
+    });
+    if (pointAreas.length === 1) {
+      [target] = pointAreas;
+    }
   }
   if (!(target instanceof HTMLAnchorElement) && !(target instanceof HTMLAreaElement)) {
-    return { activated: false, error: "The bound legacy link is no longer present." };
+    return {
+      activated: false,
+      error: "The bound legacy link no longer matches its observed activation point."
+    };
   }
   if (String(target.getAttribute("href") || "").trim() !== declaredHref) {
     return { activated: false, error: "The bound legacy link changed before activation." };
@@ -708,7 +809,9 @@ async function initializeExternalControlBridge() {
       observe: collectExternalObservation,
       screenshot: (tabId) => captureVisibleTab(tabId),
       resolveVisualAction: resolveExternalVisualAction,
-      executePage: (tabId, actions) => executePageActionsInFrames(tabId, actions),
+      executePage: (tabId, actions, executionBindings) => (
+        executePageActionsInFrames(tabId, actions, executionBindings)
+      ),
       executeBrowser: (tabId, actions) => executeExternalBrowserActions(tabId, actions)
     },
     resolveGoalIntent: resolveExternalGoalIntent,
@@ -1721,21 +1824,73 @@ function getOriginPermissionPattern(value) {
   }
 }
 
-function routeFrameAction(action) {
+function routeFrameAction(action, executionBinding = null) {
   const source = action && typeof action === "object" ? { ...action } : {};
   const refRoute = parseFrameScopedRef(source.ref);
   const conditionRoute = parseConditionFrameRoute(source.conditionJson);
-  const frameId = refRoute?.frameId ?? conditionRoute?.frameId ?? 0;
-  if (refRoute && conditionRoute && refRoute.frameId !== conditionRoute.frameId) {
-    throw new Error("One action cannot target refs from different frames.");
+  const bindingFrameId = executionBinding
+    ? assertExecutionFrameId(
+        executionBinding.frameId,
+        `execution binding ${String(executionBinding.actionId || "") || "(missing action ID)"}`
+      )
+    : null;
+  const routedFrameIds = [
+    refRoute?.frameId,
+    conditionRoute?.frameId,
+    bindingFrameId
+  ].filter((frameId) => Number.isInteger(frameId));
+  if (routedFrameIds.some((frameId) => frameId !== routedFrameIds[0])) {
+    throw new Error("One action and its execution binding cannot target different frames.");
   }
+  const frameId = routedFrameIds[0] ?? 0;
   if (refRoute) {
     source.ref = refRoute.localRef;
   }
   if (conditionRoute) {
     source.conditionJson = JSON.stringify(conditionRoute.condition);
   }
-  return { frameId, action: source };
+  return {
+    frameId,
+    action: source,
+    executionBinding: executionBinding
+      ? routeExecutionBinding(executionBinding, frameId)
+      : null
+  };
+}
+
+function routeExecutionBinding(executionBinding, selectedFrameId) {
+  const routed = {
+    ...executionBinding,
+    frameId: selectedFrameId
+  };
+  if (executionBinding.conditionBindings === undefined) {
+    return routed;
+  }
+  if (!Array.isArray(executionBinding.conditionBindings)) {
+    throw new Error("Execution condition bindings must be an array.");
+  }
+  routed.conditionBindings = executionBinding.conditionBindings.map((conditionBinding, index) => {
+    if (!conditionBinding || typeof conditionBinding !== "object" || Array.isArray(conditionBinding)) {
+      throw new Error(`Execution condition binding ${index + 1} is invalid.`);
+    }
+    const conditionFrameId = assertExecutionFrameId(
+      conditionBinding.frameId,
+      `execution condition binding ${index + 1}`
+    );
+    const refRoute = parseFrameScopedRef(conditionBinding.ref);
+    if (refRoute && refRoute.frameId !== conditionFrameId) {
+      throw new Error(`Execution condition binding ${index + 1} targets conflicting frames.`);
+    }
+    if (conditionFrameId !== selectedFrameId) {
+      throw new Error(`Execution condition binding ${index + 1} targets a different frame.`);
+    }
+    return {
+      ...conditionBinding,
+      frameId: selectedFrameId,
+      ...(refRoute ? { ref: refRoute.localRef } : {})
+    };
+  });
+  return routed;
 }
 
 function parseFrameScopedRef(value) {
@@ -3006,11 +3161,22 @@ async function callMcpTool(settings, toolCall) {
     },
     { mcpName: name }
   );
+  const result = response?.result || null;
+  if (result?.isError === true) {
+    const error = new Error(
+      extractMcpResultText(result)
+      || `MCP tool ${name} reported an execution error.`
+    );
+    error.name = "McpToolError";
+    error.code = "mcp_tool_error";
+    error.details = { toolName: name };
+    throw error;
+  }
 
   return {
     name,
-    result: response?.result || null,
-    text: extractMcpResultText(response?.result)
+    result,
+    text: extractMcpResultText(result)
   };
 }
 

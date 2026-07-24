@@ -22,6 +22,13 @@
     "unknown_after_restart",
     "cancelled"
   ]);
+  const PRIVATE_OBSERVATION_FIELDS = new Set(["binding", "stateBinding"]);
+  const PRIVATE_EXECUTION_RESULT_FIELDS = new Set([
+    "beforeFingerprint",
+    "afterFingerprint",
+    "semanticFingerprint",
+    "fingerprint"
+  ]);
 
   class ExternalControlRuntime {
     constructor(options = {}) {
@@ -1025,7 +1032,10 @@
             await this.#persistAndNotify();
             return this.#publicOperation(operation);
           }
-          actionsForExecution = validation.actions;
+          actionsForExecution = validation.actions.map((action, index) => ({
+            ...action,
+            id: operation.actions[index]?.id || action.id
+          }));
           operation.visualAttestation = cloneJson(resolved.attestation || operation.visualAttestation);
         } else {
           freshContext = await this.#collectObservation(
@@ -1058,7 +1068,11 @@
         if (browserActions.length) {
           executionResult = await this.driver.executeBrowser(operation.targetTabId, cloneJson(browserActions));
         } else {
-          executionResult = await this.driver.executePage(operation.targetTabId, cloneJson(pageActions));
+          executionResult = await this.driver.executePage(
+            operation.targetTabId,
+            cloneJson(pageActions),
+            buildPageExecutionBindings(pageActions, operation.preconditions)
+          );
         }
         if (typeof this.driver.waitAfterExecution === "function") {
           await this.driver.waitAfterExecution(executionResult);
@@ -1388,7 +1402,10 @@
   }
 
   function sanitizeObservationForClient(context) {
-    const output = sanitizeObservationForStorage(context);
+    const output = omitObjectFields(
+      sanitizeObservationForStorage(context),
+      PRIVATE_OBSERVATION_FIELDS
+    );
     if (output.screenshotDataUrl) {
       delete output.screenshotDataUrl;
     }
@@ -1413,8 +1430,83 @@
   }
 
   function sanitizeExecutionResult(result) {
-    const output = cloneJson(result ?? null);
+    const output = omitObjectFields(
+      cloneJson(result ?? null),
+      PRIVATE_EXECUTION_RESULT_FIELDS
+    );
     return redactObjectValues(output);
+  }
+
+  function buildPageExecutionBindings(actions, preconditions) {
+    const normalizedPreconditions = Array.isArray(preconditions) ? preconditions : [];
+    const preconditionsByActionId = new Map();
+    for (const precondition of normalizedPreconditions) {
+      const actionId = stringValue(precondition?.actionId);
+      if (!actionId || preconditionsByActionId.has(actionId)) {
+        throw new Error("Every page execution precondition must have a unique action ID.");
+      }
+      preconditionsByActionId.set(actionId, precondition);
+    }
+    const seenActionIds = new Set();
+    return (actions || []).map((action) => {
+      const actionId = stringValue(action?.id);
+      if (!actionId || seenActionIds.has(actionId)) {
+        throw new Error("Every page action must have a unique action ID.");
+      }
+      seenActionIds.add(actionId);
+      const precondition = preconditionsByActionId.get(actionId);
+      if (!precondition) {
+        throw new Error(`Page action ${actionId} has no matching execution precondition.`);
+      }
+      const target = precondition.target || {};
+      const conditionTargets = Array.isArray(precondition.conditionTargets)
+        ? precondition.conditionTargets.filter((entry) => entry?.target)
+        : [];
+      const routingTarget = precondition.target || conditionTargets[0]?.target || {};
+      const frameIds = Array.from(new Set([
+        ...(precondition.target ? [Number(target.frameId) || 0] : []),
+        ...conditionTargets.map(({ target: conditionTarget }) => Number(conditionTarget.frameId) || 0)
+      ]));
+      if (frameIds.length > 1) {
+        throw new Error(`Page action ${actionId} spans multiple frames.`);
+      }
+      return {
+        actionId,
+        frameId: Number.isInteger(Number(routingTarget.frameId))
+          ? Number(routingTarget.frameId)
+          : 0,
+        documentId: stringValue(routingTarget.frameDocumentId || precondition.documentId),
+        targetBinding: stringValue(target.binding),
+        targetStateBinding: stringValue(target.stateBinding),
+        conditionBindings: conditionTargets.map(({ lookup, target: conditionTarget }) => ({
+          ...(lookup || {}),
+          frameId: Number.isInteger(Number(conditionTarget.frameId))
+            ? Number(conditionTarget.frameId)
+            : 0,
+          documentId: stringValue(
+            conditionTarget.frameDocumentId || precondition.documentId
+          ),
+          targetBinding: stringValue(conditionTarget.binding),
+          targetStateBinding: stringValue(conditionTarget.stateBinding)
+        }))
+      };
+    });
+  }
+
+  function omitObjectFields(value, omittedFields) {
+    if (Array.isArray(value)) {
+      return value.map((entry) => omitObjectFields(entry, omittedFields));
+    }
+    if (!value || typeof value !== "object") {
+      return value;
+    }
+    const output = {};
+    for (const [key, entry] of Object.entries(value)) {
+      if (!omittedFields.has(key)) {
+        output[key] = omitObjectFields(entry, omittedFields);
+      }
+    }
+    return output;
   }
 
   function classifyExecutionProgress(result, beforeContext, afterContext, actions = []) {

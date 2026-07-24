@@ -698,6 +698,12 @@ try {
     assert.equal(verificationContracts.allVisualVerificationCallsReceivedScreenshot, true);
     assert.equal(verificationContracts.previousViewportEvidenceStatus, "rejected");
     assert.equal(verificationContracts.currentViewportEvidenceStatus, "verified");
+    assert.equal(verificationContracts.previousCompletionEvidenceStatus, "rejected");
+    assert.equal(verificationContracts.currentCompletionEvidenceStatus, "verified");
+    assert.equal(verificationContracts.earlierEffectEvidenceRetained, true);
+    assert.equal(verificationContracts.onlyCurrentViewportRetained, true);
+    assert.equal(verificationContracts.staleVisualEvidenceExcluded, true);
+    assert.equal(verificationContracts.toolOnlyCompletionVerifiedWithoutUnrelatedPage, true);
     assert.equal(verificationContracts.visualActionVerified, true);
     assert.equal(verificationContracts.visualActionRebound, true);
     assert.equal(verificationContracts.visualVerifierReceivedScreenshot, true);
@@ -719,6 +725,9 @@ try {
       nearText: "Dense issue grid"
     });
     assert.equal(internalDiscovery.modelCalls, 2);
+    assert.equal(internalDiscovery.mcpToolLoads, 1);
+    assert.equal(internalDiscovery.mcpAssetLoads, 1);
+    assert.equal(internalDiscovery.capabilityLoadsOverlappedObservation, true);
     assert.equal(internalDiscovery.userHandoffSuppressed, true);
     assert.equal(internalDiscovery.recoveryDecisionStatus, "continue");
     assert.equal(internalDiscovery.recoveryActionRef, "request-type-lookup");
@@ -726,6 +735,12 @@ try {
     assert.deepEqual(internalDiscovery.recoveryNearTexts, ["", "Request type"]);
     assert.equal(internalDiscovery.repeatedDisclosureWasNotReturned, true);
     assert.equal(internalDiscovery.genericContractFailureHidden, true);
+    assert.equal(internalDiscovery.boundedDiscoveryStatus, "blocked");
+    assert.match(internalDiscovery.boundedDiscoveryMessage, /아직 확인하지 못한 요소/);
+    assert.equal(internalDiscovery.boundedDiscoveryWindows, 3);
+    assert.equal(internalDiscovery.boundedDiscoveryLimit, 3);
+    assert.equal(internalDiscovery.boundedDiscoveryObservationCalls, 3);
+    assert.equal(internalDiscovery.boundedDiscoveryModelCalls, 3);
 
     const turnBoundaryContracts = await exerciseTurnBoundaryContracts({
       cdp,
@@ -756,6 +771,8 @@ try {
     assert.equal(turnBoundaryContracts.disclosureRepeatBlockedWithoutMaterialProgress, true);
     assert.equal(turnBoundaryContracts.unchangedAttemptNotCountedAsSuccess, true);
     assert.equal(turnBoundaryContracts.unchangedAttemptRepeatBlocked, true);
+    assert.equal(turnBoundaryContracts.indeterminateAttemptNotCountedAsSuccess, true);
+    assert.equal(turnBoundaryContracts.indeterminateAttemptRepeatBlocked, true);
     assert.equal(turnBoundaryContracts.stateChangingToolRepeatBlocked, true);
     assert.equal(turnBoundaryContracts.readOnlyToolRepeatAllowed, true);
     assert.equal(turnBoundaryContracts.runtimeErrorStoppedSession, true);
@@ -779,12 +796,494 @@ try {
       unresolvedClickNeedsPolicy: true
     });
 
+    const loopRuntimeContracts = await exerciseLoopRuntimeContracts({
+      cdp,
+      panelSessionId,
+      tabId: firstTabId,
+      context: firstContext.data
+    });
+    assert.deepEqual(loopRuntimeContracts.verificationOnlyFlags, [false, true]);
+    assert.equal(loopRuntimeContracts.executedEffects, 1);
+    assert.equal(loopRuntimeContracts.finalStatus, "completed");
+    assert.equal(loopRuntimeContracts.toolOnlySettleMessages, 0);
+    assert.equal(loopRuntimeContracts.permanentRetryCalls, 1);
+    assert.equal(loopRuntimeContracts.permanentRetryDelays, 0);
+    assert.equal(loopRuntimeContracts.transientRetryCalls, 3);
+    assert.deepEqual(loopRuntimeContracts.transientRetryDelays, [350, 700]);
+    assert.equal(loopRuntimeContracts.exhaustedRetryCalls, 4);
+    assert.deepEqual(loopRuntimeContracts.exhaustedRetryDelays, [350, 700, 1050]);
+    assert.equal(loopRuntimeContracts.freshProbeReusedObservation, true);
+    assert.equal(loopRuntimeContracts.freshProbeCollections, 0);
+    assert.equal(loopRuntimeContracts.productionFinalVerificationOpened, true);
+    assert.equal(loopRuntimeContracts.staleToolPreparationRejected, true);
+    assert.equal(loopRuntimeContracts.staleToolPreparationCollections, 0);
+    assert.equal(loopRuntimeContracts.staleToolPreparationUsedPlanningProbe, true);
+    assert.equal(
+      loopRuntimeContracts.stableToolPreparationAccepted,
+      true,
+      JSON.stringify(loopRuntimeContracts.stableToolPreparationDiagnostics)
+    );
+    assert.equal(loopRuntimeContracts.changedBrowserToolPreparationRejected, true);
+    assert.equal(loopRuntimeContracts.changedVisualToolPreparationRejected, true);
+    assert.equal(loopRuntimeContracts.changedVisualCaptureCalls, 1);
+
     const transitionContracts = await exerciseTabTransitionContracts({ cdp, panelSessionId });
     assert.equal(transitionContracts.preservedRunningSession, true);
     assert.equal(transitionContracts.deferredWhileBound, true);
     assert.equal(transitionContracts.resumedOnLatestTab, true);
 
-    const pointerTarget = firstContext.data.interactiveElements.find((element) => element.label === "Pointer action");
+    await evaluate(cdp, panelSessionId, `(async () => {
+      await chrome.scripting.executeScript({
+        target: { tabId: ${JSON.stringify(firstTabId)} },
+        world: "MAIN",
+        func: () => {
+          const fixture = document.createElement("div");
+          fixture.id = "stale-target-fixture";
+          Object.assign(fixture.style, {
+            position: "fixed",
+            right: "8px",
+            top: "8px",
+            zIndex: "2147483000",
+            display: "grid",
+            gap: "4px",
+            padding: "4px",
+            background: "white"
+          });
+          const button = document.createElement("button");
+          button.id = "stale-target-button";
+          button.textContent = "Stale row A";
+          button.addEventListener("click", () => {
+            window.__staleTargetClickCount = (window.__staleTargetClickCount || 0) + 1;
+          });
+          const ambientButton = document.createElement("button");
+          ambientButton.id = "ambient-churn-button";
+          ambientButton.textContent = "Ambient churn";
+          const ambientNode = document.createElement("span");
+          ambientNode.id = "ambient-churn-node";
+          ambientNode.hidden = true;
+          ambientButton.addEventListener("click", () => {
+            ambientNode.dataset.revision = String(Number(ambientNode.dataset.revision || 0) + 1);
+          });
+          const mutableCheckbox = document.createElement("input");
+          mutableCheckbox.id = "mutable-state-checkbox";
+          mutableCheckbox.type = "checkbox";
+          mutableCheckbox.setAttribute("aria-label", "Mutable state checkbox");
+          const pressTarget = document.createElement("button");
+          pressTarget.id = "text-press-target";
+          pressTarget.textContent = "Text press target";
+          pressTarget.addEventListener("keydown", () => {
+            window.__textPressTargetCount = (window.__textPressTargetCount || 0) + 1;
+          });
+          const pressDecoy = document.createElement("button");
+          pressDecoy.id = "text-press-decoy";
+          pressDecoy.textContent = "Text press decoy";
+          pressDecoy.addEventListener("keydown", () => {
+            window.__textPressDecoyCount = (window.__textPressDecoyCount || 0) + 1;
+          });
+          const raceOriginal = document.createElement("button");
+          raceOriginal.id = "post-observation-race-original";
+          raceOriginal.textContent = "Post observation race original";
+          const raceDecoy = document.createElement("button");
+          raceDecoy.id = "post-observation-race-decoy";
+          raceDecoy.textContent = "Post observation race decoy";
+          fixture.append(
+            button,
+            ambientButton,
+            ambientNode,
+            mutableCheckbox,
+            pressTarget,
+            pressDecoy,
+            raceOriginal,
+            raceDecoy
+          );
+          document.body.append(fixture);
+          window.__staleTargetClickCount = 0;
+          window.__textPressTargetCount = 0;
+          window.__textPressDecoyCount = 0;
+        }
+      });
+    })()`);
+    const staleTargetContext = await extensionMessage(cdp, panelSessionId, {
+      type: "COLLECT_PAGE_CONTEXT",
+      targetTabId: firstTabId,
+      options: {
+        maxTextChars: 4000,
+        maxElements: 20,
+        elementQuery: "Stale row A",
+        elementRoles: ["button"],
+        redactSensitiveData: true
+      }
+    });
+    const staleTarget = staleTargetContext.data.interactiveElements.find(
+      (element) => element.label === "Stale row A"
+    );
+    assert.ok(staleTarget?.ref);
+    assert.match(staleTarget.binding, /^binding-v1-/);
+    assert.match(staleTarget.stateBinding, /^state-v1-/);
+    await evaluate(cdp, panelSessionId, `(async () => {
+      await chrome.scripting.executeScript({
+        target: { tabId: ${JSON.stringify(firstTabId)} },
+        world: "MAIN",
+        func: () => {
+          document.getElementById("stale-target-button").textContent = "Stale row B";
+        }
+      });
+    })()`);
+    const recycledTargetResult = await extensionMessage(cdp, panelSessionId, {
+      type: "EXECUTE_PAGE_ACTIONS",
+      targetTabId: firstTabId,
+      actions: [{
+        id: "stale-connected-target",
+        type: "click",
+        ref: staleTarget.ref,
+        reason: "stale target binding contract"
+      }],
+      executionBindings: [{
+        actionId: "stale-connected-target",
+        frameId: staleTarget.frameId || 0,
+        documentId: staleTarget.frameDocumentId || staleTargetContext.data.documentId,
+        targetBinding: staleTarget.binding,
+        targetStateBinding: staleTarget.stateBinding,
+        conditionBindings: []
+      }]
+    });
+    assert.equal(recycledTargetResult.ok, true);
+    assert.equal(recycledTargetResult.data.results[0].ok, false);
+    assert.equal(recycledTargetResult.data.results[0].code, "stale_target");
+
+    await evaluate(cdp, panelSessionId, `(async () => {
+      await chrome.scripting.executeScript({
+        target: { tabId: ${JSON.stringify(firstTabId)} },
+        world: "MAIN",
+        func: () => {
+          const previous = document.getElementById("stale-target-button");
+          previous.textContent = "Stale row A";
+        }
+      });
+    })()`);
+    const replacedTargetContext = await extensionMessage(cdp, panelSessionId, {
+      type: "COLLECT_PAGE_CONTEXT",
+      targetTabId: firstTabId,
+      options: {
+        maxTextChars: 4000,
+        maxElements: 20,
+        elementQuery: "Stale row A",
+        elementRoles: ["button"],
+        redactSensitiveData: true
+      }
+    });
+    const replacedTarget = replacedTargetContext.data.interactiveElements.find(
+      (element) => element.label === "Stale row A"
+    );
+    await evaluate(cdp, panelSessionId, `(async () => {
+      await chrome.scripting.executeScript({
+        target: { tabId: ${JSON.stringify(firstTabId)} },
+        world: "MAIN",
+        func: () => {
+          const previous = document.getElementById("stale-target-button");
+          const replacement = document.createElement("button");
+          replacement.id = previous.id;
+          replacement.textContent = "Replacement row";
+          replacement.addEventListener("click", () => {
+            window.__staleTargetClickCount = (window.__staleTargetClickCount || 0) + 1;
+          });
+          previous.replaceWith(replacement);
+        }
+      });
+    })()`);
+    const replacedTargetResult = await extensionMessage(cdp, panelSessionId, {
+      type: "EXECUTE_PAGE_ACTIONS",
+      targetTabId: firstTabId,
+      actions: [{
+        id: "stale-replaced-target",
+        type: "click",
+        ref: replacedTarget.ref,
+        reason: "selector rebound contract"
+      }],
+      executionBindings: [{
+        actionId: "stale-replaced-target",
+        frameId: replacedTarget.frameId || 0,
+        documentId: replacedTarget.frameDocumentId || replacedTargetContext.data.documentId,
+        targetBinding: replacedTarget.binding,
+        targetStateBinding: replacedTarget.stateBinding,
+        conditionBindings: []
+      }]
+    });
+    assert.equal(replacedTargetResult.ok, true);
+    assert.equal(replacedTargetResult.data.results[0].ok, false);
+    assert.equal(replacedTargetResult.data.results[0].code, "stale_target");
+    const ambientContext = await extensionMessage(cdp, panelSessionId, {
+      type: "COLLECT_PAGE_CONTEXT",
+      targetTabId: firstTabId,
+      options: {
+        maxTextChars: 4000,
+        maxElements: 20,
+        elementQuery: "Ambient churn",
+        elementRoles: ["button"],
+        redactSensitiveData: true
+      }
+    });
+    const ambientTarget = ambientContext.data.interactiveElements.find(
+      (element) => element.label === "Ambient churn"
+    );
+    const ambientResult = await extensionMessage(cdp, panelSessionId, {
+      type: "EXECUTE_PAGE_ACTIONS",
+      targetTabId: firstTabId,
+      actions: [{
+        id: "ambient-only-change",
+        type: "click",
+        ref: ambientTarget.ref,
+        reason: "ambient revision progress contract"
+      }],
+      executionBindings: [{
+        actionId: "ambient-only-change",
+        frameId: ambientTarget.frameId || 0,
+        documentId: ambientTarget.frameDocumentId || ambientContext.data.documentId,
+        targetBinding: ambientTarget.binding,
+        targetStateBinding: ambientTarget.stateBinding,
+        conditionBindings: []
+      }]
+    });
+    assert.equal(ambientResult.ok, true);
+    assert.equal(ambientResult.data.results[0].ok, true);
+    assert.equal(ambientResult.data.results[0].verification.changed, false);
+    assert.equal(ambientResult.data.results[0].verification.ambientChanged, true);
+    assert.equal(ambientResult.data.results[0].verification.indeterminate, true);
+
+    const mutableStateContext = await extensionMessage(cdp, panelSessionId, {
+      type: "COLLECT_PAGE_CONTEXT",
+      targetTabId: firstTabId,
+      options: {
+        maxTextChars: 4000,
+        maxElements: 20,
+        elementQuery: "Mutable state checkbox",
+        elementRoles: ["checkbox"],
+        redactSensitiveData: true
+      }
+    });
+    const mutableStateTarget = mutableStateContext.data.interactiveElements.find(
+      (element) => element.label === "Mutable state checkbox"
+    );
+    assert.equal(mutableStateTarget.checked, false);
+    await evaluate(cdp, panelSessionId, `(async () => {
+      await chrome.scripting.executeScript({
+        target: { tabId: ${JSON.stringify(firstTabId)} },
+        world: "MAIN",
+        func: () => {
+          document.getElementById("mutable-state-checkbox").checked = true;
+        }
+      });
+    })()`);
+    const mutableStateResult = await extensionMessage(cdp, panelSessionId, {
+      type: "EXECUTE_PAGE_ACTIONS",
+      targetTabId: firstTabId,
+      actions: [{
+        id: "property-only-state-change",
+        type: "click",
+        ref: mutableStateTarget.ref,
+        reason: "property-only target state contract"
+      }],
+      executionBindings: [{
+        actionId: "property-only-state-change",
+        frameId: mutableStateTarget.frameId || 0,
+        documentId: mutableStateTarget.frameDocumentId || mutableStateContext.data.documentId,
+        targetBinding: mutableStateTarget.binding,
+        targetStateBinding: mutableStateTarget.stateBinding,
+        conditionBindings: []
+      }]
+    });
+    assert.equal(mutableStateResult.data.results[0].ok, false);
+    assert.equal(mutableStateResult.data.results[0].code, "stale_target");
+    const checkboxStayedChecked = await evaluate(cdp, panelSessionId, `(async () => {
+      const [result] = await chrome.scripting.executeScript({
+        target: { tabId: ${JSON.stringify(firstTabId)} },
+        world: "MAIN",
+        func: () => document.getElementById("mutable-state-checkbox").checked
+      });
+      return result.result;
+    })()`);
+    assert.equal(checkboxStayedChecked, true, "a stale checkbox plan must not toggle current state");
+
+    const targetlessDocumentResult = await extensionMessage(cdp, panelSessionId, {
+      type: "EXECUTE_PAGE_ACTIONS",
+      targetTabId: firstTabId,
+      actions: [{
+        id: "targetless-stale-document",
+        type: "extract",
+        reason: "targetless document binding contract"
+      }],
+      executionBindings: [{
+        actionId: "targetless-stale-document",
+        frameId: 0,
+        documentId: "document-from-an-expired-observation",
+        targetBinding: "",
+        targetStateBinding: "",
+        conditionBindings: []
+      }]
+    });
+    assert.equal(targetlessDocumentResult.data.results[0].ok, false);
+    assert.equal(targetlessDocumentResult.data.results[0].code, "stale_target");
+
+    const textPressContext = await extensionMessage(cdp, panelSessionId, {
+      type: "COLLECT_PAGE_CONTEXT",
+      targetTabId: firstTabId,
+      options: {
+        maxTextChars: 4000,
+        maxElements: 20,
+        elementQuery: "Text press target",
+        elementRoles: ["button"],
+        redactSensitiveData: true
+      }
+    });
+    const textPressTarget = textPressContext.data.interactiveElements.find(
+      (element) => element.label === "Text press target"
+    );
+    const textPressResult = await extensionMessage(cdp, panelSessionId, {
+      type: "EXECUTE_PAGE_ACTIONS",
+      targetTabId: firstTabId,
+      actions: [{
+        id: "text-targeted-key",
+        type: "press",
+        text: "Text press target",
+        key: "ArrowDown",
+        reason: "text lookup press contract"
+      }],
+      executionBindings: [{
+        actionId: "text-targeted-key",
+        frameId: textPressTarget.frameId || 0,
+        documentId: textPressTarget.frameDocumentId || textPressContext.data.documentId,
+        targetBinding: textPressTarget.binding,
+        targetStateBinding: textPressTarget.stateBinding,
+        conditionBindings: []
+      }]
+    });
+    assert.equal(textPressResult.data.results[0].ok, true);
+    const pressCounts = await evaluate(cdp, panelSessionId, `(async () => {
+      const [result] = await chrome.scripting.executeScript({
+        target: { tabId: ${JSON.stringify(firstTabId)} },
+        world: "MAIN",
+        func: () => ({
+          target: window.__textPressTargetCount || 0,
+          decoy: window.__textPressDecoyCount || 0
+        })
+      });
+      return result.result;
+    })()`);
+    assert.equal(pressCounts.target, 1);
+    assert.equal(pressCounts.decoy, 0);
+
+    const waitBindingResult = await extensionMessage(cdp, panelSessionId, {
+      type: "EXECUTE_PAGE_ACTIONS",
+      targetTabId: firstTabId,
+      actions: [{
+        id: "bound-wait-condition",
+        type: "wait_for",
+        conditionJson: JSON.stringify({
+          type: "element_state",
+          ref: textPressTarget.ref,
+          state: "enabled",
+          expected: true
+        }),
+        ms: 500,
+        reason: "nested wait binding contract"
+      }],
+      executionBindings: [{
+        actionId: "bound-wait-condition",
+        frameId: textPressTarget.frameId || 0,
+        documentId: textPressTarget.frameDocumentId || textPressContext.data.documentId,
+        targetBinding: "",
+        targetStateBinding: "",
+        conditionBindings: [{
+          ref: textPressTarget.ref,
+          selector: "",
+          text: "",
+          frameId: textPressTarget.frameId || 0,
+          documentId: textPressTarget.frameDocumentId || textPressContext.data.documentId,
+          targetBinding: textPressTarget.binding,
+          targetStateBinding: textPressTarget.stateBinding
+        }]
+      }]
+    });
+    assert.equal(waitBindingResult.data.results[0].ok, true);
+    assert.equal(waitBindingResult.data.results[0].result.matched, true);
+
+    const raceContext = await extensionMessage(cdp, panelSessionId, {
+      type: "COLLECT_PAGE_CONTEXT",
+      targetTabId: firstTabId,
+      options: {
+        maxTextChars: 4000,
+        maxElements: 20,
+        elementQuery: "Post observation race original",
+        elementRoles: ["button"],
+        redactSensitiveData: true
+      }
+    });
+    const raceTarget = raceContext.data.interactiveElements.find(
+      (element) => element.label === "Post observation race original"
+    );
+    const raceExecutionPromise = extensionMessage(cdp, panelSessionId, {
+      type: "EXECUTE_PAGE_ACTIONS",
+      targetTabId: firstTabId,
+      actions: [{
+        id: "post-observation-race",
+        type: "click",
+        ref: raceTarget.ref,
+        reason: "post-action target identity contract"
+      }],
+      executionBindings: [{
+        actionId: "post-observation-race",
+        frameId: raceTarget.frameId || 0,
+        documentId: raceTarget.frameDocumentId || raceContext.data.documentId,
+        targetBinding: raceTarget.binding,
+        targetStateBinding: raceTarget.stateBinding,
+        conditionBindings: []
+      }]
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await extensionMessage(cdp, panelSessionId, {
+      type: "COLLECT_PAGE_CONTEXT",
+      targetTabId: firstTabId,
+      options: {
+        maxTextChars: 4000,
+        maxElements: 20,
+        elementQuery: "Post observation race decoy",
+        elementRoles: ["button"],
+        redactSensitiveData: true
+      }
+    });
+    const raceResult = await raceExecutionPromise;
+    assert.equal(raceResult.data.results[0].ok, true);
+    assert.equal(
+      raceResult.data.results[0].verification.changed,
+      false,
+      "post-action verification must stay bound to the exact executed node"
+    );
+
+    const staleClickCount = await evaluate(cdp, panelSessionId, `(async () => {
+      const [result] = await chrome.scripting.executeScript({
+        target: { tabId: ${JSON.stringify(firstTabId)} },
+        world: "MAIN",
+        func: () => {
+          const count = window.__staleTargetClickCount || 0;
+          document.getElementById("stale-target-fixture")?.remove();
+          delete window.__staleTargetClickCount;
+          delete window.__textPressTargetCount;
+          delete window.__textPressDecoyCount;
+          return count;
+        }
+      });
+      return result.result;
+    })()`);
+    assert.equal(staleClickCount, 0, "stale refs must never activate a recycled or selector-rebound target");
+
+    const pointerStartContext = await extensionMessage(cdp, panelSessionId, {
+      type: "COLLECT_PAGE_CONTEXT",
+      targetTabId: firstTabId,
+      options: { maxTextChars: 8000, maxElements: 40, redactSensitiveData: true }
+    });
+    const pointerTarget = pointerStartContext.data.interactiveElements.find(
+      (element) => element.label === "Pointer action"
+    );
     assert.ok(
       pointerTarget?.ref,
       `pointer-cursor custom controls should be recognized without page-specific selectors: ${JSON.stringify(firstContext.data.interactiveElements.map((element) => ({ label: element.label, tag: element.tag, rect: element.rect })))}`
@@ -1315,8 +1814,26 @@ try {
       type: "EXECUTE_PAGE_ACTIONS",
       targetTabId: firstTabId,
       actions: [
-        { id: "fill-cross-frame", type: "fill", ref: crossFrameInput.ref, value: "cross-bound", reason: "cross-origin frame E2E" },
-        { id: "click-cross-frame", type: "click", ref: crossFrameAction.ref, reason: "cross-origin action E2E" }
+        { id: "fill-cross-frame", type: "fill", selector: crossFrameInput.selector, value: "cross-bound", reason: "cross-origin selector routing E2E" },
+        { id: "click-cross-frame", type: "click", text: "Cross Frame Action", reason: "cross-origin text routing E2E" }
+      ],
+      executionBindings: [
+        {
+          actionId: "fill-cross-frame",
+          frameId: crossFrameInput.frameId,
+          documentId: crossFrameInput.frameDocumentId,
+          targetBinding: crossFrameInput.binding,
+          targetStateBinding: crossFrameInput.stateBinding,
+          conditionBindings: []
+        },
+        {
+          actionId: "click-cross-frame",
+          frameId: crossFrameAction.frameId,
+          documentId: crossFrameAction.frameDocumentId,
+          targetBinding: crossFrameAction.binding,
+          targetStateBinding: crossFrameAction.stateBinding,
+          conditionBindings: []
+        }
       ]
     });
     assert.equal(crossFrameResult.ok, true);
@@ -3114,15 +3631,32 @@ async function exerciseInternalElementDiscoveryContract({ cdp, panelSessionId, t
       const requestedCursors = [];
       const requestedSearches = [];
       let modelCalls = 0;
+      let mcpToolLoads = 0;
+      let mcpAssetLoads = 0;
+      let capabilityLoadsOverlappedObservation = false;
+      let releaseCapabilityLoads;
+      const capabilityLoadGate = new Promise((resolve) => {
+        releaseCapabilityLoads = resolve;
+      });
       collectDecisionObservation = async (discovery = {}) => {
+        capabilityLoadsOverlappedObservation = mcpToolLoads === 1 && mcpAssetLoads === 1;
+        releaseCapabilityLoads();
         requestedCursors.push(discovery.elementCursor || "");
         requestedSearches.push(discovery.elementQuery || "");
         const observed = discovery.elementQuery ? secondContext : firstContext;
         state.lastContext = observed;
         return { context: observed, screenshotDataUrl: "" };
       };
-      loadMcpToolContext = async () => ({ enabled: false, tools: [], error: "" });
-      loadMcpAssetContext = async () => ({ enabled: false, resources: [], prompts: [], error: "" });
+      loadMcpToolContext = async () => {
+        mcpToolLoads += 1;
+        await capabilityLoadGate;
+        return { enabled: false, tools: [], error: "" };
+      };
+      loadMcpAssetContext = async () => {
+        mcpAssetLoads += 1;
+        await capabilityLoadGate;
+        return { enabled: false, resources: [], prompts: [], error: "" };
+      };
       requestAiDecision = async () => {
         modelCalls += 1;
         const payload = modelCalls === 1
@@ -3190,6 +3724,9 @@ async function exerciseInternalElementDiscoveryContract({ cdp, panelSessionId, t
           nearText: decision.observationRequest?.elementNearText || ""
         },
         modelCalls,
+        mcpToolLoads,
+        mcpAssetLoads,
+        capabilityLoadsOverlappedObservation,
         userHandoffSuppressed: !state.conversation.some(
           (message) => message.role === "assistant" && /직접|수동/.test(message.text || "")
         )
@@ -3407,6 +3944,87 @@ async function exerciseInternalElementDiscoveryContract({ cdp, panelSessionId, t
         };
       };
       const recoveryDecision = await requestChatDecision(state.agentSession);
+
+      state.runtimeSettings = {
+        ...state.runtimeSettings,
+        maxAgentSteps: 3
+      };
+      state.agentSession = {
+        runId: "bounded-discovery-e2e",
+        targetTabId: ${JSON.stringify(tabId)},
+        documentId: ${JSON.stringify(context.documentId)},
+        latestUserMessage: "보이지 않는 대상을 찾아줘",
+        turnIntent: createFallbackTurnIntent("보이지 않는 대상을 찾아줘"),
+        successfulEffects: [],
+        successfulInteractions: [],
+        attemptLedger: [],
+        effectSequence: 0,
+        effectKeySalt: "bounded-discovery",
+        step: 0,
+        history: [],
+        evidence: [],
+        currentPageEvidenceId: "",
+        status: "running",
+        stopRequested: false,
+        pendingRequestId: "",
+        noProgressCount: 0,
+        lastObservationFingerprint: "",
+        lastDecisionFingerprint: "",
+        startedAt: new Date().toISOString()
+      };
+      let budgetObservationCalls = 0;
+      let budgetModelCalls = 0;
+      collectDecisionObservation = async (discovery = {}) => {
+        budgetObservationCalls += 1;
+        const observed = {
+          ...structuredClone(firstContext),
+          interactiveElements: [{
+            ref: "e1",
+            tag: "button",
+            role: "button",
+            type: "button",
+            label: \`Unrelated window \${budgetObservationCalls}\`,
+            selector: \`#unrelated-\${budgetObservationCalls}\`,
+            actionability: "interactive"
+          }],
+          elementDiscovery: {
+            scope: "current-visual-viewport",
+            query: "",
+            search: { query: "", roles: [], nearText: "" },
+            pageSize: 1,
+            returned: 1,
+            total: 1000,
+            availableTotal: 1000,
+            visited: budgetObservationCalls,
+            remaining: 1000 - budgetObservationCalls,
+            hasMore: true,
+            nextCursor: \`cursor-\${budgetObservationCalls + 1}\`
+          }
+        };
+        state.lastContext = observed;
+        return { context: observed, screenshotDataUrl: "" };
+      };
+      requestAiDecision = async () => {
+        budgetModelCalls += 1;
+        return {
+          text: JSON.stringify({
+            version: "1.0",
+            status: "blocked",
+            message: "현재 요소 묶음에서는 대상을 찾지 못했습니다.",
+            summary: "대상 없음",
+            progress: "현재 묶음 확인",
+            doneReason: "대상을 찾지 못함",
+            completionEvidence: [],
+            needsUserApproval: false,
+            plan: [],
+            elementSearch: { query: "", roles: [], nearText: "", reason: "" },
+            toolCalls: [],
+            actions: [],
+            verification: { required: false, expectedChange: "", successCriteria: [] }
+          })
+        };
+      };
+      const boundedDecision = await requestChatDecision(state.agentSession);
       return {
         ...firstScenario,
         recoveryDecisionStatus: recoveryDecision.status,
@@ -3416,7 +4034,13 @@ async function exerciseInternalElementDiscoveryContract({ cdp, panelSessionId, t
         repeatedDisclosureWasNotReturned:
           recoveryDecision.actions.every((action) => action.ref !== "request-form-options"),
         genericContractFailureHidden:
-          !recoveryDecision.message.includes("안전한 실행 계획으로 변환")
+          !recoveryDecision.message.includes("안전한 실행 계획으로 변환"),
+        boundedDiscoveryStatus: boundedDecision.status,
+        boundedDiscoveryMessage: boundedDecision.message,
+        boundedDiscoveryWindows: boundedDecision.discoveryBudget?.usedWindows || 0,
+        boundedDiscoveryLimit: boundedDecision.discoveryBudget?.maxWindows || 0,
+        boundedDiscoveryObservationCalls: budgetObservationCalls,
+        boundedDiscoveryModelCalls: budgetModelCalls
       };
     } finally {
       collectDecisionObservation = originalCollectDecisionObservation;
@@ -3838,6 +4462,53 @@ async function exerciseTurnBoundaryContracts({ cdp, panelSessionId, tabId, conte
       }), 2);
       enforceTurnEffectBoundary(unchangedSession, repeatedUnchangedDecision, currentContext);
 
+      const indeterminateSession = {
+        ...unchangedSession,
+        successfulEffects: [],
+        successfulInteractions: [],
+        attemptLedger: [],
+        effectSequence: 0,
+        effectKeySalt: "indeterminate-loop"
+      };
+      const indeterminateDecision = normalizeAiDecisionResponse(JSON.stringify({
+        ...unchangedDecision,
+        step: 1,
+        actions: [{
+          id: "indeterminate-attempt",
+          type: "click",
+          ref: "e1",
+          reason: "ambient-only change attempt"
+        }]
+      }), 1);
+      enforceTurnEffectBoundary(indeterminateSession, indeterminateDecision, currentContext);
+      recordExecutionOutcomes(indeterminateSession, indeterminateDecision, [], [{
+        ok: true,
+        action: indeterminateDecision.actions[0],
+        result: { mayNavigate: false },
+        verification: {
+          changed: false,
+          materialChanged: false,
+          ambientChanged: true,
+          indeterminate: true,
+          reason: "only ambient page revisions changed"
+        }
+      }]);
+      const repeatedIndeterminateDecision = normalizeAiDecisionResponse(JSON.stringify({
+        ...indeterminateDecision,
+        step: 2,
+        actions: [{
+          id: "indeterminate-attempt-again",
+          type: "click",
+          ref: "e1",
+          reason: "same target after ambient-only churn"
+        }]
+      }), 2);
+      enforceTurnEffectBoundary(
+        indeterminateSession,
+        repeatedIndeterminateDecision,
+        currentContext
+      );
+
       const writeToolContext = {
         tools: [{
           name: "fixture.update",
@@ -3918,7 +4589,9 @@ async function exerciseTurnBoundaryContracts({ cdp, panelSessionId, tabId, conte
         plannerContextCompacted: plannerPrompt.includes("Current page context JSON")
           && !plannerPrompt.includes('"documentTextExcerpt"')
           && !plannerPrompt.includes('"collectionDiagnostics"')
-          && !plannerPrompt.includes('"payload":'),
+          && !plannerPrompt.includes('"payload":')
+          && !plannerPrompt.includes('"binding":')
+          && !plannerPrompt.includes('"stateBinding":'),
         rawPageContextChars: JSON.stringify(currentContext).length,
         formattedPageContextChars: JSON.stringify(formatPageContextForPrompt(currentContext)).length,
         malformedRawHidden: !malformedText.includes('{"status"')
@@ -3938,6 +4611,12 @@ async function exerciseTurnBoundaryContracts({ cdp, panelSessionId, tabId, conte
         unchangedAttemptRepeatBlocked:
           repeatedUnchangedDecision.status === "blocked"
           && repeatedUnchangedDecision.actions.length === 0,
+        indeterminateAttemptNotCountedAsSuccess:
+          indeterminateSession.attemptLedger[0]?.outcome === "indeterminate"
+          && indeterminateSession.successfulEffects.length === 0,
+        indeterminateAttemptRepeatBlocked:
+          repeatedIndeterminateDecision.status === "blocked"
+          && repeatedIndeterminateDecision.actions.length === 0,
         stateChangingToolRepeatBlocked: repeatedWriteToolDecision.status === "blocked"
           && repeatedWriteToolDecision.toolCalls.length === 0,
         readOnlyToolRepeatAllowed: repeatedReadToolDecision.status === "continue"
@@ -4050,6 +4729,390 @@ async function exerciseLatencyFastPathContracts({ cdp, panelSessionId, context }
       };
     } finally {
       state.runtimeSettings = originalRuntimeSettings;
+    }
+  })()`);
+}
+
+async function exerciseLoopRuntimeContracts({ cdp, panelSessionId, tabId, context }) {
+  return evaluate(cdp, panelSessionId, `(async () => {
+    const original = {
+      requestChatDecision,
+      requestExecutionPolicy,
+      assessDecisionSafety,
+      prepareDecisionForExecution,
+      executeDecisionEffects,
+      executeDecisionActions,
+      waitAfterExecution,
+      sendRuntimeMessage,
+      collectContext,
+      delay,
+      verifyCurrentObservationProbe,
+      captureScreenshotIfEnabled,
+      settings: structuredClone(state.settings),
+      runtimeSettings: structuredClone(state.runtimeSettings),
+      activeTab: state.activeTab ? structuredClone(state.activeTab) : null,
+      lastContext: state.lastContext ? structuredClone(state.lastContext) : null,
+      agentSession: state.agentSession,
+      agentRunUi: state.agentRunUi,
+      currentPlan: state.currentPlan,
+      conversation: structuredClone(state.conversation),
+      evaluationLogs: structuredClone(state.evaluationLogs)
+    };
+    try {
+      state.runtimeSettings = {
+        ...state.settings,
+        agentMode: "auto",
+        maxAgentSteps: 1,
+        maxNoProgressSteps: 2,
+        maxActionsPerTurn: 2,
+        includeScreenshot: false,
+        mcpEnabled: false
+      };
+      state.activeTab = {
+        id: ${JSON.stringify(tabId)},
+        title: ${JSON.stringify(context.title)},
+        url: ${JSON.stringify(context.url)}
+      };
+      state.lastContext = structuredClone(${JSON.stringify(context)});
+      state.conversation = [];
+      state.evaluationLogs = [];
+      state.agentSession = {
+        runId: "loop-budget-e2e",
+        targetTabId: ${JSON.stringify(tabId)},
+        documentId: ${JSON.stringify(context.documentId)},
+        latestUserMessage: "한 번 실행하고 결과를 확인해줘",
+        turnIntent: createFallbackTurnIntent("한 번 실행하고 결과를 확인해줘"),
+        successfulEffects: [],
+        successfulInteractions: [],
+        attemptLedger: [],
+        effectSequence: 0,
+        effectKeySalt: "loop-budget",
+        step: 0,
+        history: [],
+        evidence: [],
+        currentPageEvidenceId: "",
+        status: "running",
+        stopRequested: false,
+        pendingRequestId: "",
+        noProgressCount: 0,
+        lastObservationFingerprint: "",
+        lastDecisionFingerprint: "",
+        finalVerificationAvailable: false,
+        startedAt: new Date().toISOString()
+      };
+      startRunTimeline("최종 검증 예산 확인");
+
+      const verificationOnlyFlags = [];
+      let decisionCalls = 0;
+      requestChatDecision = async (session, options = {}) => {
+        verificationOnlyFlags.push(Boolean(options.verificationOnly));
+        decisionCalls += 1;
+        session.step = decisionCalls;
+        if (decisionCalls === 1) {
+          return {
+            version: "1.0",
+            step: 1,
+            status: "continue",
+            message: "한 번 실행합니다.",
+            summary: "실행",
+            progress: "대상 확인",
+            doneReason: "",
+            completionEvidence: [],
+            needsUserApproval: false,
+            plan: ["실행", "결과 확인"],
+            toolCalls: [],
+            actions: [{ id: "one-effect", type: "click", ref: "e1", reason: "budget contract" }],
+            verification: { required: true, expectedChange: "result", successCriteria: ["result"] },
+            validation: { valid: true, errors: [], warnings: [] }
+          };
+        }
+        return {
+          version: "1.0",
+          step: 2,
+          status: "completed",
+          message: "실행 결과를 확인했습니다.",
+          summary: "완료",
+          progress: "최종 상태 확인",
+          doneReason: "최종 검증 완료",
+          completionEvidence: ["runtime-evidence"],
+          needsUserApproval: false,
+          plan: ["결과 확인"],
+          toolCalls: [],
+          actions: [],
+          verification: { required: true, expectedChange: "result", successCriteria: ["result"] },
+          validation: { valid: true, errors: [], warnings: [] }
+        };
+      };
+      requestExecutionPolicy = async () => ({
+        version: "1.0",
+        verdict: "allow",
+        message: "allowed",
+        risks: [],
+        sensitiveData: [],
+        approvalReasons: []
+      });
+      assessDecisionSafety = () => ({ blocked: [], warnings: [], requiresApproval: [] });
+      prepareDecisionForExecution = async () => ({ valid: true, errors: [] });
+      let executedEffects = 0;
+      executeDecisionEffects = async (_decision) => {
+        executedEffects += 1;
+        state.agentSession.finalVerificationAvailable = true;
+        return {
+          toolResults: [],
+          actionResults: [{
+            ok: true,
+            action: { type: "click" },
+            verification: { changed: true }
+          }]
+        };
+      };
+      waitAfterExecution = async () => {};
+      await runChatAgentLoop();
+      const finalStatus = state.agentSession.status;
+
+      waitAfterExecution = original.waitAfterExecution;
+      let toolOnlySettleMessages = 0;
+      sendRuntimeMessage = async () => {
+        toolOnlySettleMessages += 1;
+        return {};
+      };
+      await waitAfterExecution([]);
+      sendRuntimeMessage = original.sendRuntimeMessage;
+
+      let permanentRetryCalls = 0;
+      const permanentRetryDelays = [];
+      collectContext = async () => {
+        permanentRetryCalls += 1;
+        throw new Error("Permanent observation configuration error");
+      };
+      delay = async (ms) => {
+        permanentRetryDelays.push(ms);
+      };
+      await collectContextWithRetry().catch(() => null);
+
+      let transientRetryCalls = 0;
+      const transientRetryDelays = [];
+      collectContext = async () => {
+        transientRetryCalls += 1;
+        if (transientRetryCalls < 3) {
+          throw new Error("Receiving end does not exist");
+        }
+        return structuredClone(${JSON.stringify(context)});
+      };
+      delay = async (ms) => {
+        transientRetryDelays.push(ms);
+      };
+      await collectContextWithRetry();
+
+      let exhaustedRetryCalls = 0;
+      const exhaustedRetryDelays = [];
+      collectContext = async () => {
+        exhaustedRetryCalls += 1;
+        throw new Error("The message port is closed");
+      };
+      delay = async (ms) => {
+        exhaustedRetryDelays.push(ms);
+      };
+      await collectContextWithRetry().catch(() => null);
+
+      const freshContext = structuredClone(${JSON.stringify(context)});
+      const freshTarget = freshContext.interactiveElements[0];
+      const freshDecision = {
+        step: 1,
+        actions: [{
+          id: "fresh-fast-path",
+          type: "click",
+          ref: freshTarget.ref,
+          reason: "freshness fast path"
+        }],
+        preconditions: [],
+        observedDocumentId: freshContext.documentId || "",
+        observedPageUrl: freshContext.url || "",
+        observationRequest: {}
+      };
+      freshDecision.preconditions = buildActionPreconditions(freshDecision.actions, freshContext);
+      state.lastContext = freshContext;
+      verifyCurrentObservationProbe = async () => ({ matches: true, current: null });
+      let freshProbeCollections = 0;
+      collectContext = async () => {
+        freshProbeCollections += 1;
+        return freshContext;
+      };
+      const freshPreparation = await original.prepareDecisionForExecution(freshDecision);
+
+      executeDecisionActions = async () => [{
+        ok: true,
+        action: { id: "production-final-effect", type: "click", ref: "e1" },
+        result: { mayNavigate: false },
+        verification: { changed: true, materialChanged: true }
+      }];
+      state.agentSession.finalVerificationAvailable = false;
+      await original.executeDecisionEffects({
+        step: 1,
+        status: "continue",
+        toolCalls: [],
+        actions: [{ id: "production-final-effect", type: "click", ref: "e1" }],
+        semanticEffects: [],
+        structuralInteractions: [],
+        executionAttempts: [],
+        verification: { expectedChange: "material result", successCriteria: ["result"] }
+      });
+      const productionFinalVerificationOpened = state.agentSession.finalVerificationAvailable;
+
+      state.lastContext = freshContext;
+      const matchingBrowserContext = formatBrowserContext(freshContext.browser || null);
+      const makeToolDecision = (overrides = {}) => ({
+        step: 1,
+        actions: [],
+        toolCalls: [{
+          toolName: "fixture.update",
+          arguments: { record: "page-derived-record" }
+        }],
+        preconditions: [],
+        observedDocumentId: freshContext.documentId || "",
+        observedPageUrl: freshContext.url || "",
+        observedPageProbe: structuredClone(freshContext.observationProbe || null),
+        observedBrowserContext: structuredClone(matchingBrowserContext),
+        observedVisualObservationId: "",
+        observationRequest: {},
+        ...overrides
+      });
+      sendRuntimeMessage = async (message) => {
+        if (message?.type === "GET_BROWSER_CONTEXT") {
+          return structuredClone(matchingBrowserContext);
+        }
+        throw new Error("Unexpected runtime message in tool freshness contract.");
+      };
+      verifyCurrentObservationProbe = async () => ({ matches: true, current: null });
+      const stableToolEvidenceVerification = await verifyToolOnlyPlanningEvidence(
+        makeToolDecision(),
+        freshContext
+      );
+      const stableToolPreparation = await original.prepareDecisionForExecution(makeToolDecision());
+
+      let staleToolPreparationUsedPlanningProbe = false;
+      verifyCurrentObservationProbe = async (probeContext) => {
+        staleToolPreparationUsedPlanningProbe = (
+          AgentCore.stableStringify(probeContext?.observationProbe || null)
+          === AgentCore.stableStringify(freshContext.observationProbe || null)
+        );
+        return { matches: false, current: null };
+      };
+      let staleToolPreparationCollections = 0;
+      collectContext = async () => {
+        staleToolPreparationCollections += 1;
+        return {
+          ...freshContext,
+          visibleText: String(freshContext.visibleText || "") + " changed record"
+        };
+      };
+      const staleToolPreparation = await original.prepareDecisionForExecution(makeToolDecision());
+
+      const changedBrowserContext = structuredClone(matchingBrowserContext);
+      if (changedBrowserContext?.tabs?.length) {
+        changedBrowserContext.tabs[0].title = String(
+          changedBrowserContext.tabs[0].title || ""
+        ) + " changed";
+      } else if (changedBrowserContext) {
+        changedBrowserContext.error = String(changedBrowserContext.error || "") + " changed";
+      }
+      verifyCurrentObservationProbe = async () => ({ matches: true, current: null });
+      sendRuntimeMessage = async (message) => {
+        if (message?.type === "GET_BROWSER_CONTEXT") {
+          return structuredClone(changedBrowserContext);
+        }
+        throw new Error("Unexpected runtime message in browser freshness contract.");
+      };
+      const changedBrowserToolPreparation = await original.prepareDecisionForExecution(
+        makeToolDecision()
+      );
+
+      const visualToolContext = structuredClone(freshContext);
+      const originalVisualScreenshot = "data:image/png;base64," + btoa(
+        "original:" + (freshContext.documentId || freshContext.url)
+      );
+      const changedVisualScreenshot = "data:image/png;base64," + btoa(
+        "changed:" + (freshContext.documentId || freshContext.url)
+      );
+      await bindScreenshotObservation(visualToolContext, originalVisualScreenshot);
+      state.lastContext = visualToolContext;
+      state.runtimeSettings.includeScreenshot = true;
+      verifyCurrentObservationProbe = async () => ({ matches: true, current: null });
+      sendRuntimeMessage = async (message) => {
+        if (message?.type === "GET_BROWSER_CONTEXT") {
+          return structuredClone(matchingBrowserContext);
+        }
+        throw new Error("Unexpected runtime message in visual freshness contract.");
+      };
+      let changedVisualCaptureCalls = 0;
+      captureScreenshotIfEnabled = async () => {
+        changedVisualCaptureCalls += 1;
+        return changedVisualScreenshot;
+      };
+      const changedVisualToolPreparation = await original.prepareDecisionForExecution(
+        makeToolDecision({
+          observedPageProbe: structuredClone(visualToolContext.observationProbe || null),
+          observedVisualObservationId: visualToolContext.visualObservation.id
+        })
+      );
+
+      return {
+        verificationOnlyFlags,
+        executedEffects,
+        finalStatus,
+        toolOnlySettleMessages,
+        permanentRetryCalls,
+        permanentRetryDelays: permanentRetryDelays.length,
+        transientRetryCalls,
+        transientRetryDelays,
+        exhaustedRetryCalls,
+        exhaustedRetryDelays,
+        freshProbeReusedObservation: freshPreparation.reusedObservation,
+        freshProbeCollections,
+        productionFinalVerificationOpened,
+        staleToolPreparationRejected: staleToolPreparation.valid === false,
+        staleToolPreparationCollections,
+        staleToolPreparationUsedPlanningProbe,
+        stableToolPreparationAccepted: stableToolPreparation.valid === true
+          && stableToolPreparation.reusedObservation === true,
+        stableToolPreparationDiagnostics: {
+          errors: stableToolPreparation.errors || [],
+          evidenceVerification: stableToolEvidenceVerification
+        },
+        changedBrowserToolPreparationRejected: changedBrowserToolPreparation.valid === false,
+        changedVisualToolPreparationRejected: changedVisualToolPreparation.valid === false,
+        changedVisualCaptureCalls
+      };
+    } finally {
+      requestChatDecision = original.requestChatDecision;
+      requestExecutionPolicy = original.requestExecutionPolicy;
+      assessDecisionSafety = original.assessDecisionSafety;
+      prepareDecisionForExecution = original.prepareDecisionForExecution;
+      executeDecisionEffects = original.executeDecisionEffects;
+      executeDecisionActions = original.executeDecisionActions;
+      waitAfterExecution = original.waitAfterExecution;
+      sendRuntimeMessage = original.sendRuntimeMessage;
+      collectContext = original.collectContext;
+      delay = original.delay;
+      verifyCurrentObservationProbe = original.verifyCurrentObservationProbe;
+      captureScreenshotIfEnabled = original.captureScreenshotIfEnabled;
+      state.settings = original.settings;
+      state.runtimeSettings = original.runtimeSettings;
+      state.activeTab = original.activeTab;
+      state.lastContext = original.lastContext;
+      state.agentSession = original.agentSession;
+      clearRunTimeline();
+      state.currentPlan = original.currentPlan;
+      state.conversation = original.conversation;
+      state.evaluationLogs = original.evaluationLogs;
+      elements.messageList.replaceChildren();
+      for (const message of state.conversation) {
+        appendChatMessage(message.role, message.text, {
+          tone: message.tone || "",
+          record: false
+        });
+      }
+      updateAgentButtons();
     }
   })()`);
 }
@@ -4351,6 +5414,142 @@ async function exerciseAgentVerificationContracts({ cdp, panelSessionId, tabId, 
         2,
         coherentScreenshot
       );
+      const completionCandidate = {
+        status: "completed",
+        message: "현재 화면 확인을 완료했습니다.",
+        summary: "현재 화면 확인",
+        progress: "확인 완료",
+        doneReason: "현재 화면 근거로 완료",
+        completionEvidence: [],
+        verification: {
+          required: true,
+          expectedChange: "현재 화면 확인",
+          successCriteria: ["현재 화면 근거"]
+        }
+      };
+      requestAiDecision = async () => ({
+        text: JSON.stringify({
+          version: "1.0",
+          status: "verified",
+          message: "이전 근거만 인용",
+          evidenceIds: [previousEvidence.id],
+          missingEvidence: [],
+          confidence: 0.99
+        }),
+        audit: null
+      });
+      const previousCompletionEvidence = await requestCompletionVerification(
+        evidenceSession,
+        completionCandidate,
+        currentContext,
+        2,
+        coherentScreenshot
+      );
+      requestAiDecision = async () => ({
+        text: JSON.stringify({
+          version: "1.0",
+          status: "verified",
+          message: "현재 근거 인용",
+          evidenceIds: [currentEvidence.id],
+          missingEvidence: [],
+          confidence: 0.99
+        }),
+        audit: null
+      });
+      const currentCompletionEvidence = await requestCompletionVerification(
+        evidenceSession,
+        completionCandidate,
+        currentContext,
+        2,
+        coherentScreenshot
+      );
+
+      const retainedEvidenceSession = {
+        ...evidenceSession,
+        runId: "retained-effect-evidence-contract",
+        evidence: [],
+        currentPageEvidenceId: ""
+      };
+      const retainedEffectEvidence = registerRuntimeEvidence(retainedEvidenceSession, {
+        source: "action_result",
+        step: 1,
+        summary: "A material effect that must survive later page observations.",
+        url: currentContext.url,
+        documentId: currentContext.documentId,
+        payload: { outcome: "changed" }
+      });
+      const staleVisualEvidence = registerRuntimeEvidence(retainedEvidenceSession, {
+        source: "visual_observation",
+        step: 1,
+        summary: "A prior screenshot that must not remain completion evidence.",
+        url: currentContext.url,
+        documentId: currentContext.documentId,
+        payload: { visualObservation: { id: "stale-visual" } }
+      });
+      for (let index = 0; index < 30; index += 1) {
+        const observationContext = structuredClone(currentContext);
+        observationContext.viewport.scrollY = index;
+        const observationEvidence = registerObservationEvidence(
+          retainedEvidenceSession,
+          observationContext,
+          index + 2
+        );
+        retainedEvidenceSession.currentPageEvidenceId = observationEvidence.id;
+      }
+      const retainedCompletionEvidence = getCompletionVerificationEvidence(
+        retainedEvidenceSession
+      );
+      const retainedCompletionEvidenceIds = retainedCompletionEvidence.map((entry) => entry.id);
+
+      const toolOnlyEvidenceSession = {
+        ...evidenceSession,
+        runId: "tool-only-completion-contract",
+        evidence: [],
+        attemptLedger: [],
+        currentPageEvidenceId: ""
+      };
+      const unrelatedPageEvidence = registerObservationEvidence(
+        toolOnlyEvidenceSession,
+        currentContext,
+        1
+      );
+      toolOnlyEvidenceSession.currentPageEvidenceId = unrelatedPageEvidence.id;
+      const toolResultEvidence = registerRuntimeEvidence(toolOnlyEvidenceSession, {
+        source: "tool_result",
+        step: 1,
+        summary: "The requested tool returned its result.",
+        url: currentContext.url,
+        documentId: currentContext.documentId,
+        payload: { result: "tool-only-result" }
+      });
+      const toolOnlyCompletionDecision = {
+        ...completionCandidate,
+        message: "도구 조회 결과는 tool-only-result입니다.",
+        completionEvidence: [toolResultEvidence.id]
+      };
+      requestAiDecision = async () => ({
+        text: JSON.stringify({
+          version: "1.0",
+          status: "verified",
+          message: "도구 결과만으로 완료를 확인했습니다.",
+          evidenceIds: [toolResultEvidence.id],
+          missingEvidence: [],
+          confidence: 0.99
+        }),
+        audit: null
+      });
+      const toolOnlyCompletionVerifier = await requestCompletionVerification(
+        toolOnlyEvidenceSession,
+        toolOnlyCompletionDecision,
+        currentContext,
+        2,
+        ""
+      );
+      const toolOnlyCompletionBound = bindVerifiedCompletionEvidence(
+        toolOnlyCompletionDecision,
+        toolOnlyCompletionVerifier,
+        toolOnlyEvidenceSession
+      );
 
       const visualContext = structuredClone(currentContext);
       visualContext.visualObservation = {
@@ -4469,6 +5668,20 @@ async function exerciseAgentVerificationContracts({ cdp, panelSessionId, tabId, 
         allVisualVerificationCallsReceivedScreenshot: screenshotChecks.length >= 4 && screenshotChecks.every(Boolean),
         previousViewportEvidenceStatus: previousViewportEvidence.status,
         currentViewportEvidenceStatus: currentViewportEvidence.status,
+        previousCompletionEvidenceStatus: previousCompletionEvidence.status,
+        currentCompletionEvidenceStatus: currentCompletionEvidence.status,
+        earlierEffectEvidenceRetained:
+          retainedCompletionEvidenceIds.includes(retainedEffectEvidence.id),
+        onlyCurrentViewportRetained:
+          retainedCompletionEvidence.filter((entry) => entry.source === "page_observation").length === 1
+          && retainedCompletionEvidenceIds.includes(retainedEvidenceSession.currentPageEvidenceId),
+        staleVisualEvidenceExcluded:
+          !retainedCompletionEvidenceIds.includes(staleVisualEvidence.id),
+        toolOnlyCompletionVerifiedWithoutUnrelatedPage:
+          toolOnlyCompletionVerifier.status === "verified"
+          && toolOnlyCompletionBound
+          && toolOnlyCompletionDecision.completionEvidence.length === 1
+          && toolOnlyCompletionDecision.completionEvidence[0] === toolResultEvidence.id,
         visualActionVerified: visualVerified.valid,
         visualActionRebound,
         visualVerifierReceivedScreenshot,

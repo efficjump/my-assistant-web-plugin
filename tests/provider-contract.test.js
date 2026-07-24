@@ -153,6 +153,253 @@ test("auto MCP version resolves to the current stable client preference", () => 
   assert.equal(runtime.resolveMcpProtocolVersion({ mcpProtocolVersion: "2025-06-18" }), "2025-06-18");
 });
 
+test("treats an MCP isError tool result as an execution failure", async () => {
+  const runtime = loadBackgroundFunctions();
+  runtime.ensureMcpInitialized = async () => {};
+  runtime.sendMcpRequest = async () => ({
+    result: {
+      isError: true,
+      content: [{ type: "text", text: "Tool rejected the request." }]
+    }
+  });
+
+  await assert.rejects(
+    runtime.callMcpTool(
+      { mcpEnabled: true },
+      { toolName: "dynamic-tool", arguments: {} }
+    ),
+    (error) => (
+      error?.name === "McpToolError"
+      && error?.code === "mcp_tool_error"
+      && /rejected/i.test(error.message)
+    )
+  );
+});
+
+test("execution bindings are an exact fail-closed action-ID map", async () => {
+  const runtime = loadBackgroundFunctions();
+  const action = (id) => ({ id, type: "click", ref: "e1" });
+  const binding = (actionId) => ({
+    actionId,
+    frameId: 0,
+    documentId: "document-1",
+    targetBinding: `binding-${actionId}`
+  });
+
+  const indexed = runtime.indexExecutionBindings(
+    [action("first"), action("second")],
+    [binding("second"), binding("first")]
+  );
+  assert.equal(indexed.get("first").targetBinding, "binding-first");
+  assert.equal(indexed.get("second").targetBinding, "binding-second");
+
+  await assert.rejects(
+    runtime.executePageActionsInFrames(
+      1,
+      [action("duplicate"), action("duplicate")],
+      [binding("duplicate")]
+    ),
+    /duplicate action ID/i
+  );
+  await assert.rejects(
+    runtime.executePageActionsInFrames(
+      1,
+      [action("first")],
+      [binding("first"), binding("first")]
+    ),
+    /duplicate execution binding ID/i
+  );
+  await assert.rejects(
+    runtime.executePageActionsInFrames(
+      1,
+      [action("first"), action("second")],
+      [binding("first")]
+    ),
+    /no matching execution binding: second/i
+  );
+  await assert.rejects(
+    runtime.executePageActionsInFrames(
+      1,
+      [action("first")],
+      [binding("unexpected")]
+    ),
+    /no matching action: unexpected/i
+  );
+});
+
+test("frame routing uses bindings and localizes condition refs without crossing frames", () => {
+  const runtime = loadBackgroundFunctions();
+  const selectorBinding = {
+    actionId: "selector-action",
+    frameId: 7,
+    documentId: "frame-document-7",
+    targetBinding: "target-7",
+    targetStateBinding: "state-7"
+  };
+  const selectorRoute = runtime.routeFrameAction({
+    id: "selector-action",
+    type: "click",
+    selector: "#bound-target"
+  }, selectorBinding);
+  assert.equal(selectorRoute.frameId, 7);
+  assert.equal(selectorRoute.executionBinding.frameId, 7);
+  assert.equal(selectorRoute.executionBinding.targetStateBinding, "state-7");
+
+  const conditionRoute = runtime.routeFrameAction({
+    id: "condition-action",
+    type: "wait_for",
+    conditionJson: JSON.stringify({
+      all: [
+        { type: "element_state", ref: "f7:e3", state: "checked" },
+        { type: "element", ref: "f7:e4", operator: "exists" }
+      ]
+    })
+  }, {
+    actionId: "condition-action",
+    frameId: 7,
+    documentId: "frame-document-7",
+    targetBinding: "",
+    conditionBindings: [
+      {
+        ref: "f7:e3",
+        selector: "#first",
+        text: "",
+        frameId: 7,
+        documentId: "frame-document-7",
+        targetBinding: "condition-1",
+        targetStateBinding: "state-1"
+      },
+      {
+        ref: "f7:e4",
+        selector: "#second",
+        text: "",
+        frameId: 7,
+        documentId: "frame-document-7",
+        targetBinding: "condition-2",
+        targetStateBinding: "state-2"
+      }
+    ]
+  });
+  const routedCondition = JSON.parse(conditionRoute.action.conditionJson);
+  assert.equal(conditionRoute.frameId, 7);
+  assert.equal(routedCondition.all[0].ref, "e3");
+  assert.equal(routedCondition.all[1].ref, "e4");
+  assert.deepEqual(
+    Array.from(conditionRoute.executionBinding.conditionBindings, (item) => item.ref),
+    ["e3", "e4"]
+  );
+
+  assert.throws(
+    () => runtime.routeFrameAction(
+      { id: "conflict", type: "click", ref: "f8:e1" },
+      { ...selectorBinding, actionId: "conflict" }
+    ),
+    /different frames/i
+  );
+  assert.throws(
+    () => runtime.routeFrameAction(
+      { id: "condition-conflict", type: "wait_for", conditionJson: "{}" },
+      {
+        ...selectorBinding,
+        actionId: "condition-conflict",
+        conditionBindings: [{
+          ref: "f8:e1",
+          frameId: 8,
+          documentId: "frame-document-8",
+          targetBinding: "condition-8",
+          targetStateBinding: "state-8"
+        }]
+      }
+    ),
+    /different frame/i
+  );
+});
+
+test("the external page driver forwards execution bindings", async () => {
+  const runtime = loadBackgroundFunctions();
+  let driver = null;
+  const storageArea = {
+    get: async () => ({}),
+    set: async () => {},
+    setAccessLevel: async () => {}
+  };
+  runtime.chrome.storage = { local: storageArea, session: storageArea };
+  runtime.chrome.runtime.sendMessage = async () => ({});
+  runtime.WebExternalControlRuntime = {
+    createExternalControlRuntime(options) {
+      driver = options.driver;
+      return { initialize: async () => {} };
+    }
+  };
+  await runtime.initializeExternalControlBridge();
+  assert.ok(driver);
+
+  await assert.rejects(
+    driver.executePage(
+      1,
+      [{ id: "bound-action", type: "click", ref: "e1" }],
+      [{
+        actionId: "different-action",
+        frameId: 0,
+        documentId: "document-1",
+        targetBinding: "target-1"
+      }]
+    ),
+    /no matching action: different-action/i
+  );
+});
+
+test("legacy main-world anchors must match both selector and observed point", () => {
+  const runtime = loadBackgroundFunctions();
+  class FakeAnchor {
+    constructor(name) {
+      this.name = name;
+      this.clicked = false;
+    }
+
+    getAttribute(name) {
+      return name === "href" ? "javascript:activate()" : "";
+    }
+
+    click() {
+      this.clicked = true;
+    }
+  }
+  class FakeArea {}
+  runtime.HTMLAnchorElement = FakeAnchor;
+  runtime.HTMLAreaElement = FakeArea;
+
+  const first = new FakeAnchor("first");
+  const second = new FakeAnchor("second");
+  runtime.document = {
+    querySelectorAll: () => [first, second],
+    elementFromPoint: () => ({
+      closest: () => second
+    })
+  };
+
+  const activated = runtime.activateBoundJavascriptAnchor({
+    selector: "a[data-action='repeat']",
+    declaredHref: "javascript:activate()",
+    point: { x: 120, y: 80 }
+  });
+  assert.equal(activated.activated, true);
+  assert.equal(first.clicked, false);
+  assert.equal(second.clicked, true);
+
+  const replacement = new FakeAnchor("replacement");
+  runtime.document.elementFromPoint = () => ({
+    closest: () => replacement
+  });
+  const rejected = runtime.activateBoundJavascriptAnchor({
+    selector: "a[data-action='repeat']",
+    declaredHref: "javascript:activate()",
+    point: { x: 120, y: 80 }
+  });
+  assert.equal(rejected.activated, false);
+  assert.match(rejected.error, /activation point/i);
+});
+
 test("falls back once when a compatible endpoint rejects structured output", async () => {
   const requestBodies = [];
   const fetchImplementation = async (_url, init) => {

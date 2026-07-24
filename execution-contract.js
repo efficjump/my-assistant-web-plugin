@@ -85,6 +85,7 @@
     if (input.length > maxActions) {
       throw new Error(`No more than ${maxActions} actions may be submitted at once.`);
     }
+    const explicitActionIds = new Set();
     input.forEach((action, index) => {
       if (!action || typeof action !== "object" || Array.isArray(action)) {
         throw new TypeError(`actions[${index}] must be an object.`);
@@ -96,16 +97,43 @@
       if (!EXTERNAL_ACTION_TYPE_SET.has(String(action.type || "").trim().toLowerCase())) {
         throw new Error(`actions[${index}] uses an unavailable external action type: ${action.type || "missing"}`);
       }
+      const explicitId = normalizeExplicitActionId(action);
+      if (explicitId && explicitActionIds.has(explicitId)) {
+        throw new Error(`actions[${index}] reuses the explicit action id: ${explicitId}`);
+      }
+      if (explicitId) {
+        explicitActionIds.add(explicitId);
+      }
     });
 
-    const decision = AgentCore.normalizeDecision({ status: "continue", actions: input }, {
+    const assignedActionIds = new Set(explicitActionIds);
+    const actionsWithUniqueIds = input.map((action, index) => {
+      const explicitId = normalizeExplicitActionId(action);
+      if (explicitId) {
+        return { ...action, id: explicitId };
+      }
+      const baseId = `action-${index + 1}`;
+      let generatedId = baseId;
+      let suffix = 2;
+      while (assignedActionIds.has(generatedId)) {
+        generatedId = `${baseId}-${suffix}`;
+        suffix += 1;
+      }
+      assignedActionIds.add(generatedId);
+      return { ...action, id: generatedId };
+    });
+    const decision = AgentCore.normalizeDecision({ status: "continue", actions: actionsWithUniqueIds }, {
       step: 1,
       maxEffects: maxActions
     });
-    return decision.actions.map((action, index) => ({
-      ...action,
-      id: String(action.id || `external-action-${index + 1}`)
-    }));
+    return decision.actions;
+  }
+
+  function normalizeExplicitActionId(action) {
+    if (!action || !Object.hasOwn(action, "id")) {
+      return "";
+    }
+    return stringValue(action.id).trim();
   }
 
   function validateExternalActions(actions, context, options = {}) {
@@ -176,6 +204,8 @@
       parentFrameId: Number.isInteger(Number(target.parentFrameId)) ? Number(target.parentFrameId) : -1,
       frameDocumentId: stringValue(target.frameDocumentId),
       frameUrl: stringValue(target.frameUrl),
+      binding: stringValue(target.binding),
+      stateBinding: stringValue(target.stateBinding),
       rectSpace: stringValue(target.rectSpace),
       rectDigest: digestValue(target.rect || null),
       tag: stringValue(target.tag),
@@ -222,32 +252,95 @@
   }
 
   function buildActionPreconditions(actions, context) {
-    return (actions || []).map((action) => ({
-      actionId: stringValue(action.id),
-      documentId: stringValue(context?.documentId),
-      pageUrl: stringValue(context?.url),
-      contextDigest: contextDigest(context),
-      visualObservationId: stringValue(action.visualObservationId),
-      lookup: {
-        ref: stringValue(action.ref),
-        selector: stringValue(action.selector),
-        text: stringValue(action.text)
-      },
-      target: summarizeTargetForPrecondition(findActionTarget(action, context)),
-      browserTab: action.tabId
-        ? summarizeBrowserTab((context?.browser?.tabs || []).find((tab) => Number(tab.tabId) === Number(action.tabId)))
-        : null
-    }));
+    return (actions || []).map((action) => {
+      const conditionLookups = action?.type === "wait_for"
+        ? extractConditionElementLookups(action.conditionJson)
+        : [];
+      return {
+        actionId: stringValue(action.id),
+        actionType: stringValue(action.type),
+        documentId: stringValue(context?.documentId),
+        pageUrl: stringValue(context?.url),
+        contextDigest: contextDigest(context),
+        visualObservationId: stringValue(action.visualObservationId),
+        lookup: {
+          ref: stringValue(action.ref),
+          selector: stringValue(action.selector),
+          text: stringValue(action.text)
+        },
+        target: summarizeTargetForPrecondition(findActionTarget(action, context)),
+        conditionTargets: conditionLookups === null
+          ? null
+          : conditionLookups.map((lookup) => ({
+              lookup,
+              target: summarizeTargetForPrecondition(findActionTarget(lookup, context))
+            })),
+        browserTab: action.tabId
+          ? summarizeBrowserTab((context?.browser?.tabs || []).find((tab) => Number(tab.tabId) === Number(action.tabId)))
+          : null
+      };
+    });
+  }
+
+  function extractConditionElementLookups(conditionJson) {
+    if (typeof conditionJson !== "string" || !conditionJson.trim()) {
+      return null;
+    }
+    let condition;
+    try {
+      condition = JSON.parse(conditionJson);
+    } catch {
+      return null;
+    }
+    if (!condition || typeof condition !== "object" || Array.isArray(condition)) {
+      return null;
+    }
+
+    const lookups = [];
+    const pending = [condition];
+    while (pending.length) {
+      const current = pending.pop();
+      if (!current || typeof current !== "object") {
+        continue;
+      }
+      if (Array.isArray(current)) {
+        for (let index = current.length - 1; index >= 0; index -= 1) {
+          pending.push(current[index]);
+        }
+        continue;
+      }
+      const lookup = {};
+      for (const key of ["ref", "selector", "text"]) {
+        const value = stringValue(current[key]).trim();
+        if (value) {
+          lookup[key] = value;
+        }
+      }
+      if (Object.keys(lookup).length) {
+        lookups.push(lookup);
+      }
+      const children = Object.values(current);
+      for (let index = children.length - 1; index >= 0; index -= 1) {
+        pending.push(children[index]);
+      }
+    }
+    return lookups;
   }
 
   function validateActionPreconditions(preconditionsOrDecision, context) {
     const errors = [];
+    const hasDecisionActions = !Array.isArray(preconditionsOrDecision)
+      && Array.isArray(preconditionsOrDecision?.actions);
     const preconditions = Array.isArray(preconditionsOrDecision)
       ? preconditionsOrDecision
       : preconditionsOrDecision?.preconditions || [];
-    const actions = Array.isArray(preconditionsOrDecision?.actions)
+    const actions = hasDecisionActions
       ? preconditionsOrDecision.actions
-      : preconditions.map((item) => ({ id: item.actionId, ...(item.lookup || {}) }));
+      : preconditions.map((item) => ({
+          id: item.actionId,
+          type: item.actionType,
+          ...(item.lookup || {})
+        }));
     const byActionId = new Map(preconditions.map((item) => [String(item.actionId || ""), item]));
 
     if (preconditionsOrDecision?.observedDocumentId
@@ -289,6 +382,47 @@
           continue;
         }
       }
+      if (precondition.actionType === "wait_for" || action.type === "wait_for") {
+        if (!Array.isArray(precondition.conditionTargets)) {
+          errors.push(`The wait condition could not be bound for action ${action.id || "unknown"}.`);
+          continue;
+        }
+        if (hasDecisionActions) {
+          const currentLookups = extractConditionElementLookups(action.conditionJson);
+          const expectedLookups = precondition.conditionTargets.map((entry) => entry?.lookup || {});
+          if (
+            currentLookups === null
+            || AgentCore.stableStringify(currentLookups) !== AgentCore.stableStringify(expectedLookups)
+          ) {
+            errors.push(`The wait condition changed or is invalid for action ${action.id || "unknown"}.`);
+            continue;
+          }
+        }
+        let conditionTargetChanged = false;
+        for (const conditionTarget of precondition.conditionTargets) {
+          if (
+            !conditionTarget?.lookup
+            || !conditionTarget.target
+          ) {
+            conditionTargetChanged = true;
+            break;
+          }
+          const currentTarget = summarizeTargetForPrecondition(
+            findActionTarget(conditionTarget.lookup, context)
+          );
+          if (
+            AgentCore.stableStringify(currentTarget)
+            !== AgentCore.stableStringify(conditionTarget.target)
+          ) {
+            conditionTargetChanged = true;
+            break;
+          }
+        }
+        if (conditionTargetChanged) {
+          errors.push(`A wait condition target changed or disappeared for action ${action.id || "unknown"}.`);
+          continue;
+        }
+      }
       if (!precondition.target) {
         continue;
       }
@@ -306,8 +440,10 @@
     return digestValue({
       documentId: context?.documentId || "",
       url: context?.url || "",
-      domRevision: context?.pageState?.domRevision ?? context?.domRevision ?? null,
-      frameRevisions: context?.pageState?.frameRevisions || [],
+      frameDocuments: (context?.pageState?.frameRevisions || []).map((frame) => ({
+        frameId: frame.frameId,
+        documentId: frame.documentId || ""
+      })),
       elements: [
         ...(context?.interactiveElements || []),
         ...(context?.scrollRegions || []),

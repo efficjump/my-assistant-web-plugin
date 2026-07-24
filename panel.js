@@ -66,6 +66,17 @@ const CHAT_AGENT_SCHEMA_TEXT = AgentCore.buildDecisionContractText();
 
 const SUPPORTED_ACTION_TYPES = new Set(AgentCore.ACTION_TYPES);
 const BROWSER_ACTION_TYPES = new Set(AgentCore.BROWSER_ACTION_TYPES || []);
+const PRIVATE_RUNTIME_FIELDS = new Set([
+  "binding",
+  "stateBinding",
+  "beforeFingerprint",
+  "afterFingerprint",
+  "semanticFingerprint",
+  "fingerprint",
+  "observedPageProbe",
+  "observedBrowserContext",
+  "observedVisualObservationId"
+]);
 
 const SESSION_STORAGE_KEY = "chatSessions";
 const SETTINGS_SECRET_STORAGE_KEY = "settingsSecrets";
@@ -2892,6 +2903,7 @@ function createAgentSession(latestUserMessage) {
     noProgressCount: 0,
     lastObservationFingerprint: "",
     lastDecisionFingerprint: "",
+    finalVerificationAvailable: false,
     startedAt: new Date().toISOString()
   };
   startRunTimeline(latestUserMessage);
@@ -3251,12 +3263,24 @@ async function runChatAgentLoop() {
 
   while (!session.stopRequested) {
     const runtimeSettings = getRuntimeSettings();
-    if (session.step >= runtimeSettings.maxAgentSteps) {
+    const turnBudgetExhausted = session.step >= runtimeSettings.maxAgentSteps;
+    if (turnBudgetExhausted && !session.finalVerificationAvailable) {
       finishAgent("blocked", `최대 턴 ${runtimeSettings.maxAgentSteps}회에 도달했습니다.`);
       return;
     }
+    const verificationOnly = turnBudgetExhausted && session.finalVerificationAvailable;
+    if (verificationOnly) {
+      session.finalVerificationAvailable = false;
+    }
 
-    const decision = await requestChatDecision(session);
+    const decision = await requestChatDecision(session, { verificationOnly });
+    if (verificationOnly && ["continue", "discover"].includes(decision.status)) {
+      decision.status = "blocked";
+      decision.toolCalls = [];
+      decision.actions = [];
+      decision.message = "마지막 허용 작업의 결과를 확인했지만 완료 근거가 충분하지 않아 추가 실행 없이 중단했습니다.";
+      decision.doneReason = `최대 턴 ${runtimeSettings.maxAgentSteps}회 이후 최종 검증에서 완료되지 않음`;
+    }
     if (decision.status === "continue") {
       decision.policy = await requestExecutionPolicy(session, decision, state.lastContext);
     }
@@ -3299,6 +3323,21 @@ async function runChatAgentLoop() {
       return;
     }
 
+    const preparation = await prepareDecisionForExecution(decision);
+    if (!preparation.valid) {
+      appendChatMessage(
+        "system",
+        `판단 이후 페이지 상태가 바뀌어 기존 계획을 실행하지 않고 다시 관찰합니다.\n${preparation.errors.join("\n")}`,
+        { tone: "warning" }
+      );
+      state.currentPlan = null;
+      if (session.step >= runtimeSettings.maxAgentSteps) {
+        finishAgent("blocked", "마지막 실행 턴 전에 페이지 상태가 바뀌어 안전하게 중단했습니다.");
+        return;
+      }
+      continue;
+    }
+
     appendDecisionMessage(decision);
     const resultBundle = await executeDecisionEffects(decision);
     await waitAfterExecution(resultBundle.actionResults);
@@ -3309,14 +3348,24 @@ async function runChatAgentLoop() {
 
 async function requestChatDecision(session, discovery = {}) {
   const step = session.step + 1;
+  const runtimeSettings = getRuntimeSettings();
+  const discoveryState = discovery.state || {
+    windows: 0,
+    maxWindows: deriveDiscoveryWindowBudget(runtimeSettings)
+  };
+  discoveryState.windows += 1;
   setStatusLine(`${step}번째 턴 · 화면 관찰 중`);
   updateRunTimeline("observe", "active", `${step}번째 턴 화면 관찰 중`);
-  const observation = await collectDecisionObservation({
-    elementCursor: discovery.cursor || "",
-    elementQuery: discovery.query || "",
-    elementRoles: discovery.roles || [],
-    elementNearText: discovery.nearText || ""
-  });
+  const mcpContextPromise = discovery.mcpContextPromise || loadAgentMcpContext();
+  const [observation, mcpContext] = await Promise.all([
+    collectDecisionObservation({
+      elementCursor: discovery.cursor || "",
+      elementQuery: discovery.query || "",
+      elementRoles: discovery.roles || [],
+      elementNearText: discovery.nearText || ""
+    }),
+    mcpContextPromise
+  ]);
   const context = observation.context;
   session.documentId = context.documentId || session.documentId;
   const currentPageEvidence = registerObservationEvidence(session, context, step);
@@ -3326,16 +3375,14 @@ async function requestChatDecision(session, discovery = {}) {
     "done",
     `텍스트 ${context.visibleText.length.toLocaleString()}자 · 요소 ${context.interactiveElements.length.toLocaleString()}개`
   );
-  const toolContext = await loadMcpToolContext();
-  const assetContext = toolContext.enabled
-    ? await loadMcpAssetContext()
-    : { enabled: false, resources: [], prompts: [], error: "" };
-  const mcpContext = buildAgentMcpContext(toolContext, assetContext);
   const screenshotDataUrl = observation.screenshotDataUrl;
   setStatusLine(`${step}번째 턴 · AI 판단 중`);
   updateRunTimeline("think", "active", `${step}번째 턴 판단 중`);
 
-  const prompt = buildChatAgentPrompt(session, context, mcpContext, step);
+  const prompt = buildChatAgentPrompt(session, context, mcpContext, step, {
+    verificationOnly: Boolean(discovery.verificationOnly),
+    discoveryState
+  });
   const response = await requestAiDecision(session, {
     step,
     purpose: "decision",
@@ -3512,11 +3559,13 @@ async function requestChatDecision(session, discovery = {}) {
   const seenElementSearches = discovery.seenSearches instanceof Set
     ? discovery.seenSearches
     : new Set();
-  const maxSearchesPerTurn = Math.max(
-    2,
-    Math.min(8, Number(getRuntimeSettings().maxAgentSteps) || 2)
-  );
-  if (!session.stopRequested && validation.valid && decision.status === "discover") {
+  const maxSearchesPerTurn = discoveryState.maxWindows;
+  if (
+    !session.stopRequested
+    && !discovery.verificationOnly
+    && validation.valid
+    && decision.status === "discover"
+  ) {
     const requestedSearch = AgentCore.normalizeElementSearch(decision.elementSearch);
     const searchKey = AgentCore.stableStringify({
       query: requestedSearch.query,
@@ -3526,6 +3575,7 @@ async function requestChatDecision(session, discovery = {}) {
     if (
       !seenElementSearches.has(searchKey)
       && seenElementSearches.size < maxSearchesPerTurn
+      && discoveryState.windows < discoveryState.maxWindows
     ) {
       const nextSeenSearches = new Set(seenElementSearches);
       nextSeenSearches.add(searchKey);
@@ -3550,7 +3600,9 @@ async function requestChatDecision(session, discovery = {}) {
         seenSearches: nextSeenSearches,
         seenCursors: discovery.seenCursors,
         fallbackCursor,
-        fallbackUsed: Boolean(discovery.fallbackUsed)
+        fallbackUsed: Boolean(discovery.fallbackUsed),
+        state: discoveryState,
+        mcpContextPromise
       });
     }
     decision.status = "blocked";
@@ -3567,10 +3619,12 @@ async function requestChatDecision(session, discovery = {}) {
     : new Set();
   if (
     !session.stopRequested
+    && !discovery.verificationOnly
     && ["blocked", "clarify"].includes(decision.status)
     && context.elementDiscovery?.hasMore
     && nextElementCursor
     && !seenElementCursors.has(nextElementCursor)
+    && discoveryState.windows < discoveryState.maxWindows
   ) {
     const nextSeenCursors = new Set(seenElementCursors);
     nextSeenCursors.add(nextElementCursor);
@@ -3595,17 +3649,21 @@ async function requestChatDecision(session, discovery = {}) {
       seenCursors: nextSeenCursors,
       seenSearches: seenElementSearches,
       fallbackCursor,
-      fallbackUsed: Boolean(discovery.fallbackUsed)
+      fallbackUsed: Boolean(discovery.fallbackUsed),
+      state: discoveryState,
+      mcpContextPromise
     });
   }
 
   if (
     !session.stopRequested
+    && !discovery.verificationOnly
     && ["blocked", "clarify"].includes(decision.status)
     && currentSearchActive
     && Number(context.elementDiscovery?.returned || 0) === 0
     && fallbackCursor
     && !discovery.fallbackUsed
+    && discoveryState.windows < discoveryState.maxWindows
   ) {
     appendEvaluationLog({
       kind: "element-discovery-fallback",
@@ -3622,10 +3680,51 @@ async function requestChatDecision(session, discovery = {}) {
       seenCursors: seenElementCursors,
       seenSearches: seenElementSearches,
       fallbackCursor: "",
-      fallbackUsed: true
+      fallbackUsed: true,
+      state: discoveryState,
+      mcpContextPromise
     });
   }
 
+  if (
+    decision.status === "discover"
+    && (
+      discovery.verificationOnly
+      || discoveryState.windows >= discoveryState.maxWindows
+    )
+  ) {
+    decision.status = "blocked";
+    decision.elementSearch = AgentCore.normalizeElementSearch({});
+    decision.message = discovery.verificationOnly
+      ? "마지막 허용 작업 이후에는 추가 요소 탐색이나 실행을 시작하지 않고 현재 근거만 확인했습니다."
+      : `한 턴에서 허용된 요소 탐색 ${discoveryState.maxWindows}회 안에 실행 대상을 특정하지 못했습니다.`;
+    decision.doneReason = discovery.verificationOnly
+      ? "최종 검증 전용 관찰에서 추가 탐색이 필요함"
+      : "요소 탐색 예산에 도달함";
+  }
+  if (
+    !discovery.verificationOnly
+    && discoveryState.windows >= discoveryState.maxWindows
+    && context.elementDiscovery?.hasMore
+    && String(context.elementDiscovery?.nextCursor || "")
+    && ["blocked", "clarify"].includes(decision.status)
+  ) {
+    decision.status = "blocked";
+    decision.elementSearch = AgentCore.normalizeElementSearch({});
+    decision.message = `설정된 탐색 예산 ${discoveryState.maxWindows}회에 도달했지만 현재 viewport에 아직 확인하지 못한 요소가 남아 있어 대상을 단정하지 않았습니다.`;
+    decision.doneReason = "미탐색 요소가 남은 상태에서 요소 탐색 예산에 도달함";
+  }
+  if (discovery.verificationOnly && decision.status === "continue") {
+    decision.status = "blocked";
+    decision.toolCalls = [];
+    decision.actions = [];
+    decision.message = "마지막 허용 작업의 결과를 확인했지만 완료 근거가 충분하지 않아 추가 실행 없이 중단했습니다.";
+    decision.doneReason = `최대 턴 ${runtimeSettings.maxAgentSteps}회 이후 최종 검증에서 완료되지 않음`;
+  }
+  decision.discoveryBudget = {
+    usedWindows: discoveryState.windows,
+    maxWindows: discoveryState.maxWindows
+  };
   decision.observationRequest = {
     elementCursor: discovery.cursor || "",
     elementQuery: currentElementSearch.query,
@@ -3635,6 +3734,9 @@ async function requestChatDecision(session, discovery = {}) {
   decision.preconditions = buildActionPreconditions(decision.actions, context);
   decision.observedPageUrl = context.url || "";
   decision.observedDocumentId = context.documentId || "";
+  decision.observedPageProbe = structuredClone(context.observationProbe || null);
+  decision.observedBrowserContext = structuredClone(context.browser || null);
+  decision.observedVisualObservationId = context.visualObservation?.id || "";
   enforceTurnEffectBoundary(session, decision, context);
   const progressGuard = AgentCore.updateProgressGuard(session, context, decision, {
     limit: getRuntimeSettings().maxNoProgressSteps
@@ -3684,6 +3786,13 @@ async function requestChatDecision(session, discovery = {}) {
   });
   trimList(session.history, 18);
   return decision;
+}
+
+function deriveDiscoveryWindowBudget(runtimeSettings) {
+  return Math.max(
+    1,
+    Math.trunc(Number(runtimeSettings?.maxAgentSteps) || DEFAULT_SETTINGS.maxAgentSteps)
+  );
 }
 
 function parseDecisionFromAiText(text) {
@@ -3757,15 +3866,34 @@ function bindVerifiedCompletionEvidence(decision, verifier, session = state.agen
   if (decision?.status !== "completed" || verifier?.status !== "verified") {
     return false;
   }
-  const availableEvidenceIds = new Set(getAvailableEvidenceIds(session));
+  const currentPageEvidenceId = session?.currentPageEvidenceId || "";
+  const availableEvidenceIds = new Set(
+    getCompletionVerificationEvidence(session).map((entry) => entry.id)
+  );
   const verifiedEvidenceIds = Array.from(new Set(
     (verifier.evidenceIds || []).filter((evidenceId) => availableEvidenceIds.has(evidenceId))
   ));
-  if (!verifiedEvidenceIds.length) {
+  if (
+    completionRequiresCurrentPageEvidence(session)
+    && (
+      !currentPageEvidenceId
+      || !verifiedEvidenceIds.includes(currentPageEvidenceId)
+    )
+  ) {
     return false;
   }
   decision.completionEvidence = verifiedEvidenceIds;
   return true;
+}
+
+function completionRequiresCurrentPageEvidence(session) {
+  const evidence = session?.evidence || [];
+  const attempts = session?.attemptLedger || [];
+  const hasPageActionEvidence = evidence.some((entry) => entry.source === "action_result")
+    || attempts.some((attempt) => attempt.effectKind === "action");
+  const hasToolEvidence = evidence.some((entry) => entry.source === "tool_result")
+    || attempts.some((attempt) => attempt.effectKind === "tool");
+  return hasPageActionEvidence || !hasToolEvidence;
 }
 
 function bindCompletionVerifierAsGrounding(decision, verifier) {
@@ -3877,6 +4005,14 @@ function buildAgentMcpContext(toolContext, assetContext) {
     assetError: assetContext?.error || "",
     tools: interleaveCapabilityGroups([providerCapabilities, toolCapabilities, resourceCapabilities, promptCapabilities])
   };
+}
+
+async function loadAgentMcpContext() {
+  const [toolContext, assetContext] = await Promise.all([
+    loadMcpToolContext(),
+    loadMcpAssetContext()
+  ]);
+  return buildAgentMcpContext(toolContext, assetContext);
 }
 
 function buildProviderToolCapabilities() {
@@ -4002,7 +4138,10 @@ async function requestAiDecision(session, request) {
 
 async function requestCompletionVerification(session, decision, context, step, screenshotDataUrl = "") {
   updateRunTimeline("verify", "active", "독립 verifier가 완료 근거를 확인 중");
-  const evidenceIds = getAvailableEvidenceIds(session);
+  const evidence = getCompletionVerificationEvidence(session);
+  const evidenceIds = evidence.map((entry) => entry.id);
+  const currentPageEvidenceId = session.currentPageEvidenceId || "";
+  const requiresCurrentPageEvidence = completionRequiresCurrentPageEvidence(session);
   try {
     const response = await requestAiDecision(session, {
       step,
@@ -4014,11 +4153,12 @@ async function requestCompletionVerification(session, decision, context, step, s
         doneReason: decision.doneReason,
         completionEvidence: decision.completionEvidence,
         successCriteria: decision.verification?.successCriteria || []
-      }, null, 2)}\n\nRuntime evidence ledger JSON:\n${JSON.stringify(formatEvidenceLedger(session), null, 2)}\n\nCurrent bound document:\n${JSON.stringify({
+      }, null, 2)}\n\nEligible runtime evidence ledger JSON:\n${JSON.stringify(evidence, null, 2)}\n\nCurrent bound document:\n${JSON.stringify({
         targetTabId: session.targetTabId,
         documentId: context.documentId || "",
         url: context.url || "",
-        title: context.title || ""
+        title: context.title || "",
+        requiredPageEvidenceId: requiresCurrentPageEvidence ? currentPageEvidenceId : ""
       }, null, 2)}`,
       screenshotDataUrl,
       responseSchema: AgentCore.VERIFIER_SCHEMA
@@ -4029,6 +4169,21 @@ async function requestCompletionVerification(session, decision, context, step, s
       verifier.status = "rejected";
       verifier.message = validation.errors.join("\n");
       verifier.missingEvidence = Array.from(new Set([...verifier.missingEvidence, ...validation.errors]));
+    }
+    if (
+      verifier.status === "verified"
+      && requiresCurrentPageEvidence
+      && (
+        !currentPageEvidenceId
+        || !verifier.evidenceIds.includes(currentPageEvidenceId)
+      )
+    ) {
+      verifier.status = "rejected";
+      verifier.message = "완료 판정이 현재 페이지 관찰 근거를 인용하지 않았습니다.";
+      verifier.missingEvidence = Array.from(new Set([
+        ...verifier.missingEvidence,
+        "현재 페이지 관찰 근거가 필요합니다."
+      ]));
     }
     session.history.push({ kind: "verifier", step, ...verifier });
     appendEvaluationLog({ kind: "verifier", step, ...verifier });
@@ -4448,7 +4603,7 @@ function evaluateTurnEffectBoundary(session, decision, context) {
       .find((entry) => entry.key === attempt.key);
     if (
       !priorAttempt
-      || !["failed", "unchanged"].includes(priorAttempt.outcome)
+      || !["failed", "unchanged", "indeterminate"].includes(priorAttempt.outcome)
       || priorAttempt.observationDigest !== attempt.observationDigest
       || (
         attempt.targetSignature
@@ -4583,6 +4738,9 @@ function recordExecutionOutcomes(session, decision, toolResults, actionResults) 
       successCriteria: decision.verification?.successCriteria || [],
       actualChange: {
         changed: verification.changed === true,
+        materialChanged: verification.materialChanged === true,
+        ambientChanged: verification.ambientChanged === true,
+        indeterminate: verification.indeterminate === true,
         reason: truncate(redactSecretText(verification.reason || result?.error || ""), 1000),
         urlChanged: verification.urlChanged === true,
         domChanged: verification.domChanged === true,
@@ -4634,11 +4792,13 @@ function recordExecutionOutcomes(session, decision, toolResults, actionResults) 
         ? "navigation"
         : attempt.canSucceedWithoutPageChange
           ? "succeeded"
+          : result.verification?.indeterminate === true
+            ? "indeterminate"
           : result.verification?.changed === false
             ? "unchanged"
             : "changed";
     recordAttempt(attempt, outcome, result, sequence);
-    const madeProgress = result?.ok && !["failed", "unchanged"].includes(outcome);
+    const madeProgress = result?.ok && !["failed", "unchanged", "indeterminate"].includes(outcome);
     const semanticEffect = semanticEffects.find(
       (item) => item.effectKind === "action" && item.effectIndex === effectIndex && item.key
     );
@@ -4655,6 +4815,105 @@ function recordExecutionOutcomes(session, decision, toolResults, actionResults) 
   trimList(session.successfulEffects, 40);
   trimList(session.successfulInteractions, 40);
   trimList(session.attemptLedger, 60);
+}
+
+async function prepareDecisionForExecution(decision) {
+  if (!decision?.actions?.length && !decision?.toolCalls?.length) {
+    return {
+      valid: true,
+      errors: [],
+      observation: { context: state.lastContext, screenshotDataUrl: "" },
+      reusedObservation: true
+    };
+  }
+
+  const observationRequest = decision.observationRequest || {};
+  const hasVisualAction = decision.actions.some((action) => action.type === "visual_click");
+  const hasBrowserAction = decision.actions.some((action) => BROWSER_ACTION_TYPES.has(action.type));
+  const toolOnly = Boolean(decision.toolCalls?.length) && !decision.actions?.length;
+  let observation = null;
+  let reusedObservation = false;
+
+  if (toolOnly && !state.lastContext) {
+    return {
+      valid: false,
+      errors: ["도구 실행 계획을 검증할 원래 페이지 관찰이 없습니다."],
+      observation: { context: null, screenshotDataUrl: "" },
+      reusedObservation: false
+    };
+  }
+
+  if (!hasVisualAction && !hasBrowserAction && state.lastContext) {
+    if (toolOnly) {
+      const evidenceVerification = await verifyToolOnlyPlanningEvidence(decision, state.lastContext);
+      if (evidenceVerification.valid) {
+        observation = { context: state.lastContext, screenshotDataUrl: "" };
+        reusedObservation = true;
+      } else {
+        const errors = [
+          "도구 실행 계획을 만든 뒤 페이지 상태가 변경되어 현재 근거로 다시 판단해야 합니다."
+        ];
+        appendEvaluationLog({
+          kind: "execution-freshness",
+          step: decision.step,
+          outcome: "stale",
+          reusedObservation: false,
+          reasons: evidenceVerification.reasons,
+          errors
+        });
+        return {
+          valid: false,
+          errors,
+          observation: { context: state.lastContext, screenshotDataUrl: "" },
+          reusedObservation: false
+        };
+      }
+    } else {
+      const probe = await verifyCurrentObservationProbe({
+        observationProbe: decision.observedPageProbe || state.lastContext.observationProbe
+      });
+      if (probe.matches) {
+        observation = { context: state.lastContext, screenshotDataUrl: "" };
+        reusedObservation = true;
+      }
+    }
+  }
+
+  if (!observation) {
+    observation = hasVisualAction
+      ? await collectDecisionObservation(observationRequest)
+      : { context: await collectContextWithRetry(observationRequest), screenshotDataUrl: "" };
+  }
+
+  const errors = validateActionPreconditions(decision, observation.context);
+  if (errors.length) {
+    appendEvaluationLog({
+      kind: "execution-freshness",
+      step: decision.step,
+      outcome: "stale",
+      reusedObservation,
+      errors: errors.map((error) => truncate(redactSecretText(error), 500))
+    });
+    return { valid: false, errors, observation, reusedObservation };
+  }
+
+  const visualVerification = await verifyVisualActionsBeforeExecution(decision, observation);
+  if (!visualVerification.valid) {
+    return {
+      valid: false,
+      errors: visualVerification.errors,
+      observation,
+      reusedObservation
+    };
+  }
+
+  appendEvaluationLog({
+    kind: "execution-freshness",
+    step: decision.step,
+    outcome: "fresh",
+    reusedObservation
+  });
+  return { valid: true, errors: [], observation, reusedObservation };
 }
 
 async function executeCurrentPlan() {
@@ -4685,34 +4944,11 @@ async function executeCurrentPlan() {
 
   await runBusy(async () => {
     hideApprovalPanel();
-    const hasVisualAction = state.currentPlan.actions?.some((action) => action.type === "visual_click");
-    const observationRequest = state.currentPlan.observationRequest || {};
-    const freshObservation = hasVisualAction
-      ? await collectDecisionObservation(observationRequest)
-      : { context: await collectContextWithRetry(observationRequest), screenshotDataUrl: "" };
-    const freshContext = freshObservation.context;
-    const preconditionErrors = validateActionPreconditions(state.currentPlan, freshContext);
-    if (preconditionErrors.length) {
+    const preparation = await prepareDecisionForExecution(state.currentPlan);
+    if (!preparation.valid) {
       appendChatMessage(
         "system",
-        `승인 대기 중 페이지 상태가 바뀌어 기존 계획을 실행하지 않고 다시 계획합니다.\n${preconditionErrors.join("\n")}`,
-        { tone: "warning" }
-      );
-      state.currentPlan = null;
-      if (state.agentSession && !state.agentSession.stopRequested) {
-        state.agentSession.status = "running";
-        await runChatAgentLoop();
-      }
-      return;
-    }
-    const visualVerification = await verifyVisualActionsBeforeExecution(
-      state.currentPlan,
-      freshObservation
-    );
-    if (!visualVerification.valid) {
-      appendChatMessage(
-        "system",
-        `화면 좌표 대상을 현재 스크린샷에서 독립적으로 확인하지 못해 실행하지 않고 다시 계획합니다.\n${visualVerification.errors.join("\n")}`,
+        `승인 대기 중 페이지 상태가 바뀌어 기존 계획을 실행하지 않고 다시 계획합니다.\n${preparation.errors.join("\n")}`,
         { tone: "warning" }
       );
       state.currentPlan = null;
@@ -4740,44 +4976,37 @@ async function executeCurrentPlan() {
 }
 
 function buildActionPreconditions(actions, context) {
-  return (actions || []).map((action) => ({
-    actionId: action.id,
-    documentId: context?.documentId || "",
-    pageUrl: context?.url || "",
-    visualObservationStamp: action.type === "visual_click" ? buildVisualObservationStamp(context) : null,
-    target: summarizeTargetForPrecondition(findActionTarget(action, context)),
-    browserTab: action.tabId
-      ? summarizeBrowserTab((context?.browser?.tabs || []).find((tab) => Number(tab.tabId) === Number(action.tabId)))
-      : null,
-    download: action.downloadId
-      ? summarizeBrowserDownload((context?.browser?.downloads || []).find((item) => Number(item.downloadId) === Number(action.downloadId)))
-      : null
-  }));
+  const sharedPreconditions = ExecutionContract.buildActionPreconditions(actions || [], context || {});
+  return sharedPreconditions.map((precondition, index) => {
+    const action = actions[index] || {};
+    return {
+      ...precondition,
+      visualObservationStamp: action.type === "visual_click" ? buildVisualObservationStamp(context) : null,
+      download: action.downloadId
+        ? summarizeBrowserDownload((context?.browser?.downloads || []).find(
+            (item) => Number(item.downloadId) === Number(action.downloadId)
+          ))
+        : null
+    };
+  });
 }
 
 function validateActionPreconditions(decision, context) {
-  const errors = [];
-  if (decision?.observedDocumentId && decision.observedDocumentId !== context?.documentId) {
-    errors.push("승인 후 문서가 새로 로드되어 기존 요소 참조를 폐기했습니다.");
-    return errors;
-  }
-  if (decision?.observedPageUrl && decision.observedPageUrl !== context?.url) {
-    errors.push(`관찰한 페이지가 변경되었습니다: ${decision.observedPageUrl} → ${context?.url || "unknown"}`);
-    return errors;
+  const sharedValidation = ExecutionContract.validateActionPreconditions({
+    actions: decision?.actions || [],
+    preconditions: decision?.preconditions || [],
+    observedDocumentId: decision?.observedDocumentId || "",
+    observedPageUrl: decision?.observedPageUrl || ""
+  }, context || {});
+  const errors = [...(sharedValidation.errors || [])];
+  if (!sharedValidation.valid) {
+    return Array.from(new Set(errors));
   }
   const expected = new Map((decision?.preconditions || []).map((item) => [item.actionId, item]));
   for (const action of decision?.actions || []) {
     const precondition = expected.get(action.id);
     if (!precondition) {
       errors.push(`액션 사전조건이 없습니다: ${action.id}`);
-      continue;
-    }
-    if (precondition.pageUrl && precondition.pageUrl !== context?.url) {
-      errors.push(`페이지 URL이 변경되었습니다: ${precondition.pageUrl} → ${context?.url || "unknown"}`);
-      continue;
-    }
-    if (precondition.documentId && precondition.documentId !== context?.documentId) {
-      errors.push(`액션 대상 문서가 교체되었습니다: ${action.id}`);
       continue;
     }
     if (action.type === "visual_click") {
@@ -4793,15 +5022,6 @@ function validateActionPreconditions(decision, context) {
         continue;
       }
     }
-    if (precondition.browserTab) {
-      const currentTab = summarizeBrowserTab((context?.browser?.tabs || []).find(
-        (tab) => Number(tab.tabId) === Number(precondition.browserTab.tabId)
-      ));
-      if (!currentTab || AgentCore.stableStringify(currentTab) !== AgentCore.stableStringify(precondition.browserTab)) {
-        errors.push(`브라우저 탭 상태가 변경되었습니다: ${precondition.browserTab.tabId}`);
-        continue;
-      }
-    }
     if (precondition.download) {
       const currentDownload = summarizeBrowserDownload((context?.browser?.downloads || []).find(
         (item) => Number(item.downloadId) === Number(precondition.download.downloadId)
@@ -4811,15 +5031,8 @@ function validateActionPreconditions(decision, context) {
         continue;
       }
     }
-    if (!precondition.target) {
-      continue;
-    }
-    const currentTarget = summarizeTargetForPrecondition(findActionTarget(action, context));
-    if (!currentTarget || AgentCore.stableStringify(currentTarget) !== AgentCore.stableStringify(precondition.target)) {
-      errors.push(`액션 대상이 변경되었거나 사라졌습니다: ${action.ref || action.selector || action.text || action.id}`);
-    }
   }
-  return errors;
+  return Array.from(new Set(errors));
 }
 
 async function verifyVisualActionsBeforeExecution(decision, observation) {
@@ -5012,6 +5225,12 @@ async function executeDecisionEffects(decision) {
       actionResults: summarizeResults(actionResults)
     });
     trimList(state.agentSession.history, 18);
+    if (
+      toolResults.length + actionResults.length > 0
+      && decision.step >= getRuntimeSettings().maxAgentSteps
+    ) {
+      state.agentSession.finalVerificationAvailable = true;
+    }
   }
 
   return { toolResults, actionResults };
@@ -5076,7 +5295,8 @@ async function executeDecisionActions(decision) {
   const response = await sendRuntimeMessage({
     type: browserLevel ? "EXECUTE_BROWSER_ACTIONS" : "EXECUTE_PAGE_ACTIONS",
     targetTabId: getRuntimeTargetTabId(),
-    actions: decision.actions
+    actions: decision.actions,
+    executionBindings: browserLevel ? [] : buildDecisionExecutionBindings(decision)
   });
 
   const results = response.results || [];
@@ -5096,6 +5316,59 @@ async function executeDecisionActions(decision) {
   );
 
   return results;
+}
+
+function buildDecisionExecutionBindings(decision) {
+  const actionIds = (decision?.actions || []).map((action) => String(action?.id || ""));
+  const preconditionIds = (decision?.preconditions || []).map((item) => String(item?.actionId || ""));
+  if (
+    actionIds.some((id) => !id)
+    || new Set(actionIds).size !== actionIds.length
+    || preconditionIds.some((id) => !id)
+    || new Set(preconditionIds).size !== preconditionIds.length
+  ) {
+    throw new Error("실행 액션과 사전조건에는 서로 다른 action ID가 필요합니다.");
+  }
+  const preconditions = new Map(
+    (decision?.preconditions || []).map((item) => [String(item.actionId), item])
+  );
+  return (decision?.actions || []).map((action) => {
+    const precondition = preconditions.get(String(action.id || ""));
+    if (!precondition) {
+      throw new Error(`실행 사전조건을 찾지 못했습니다: ${action.id}`);
+    }
+    const conditionBindings = (precondition.conditionTargets || [])
+      .filter((entry) => entry?.target)
+      .map((entry) => ({
+        ref: entry.lookup?.ref || "",
+        selector: entry.lookup?.selector || "",
+        text: entry.lookup?.text || "",
+        frameId: Number.isInteger(Number(entry.target.frameId)) ? Number(entry.target.frameId) : 0,
+        documentId: entry.target.frameDocumentId || precondition.documentId || "",
+        targetBinding: entry.target.binding || "",
+        targetStateBinding: entry.target.stateBinding || ""
+      }));
+    const boundFrameIds = Array.from(new Set([
+      ...(precondition.target ? [Number(precondition.target.frameId) || 0] : []),
+      ...conditionBindings.map((binding) => binding.frameId)
+    ]));
+    if (boundFrameIds.length > 1) {
+      throw new Error(`한 액션은 서로 다른 프레임의 대상을 함께 실행할 수 없습니다: ${action.id || action.type}`);
+    }
+    const frameId = boundFrameIds[0] || 0;
+    const frameDocumentId = precondition.target?.frameDocumentId
+      || conditionBindings[0]?.documentId
+      || precondition.documentId
+      || "";
+    return {
+      actionId: action.id || "",
+      frameId,
+      documentId: frameDocumentId,
+      targetBinding: precondition.target?.binding || "",
+      targetStateBinding: precondition.target?.stateBinding || "",
+      conditionBindings
+    };
+  });
 }
 
 function recordUndoEntries(results) {
@@ -5383,18 +5656,45 @@ async function collectContext(discovery = {}) {
 
 async function collectContextWithRetry(discovery = {}) {
   let lastError;
-  for (let attempt = 0; attempt < 4; attempt += 1) {
+  const maxAttempts = 4;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     try {
       return await collectContext(discovery);
     } catch (error) {
       lastError = error;
-      if (isRestrictedPageError(error)) {
+      if (
+        attempt + 1 >= maxAttempts
+        || !isTransientObservationError(error)
+      ) {
         break;
       }
       await delay(350 + attempt * 350);
     }
   }
   throw lastError;
+}
+
+function isTransientObservationError(error) {
+  if (isRestrictedPageError(error)) {
+    return false;
+  }
+  const name = String(error?.name || "");
+  const code = String(error?.code || "").toLowerCase();
+  if (["AbortError", "NetworkError", "TimeoutError"].includes(name)) {
+    return true;
+  }
+  if ([
+    "context_unavailable",
+    "document_replaced",
+    "frame_detached",
+    "message_port_closed",
+    "navigation_in_progress"
+  ].includes(code)) {
+    return true;
+  }
+  return /receiving end does not exist|could not establish connection|message (?:channel|port) (?:is )?closed|frame was removed|no frame with id|document (?:was )?(?:unloaded|replaced)|navigation (?:is )?in progress/i.test(
+    String(error?.message || error || "")
+  );
 }
 
 function formatBrowserContext(context) {
@@ -5459,7 +5759,7 @@ async function collectDecisionObservation(discovery = {}) {
     const probeVerification = await verifyCurrentObservationProbe(context);
     if (probeVerification.matches) {
       return {
-        context: bindScreenshotObservation(context, screenshotDataUrl),
+        context: await bindScreenshotObservation(context, screenshotDataUrl),
         screenshotDataUrl
       };
     }
@@ -5533,10 +5833,56 @@ async function verifyCurrentObservationProbe(context) {
   }
 }
 
-function bindScreenshotObservation(context, screenshotDataUrl) {
-  const visualStamp = buildVisualObservationStamp(context);
-  const screenshotDigest = AgentCore.hashString(String(screenshotDataUrl || ""));
-  const id = `visual-${AgentCore.hashString(`${AgentCore.stableStringify(visualStamp)}:${screenshotDigest}`)}`;
+async function verifyToolOnlyPlanningEvidence(decision, context) {
+  const expectedVisualObservationId = String(decision?.observedVisualObservationId || "");
+  const screenshotDataUrl = expectedVisualObservationId
+    ? await captureScreenshotIfEnabled()
+    : "";
+  const [pageProbe, browserResult] = await Promise.all([
+    verifyCurrentObservationProbe({
+      observationProbe: decision?.observedPageProbe || context?.observationProbe
+    }),
+    sendRuntimeMessage({
+      type: "GET_BROWSER_CONTEXT",
+      targetTabId: getRuntimeTargetTabId()
+    }).then(
+      (value) => ({ ok: true, value: formatBrowserContext(value) }),
+      (error) => ({ ok: false, error })
+    )
+  ]);
+  const reasons = [];
+  if (!pageProbe.matches) {
+    reasons.push("page_probe_changed");
+  }
+
+  const expectedBrowserContext = Object.hasOwn(decision || {}, "observedBrowserContext")
+    ? decision.observedBrowserContext
+    : context?.browser || null;
+  if (
+    !browserResult.ok
+    || AgentCore.stableStringify(browserResult.value)
+      !== AgentCore.stableStringify(expectedBrowserContext)
+  ) {
+    reasons.push(browserResult.ok ? "browser_context_changed" : "browser_context_unavailable");
+  }
+
+  if (
+    expectedVisualObservationId
+    && (
+      !screenshotDataUrl
+      || await createVisualObservationId(context, screenshotDataUrl) !== expectedVisualObservationId
+    )
+  ) {
+    reasons.push(screenshotDataUrl ? "visual_observation_changed" : "visual_observation_unavailable");
+  }
+  return {
+    valid: reasons.length === 0,
+    reasons
+  };
+}
+
+async function bindScreenshotObservation(context, screenshotDataUrl) {
+  const id = await createVisualObservationId(context, screenshotDataUrl);
   context.visualObservation = {
     id,
     capturedAt: new Date().toISOString(),
@@ -5555,6 +5901,18 @@ function bindScreenshotObservation(context, screenshotDataUrl) {
     }
   };
   return context;
+}
+
+async function createVisualObservationId(context, screenshotDataUrl) {
+  const visualStamp = buildVisualObservationStamp(context);
+  const payload = new TextEncoder().encode(
+    `${AgentCore.stableStringify(visualStamp)}\u0000${String(screenshotDataUrl || "")}`
+  );
+  const digest = await globalThis.crypto.subtle.digest("SHA-256", payload);
+  const digestHex = Array.from(new Uint8Array(digest))
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+  return `visual-v2-${digestHex}`;
 }
 
 function buildVisualObservationStamp(context) {
@@ -5641,10 +5999,19 @@ function registerEffectEvidence(session, decision, toolResults, actionResults) {
     });
   }
   for (const [index, result] of actionResults.entries()) {
+    const outcome = !result.ok
+      ? "failed"
+      : result.result?.mayNavigate
+        ? "started navigation"
+        : result.verification?.changed
+          ? "produced a material observable change"
+          : result.verification?.indeterminate
+            ? "ran with an indeterminate ambient-only change"
+            : "ran without an observable change";
     registerRuntimeEvidence(session, {
       source: "action_result",
       step: decision.step,
-      summary: `${result.action?.type || `action-${index + 1}`} ${result.ok ? "executed" : "failed"}.`,
+      summary: `${result.action?.type || `action-${index + 1}`} ${outcome}.`,
       url: state.lastContext?.url || "",
       documentId: state.lastContext?.documentId || "",
       payload: summarizeResults([result])[0] || {}
@@ -5698,6 +6065,29 @@ function formatEvidenceLedger(session) {
     observedAt: item.observedAt,
     payload: item.payload
   }));
+}
+
+function getCompletionVerificationEvidence(session) {
+  const currentPageEvidenceId = session?.currentPageEvidenceId || "";
+  const evidence = (session?.evidence || []).map((item) => ({
+    id: item.id,
+    source: item.source,
+    step: item.step,
+    summary: item.summary,
+    url: item.url,
+    documentId: item.documentId,
+    observedAt: item.observedAt,
+    payload: item.payload
+  }));
+  const effectEvidence = evidence
+    .filter((entry) => !["page_observation", "visual_observation"].includes(entry.source));
+  const currentPageEvidence = evidence.find((entry) => (
+    entry.source === "page_observation"
+    && entry.id === currentPageEvidenceId
+  ));
+  return currentPageEvidence
+    ? [...effectEvidence, currentPageEvidence]
+    : effectEvidence;
 }
 
 function getEffectiveTurnIntent(session) {
@@ -5771,13 +6161,13 @@ For an unlabeled icon or button identified by its relationship to a nearby field
 Page-grounded answers are checked by an independent verifier. State only facts supported by the latest visual-viewport evidence; if that evidence is insufficient, ask one focused question or name the precise limitation instead of filling gaps from prior conversation.
 The turn intent was resolved once before observation. Do not broaden, reinterpret, or re-resolve it from raw chat. When repeatPolicy is once, a semantic state-changing effect that already succeeded must not be proposed again; verify the new state or finish instead.
 Do not activate the same disclosure control again unless a different material effect occurred after it or the resolved intent explicitly permits that repetition. Repeating a disclosure usually reverses the previous open/closed state rather than advancing the task.
-Treat transport success and task progress as different facts. An action marked unchanged or failed in the execution-attempt ledger did not advance the objective; do not retry the same target from the same evidence state. Use its expected-versus-actual change to select a different target, a relational element search, or a focused clarification.
+Treat transport success and task progress as different facts. An action marked unchanged, indeterminate, or failed in the execution-attempt ledger did not prove progress; do not retry the same target from the same evidence state. Use its expected-versus-actual change to select a different target, a relational element search, or a focused clarification.
 After every effect, verify the expected observable change. For completionEvidence, cite only IDs from the runtime ledger; use an empty array when unsure because the independent runtime verifier performs the final evidence binding. A completed status is accepted only after that binding succeeds and the final message contains the requested result itself. Never finish by promising to summarize or report later, or by saying that a result was produced without presenting it. A blocked status must state the actual blocker and the safest next step.
 
 ${CHAT_AGENT_SCHEMA_TEXT}`;
 }
 
-function buildChatAgentPrompt(session, context, mcpContext, step) {
+function buildChatAgentPrompt(session, context, mcpContext, step, options = {}) {
   const runtimeSettings = getRuntimeSettings();
   return `Resolved turn intent JSON:
 ${JSON.stringify(getEffectiveTurnIntent(session), null, 2)}
@@ -5786,7 +6176,14 @@ Picked element JSON:
 ${JSON.stringify(state.pickedElement || null, null, 2)}
 
 Agent turn:
-${step} of ${runtimeSettings.maxAgentSteps}
+${options.verificationOnly
+    ? `final verification after ${runtimeSettings.maxAgentSteps} allowed turns`
+    : `${step} of ${runtimeSettings.maxAgentSteps}`}
+
+Turn execution boundary:
+${options.verificationOnly
+    ? "Verification-only: inspect the latest result and return answer, completed, clarify, or blocked. Do not request discovery, tools, or page actions."
+    : `Execution is allowed. Element discovery window ${Number(options.discoveryState?.windows || 1)} of ${Number(options.discoveryState?.maxWindows || 1)}.`}
 
 Progress guard JSON:
 ${JSON.stringify({
@@ -5867,13 +6264,21 @@ function formatPageContextForPrompt(context) {
     liveRegions: context?.liveRegions || [],
     interactiveElementStats: context?.interactiveElementStats || null,
     elementDiscovery: context?.elementDiscovery || null,
-    interactiveElements: context?.interactiveElements || [],
-    scrollRegions: context?.scrollRegions || [],
-    visualSurfaces: context?.visualSurfaces || [],
+    interactiveElements: stripExecutionBindings(context?.interactiveElements || []),
+    scrollRegions: stripExecutionBindings(context?.scrollRegions || []),
+    visualSurfaces: stripExecutionBindings(context?.visualSurfaces || []),
     visualObservation: context?.visualObservation || null,
     automationCapabilities: context?.automationCapabilities || null,
     browser: context?.browser || null
   };
+}
+
+function stripExecutionBindings(items) {
+  return (items || []).map(({
+    binding: _binding,
+    stateBinding: _stateBinding,
+    ...item
+  }) => item);
 }
 
 function buildRuntimePolicy(context) {
@@ -6816,6 +7221,10 @@ function canExecuteCurrentPlan() {
 }
 
 async function waitAfterExecution(results) {
+  if (!results.length) {
+    updateRunTimeline("verify", "done", "도구 결과를 다음 턴에서 검증");
+    return;
+  }
   const mayNavigate = results.some((result) => {
     return result.action?.type === "navigate" || result.action?.type === "submit" || result.result?.mayNavigate;
   });
@@ -6852,16 +7261,13 @@ async function waitAfterExecution(results) {
       message: getUserFacingErrorMessage(error)
     });
   }
-  await refreshActiveTabSummary();
   const verifiedChanges = results.filter((result) => result.verification?.changed).length;
   const failed = results.filter((result) => !result.ok).length;
   const detail = failed
     ? `${failed.toLocaleString()}개 실패 · 다음 턴에서 재계획`
-    : results.length
-      ? `${verifiedChanges.toLocaleString()}/${results.length.toLocaleString()}개 변화 확인 · ${
-          Number(settleResult?.elapsedMs || 0).toLocaleString()
-        }ms 안정화`
-      : "도구 결과를 다음 턴에서 검증";
+    : `${verifiedChanges.toLocaleString()}/${results.length.toLocaleString()}개 변화 확인 · ${
+        Number(settleResult?.elapsedMs || 0).toLocaleString()
+      }ms 안정화`;
   updateRunTimeline("verify", failed ? "warning" : "done", detail);
 }
 
@@ -7021,9 +7427,23 @@ function summarizeResults(results) {
   return results.map((result) => ({
     ok: result.ok,
     action: result.action?.type || "",
-    detail: result.ok ? redactObject(result.result) : result.error,
-    verification: result.verification || null
+    detail: result.ok ? stripPrivateRuntimeFields(redactObject(result.result)) : result.error,
+    verification: stripPrivateRuntimeFields(result.verification || null)
   }));
+}
+
+function stripPrivateRuntimeFields(value) {
+  if (Array.isArray(value)) {
+    return value.map(stripPrivateRuntimeFields);
+  }
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([key]) => !PRIVATE_RUNTIME_FIELDS.has(key))
+      .map(([key, entry]) => [key, stripPrivateRuntimeFields(entry)])
+  );
 }
 
 function redactObject(value, keyName = "") {

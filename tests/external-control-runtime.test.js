@@ -117,8 +117,12 @@ class FakeDriver {
     return clone(this.observations[index]);
   }
 
-  async executePage(tabId, actions) {
-    this.pageExecutions.push({ tabId, actions: clone(actions) });
+  async executePage(tabId, actions, executionBindings) {
+    this.pageExecutions.push({
+      tabId,
+      actions: clone(actions),
+      executionBindings: clone(executionBindings)
+    });
     return { ok: true, actionCount: actions.length };
   }
 
@@ -777,6 +781,185 @@ test("browser observations expose only the shared page and omit unrelated tab in
   }
 });
 
+test("element bindings remain internal while execution receives immutable frame bindings", async () => {
+  const targetBinding = "binding-v1-child-save";
+  const targetStateBinding = "state-binding-v1-child-save";
+  const nestedBinding = "binding-v1-nested-private";
+  const nestedStateBinding = "state-binding-v1-nested-private";
+  const boundContext = pageContext({
+    element: {
+      ref: "f7:e1",
+      frameId: 7,
+      parentFrameId: 0,
+      frameDocumentId: "frame-document-7",
+      binding: targetBinding,
+      stateBinding: targetStateBinding
+    },
+    runtimeMetadata: {
+      binding: nestedBinding,
+      stateBinding: nestedStateBinding,
+      children: [{
+        binding: "binding-v1-array-private",
+        stateBinding: "state-binding-v1-array-private",
+        label: "private runtime record"
+      }]
+    }
+  });
+  const driver = new FakeDriver({
+    observations: [
+      boundContext,
+      boundContext,
+      pageContext({
+        element: {
+          ref: "f7:e1",
+          frameId: 7,
+          parentFrameId: 0,
+          frameDocumentId: "frame-document-7",
+          binding: targetBinding,
+          stateBinding: targetStateBinding
+        },
+        visibleText: "Settings saved"
+      })
+    ]
+  });
+  const storage = new MemoryStorage();
+  let policyContext = null;
+  const { runtime } = await createRuntime({
+    storage,
+    driver,
+    evaluatePolicy: async ({ context }) => {
+      policyContext = clone(context);
+      return {
+        version: "1.0",
+        verdict: "allow",
+        message: "Allowed",
+        risks: [],
+        sensitiveData: [],
+        approvalReasons: []
+      };
+    }
+  });
+  const session = await armAndStart(runtime);
+  const observation = await observe(runtime, session.session_id);
+
+  const serializedClientContext = JSON.stringify(observation.context);
+  assert.doesNotMatch(serializedClientContext, /"binding"/);
+  assert.doesNotMatch(serializedClientContext, /"stateBinding"/);
+  const persistedObservation = storage.snapshot()
+    .externalControlRuntimeV1
+    .sessions[session.session_id]
+    .observation
+    .context;
+  assert.equal(persistedObservation.interactiveElements[0].binding, targetBinding);
+  assert.equal(
+    persistedObservation.interactiveElements[0].stateBinding,
+    targetStateBinding
+  );
+  assert.equal(persistedObservation.runtimeMetadata.binding, nestedBinding);
+  assert.equal(persistedObservation.runtimeMetadata.stateBinding, nestedStateBinding);
+  assert.equal(
+    persistedObservation.runtimeMetadata.children[0].binding,
+    "binding-v1-array-private"
+  );
+  assert.equal(
+    persistedObservation.runtimeMetadata.children[0].stateBinding,
+    "state-binding-v1-array-private"
+  );
+
+  const proposed = await runtime.dispatch(
+    "browser_execute",
+    executionArgs(session.session_id, observation.observation_id, {
+      actions: [clickAction({ ref: "f7:e1" })]
+    })
+  );
+  assert.equal(proposed.status, "waiting_approval");
+  assert.ok(policyContext);
+  const serializedPolicyContext = JSON.stringify(policyContext);
+  assert.doesNotMatch(serializedPolicyContext, /"binding"/);
+  assert.doesNotMatch(serializedPolicyContext, /"stateBinding"/);
+
+  const completed = await runtime.approveOperation(proposed.operation_id);
+  assert.equal(completed.status, "completed");
+  assert.deepEqual(driver.pageExecutions[0].executionBindings, [{
+    actionId: "action-1",
+    frameId: 7,
+    documentId: "frame-document-7",
+    targetBinding,
+    targetStateBinding,
+    conditionBindings: []
+  }]);
+});
+
+test("wait conditions receive immutable bindings for every observed target", async () => {
+  const primaryTarget = {
+    ...pageContext().interactiveElements[0],
+    ref: "f7:e1",
+    selector: "#primary-control",
+    frameId: 7,
+    parentFrameId: 0,
+    frameDocumentId: "frame-document-7",
+    binding: "binding-v1-primary-control",
+    stateBinding: "state-binding-v1-primary-control"
+  };
+  const statusTarget = {
+    ...primaryTarget,
+    ref: "f7:e2",
+    selector: "#status-control",
+    label: "Status control",
+    binding: "binding-v1-status-control",
+    stateBinding: "state-binding-v1-status-control"
+  };
+  const boundContext = pageContext({
+    interactiveElements: [primaryTarget, statusTarget]
+  });
+  const driver = new FakeDriver({
+    observations: [boundContext, boundContext, boundContext]
+  });
+  const { runtime } = await createRuntime({ driver });
+  const session = await armAndStart(runtime);
+  const observation = await observe(runtime, session.session_id);
+  const completed = await runtime.dispatch(
+    "browser_execute",
+    executionArgs(session.session_id, observation.observation_id, {
+      actions: [{
+        type: "wait_for",
+        conditionJson: JSON.stringify({
+          all: [
+            { type: "element_state", ref: "f7:e1", state: "enabled" },
+            { type: "element", selector: "#status-control", operator: "exists" }
+          ]
+        }),
+        reason: "Wait for both observed controls"
+      }]
+    })
+  );
+
+  assert.equal(completed.status, "completed");
+  assert.deepEqual(driver.pageExecutions[0].executionBindings, [{
+    actionId: "action-1",
+    frameId: 7,
+    documentId: "frame-document-7",
+    targetBinding: "",
+    targetStateBinding: "",
+    conditionBindings: [
+      {
+        ref: "f7:e1",
+        frameId: 7,
+        documentId: "frame-document-7",
+        targetBinding: "binding-v1-primary-control",
+        targetStateBinding: "state-binding-v1-primary-control"
+      },
+      {
+        selector: "#status-control",
+        frameId: 7,
+        documentId: "frame-document-7",
+        targetBinding: "binding-v1-status-control",
+        targetStateBinding: "state-binding-v1-status-control"
+      }
+    ]
+  }]);
+});
+
 test("browser_execute must bind to the latest observation", async () => {
   const { runtime } = await createRuntime({
     driver: new FakeDriver({ observations: [pageContext(), pageContext({ domRevision: 2 })] })
@@ -833,6 +1016,75 @@ test("a state-changing proposal waits for trusted approval and re-observes befor
   assert.match(verified.next, /browser_session_close now/i);
   const closed = await runtime.dispatch("browser_session_close", { session_id: session.session_id });
   assert.match(closed.next, /final answer now/i);
+});
+
+test("public execution results recursively omit internal fingerprints", async () => {
+  const driver = new FakeDriver({
+    observations: [
+      pageContext(),
+      pageContext(),
+      pageContext({ visibleText: "Settings saved" })
+    ]
+  });
+  driver.executePage = async (tabId, actions, executionBindings) => {
+    driver.pageExecutions.push({
+      tabId,
+      actions: clone(actions),
+      executionBindings: clone(executionBindings)
+    });
+    return {
+      results: [{
+        ok: true,
+        action: actions[0],
+        result: {
+          detail: "saved",
+          fingerprint: "result-fingerprint-private",
+          nested: [{ semanticFingerprint: "semantic-private" }]
+        },
+        verification: {
+          changed: true,
+          beforeFingerprint: "before-private",
+          afterFingerprint: "after-private",
+          nested: {
+            fingerprint: "nested-private",
+            items: [{ afterFingerprint: "array-private" }]
+          }
+        }
+      }],
+      diagnostics: {
+        semanticFingerprint: "diagnostic-private",
+        status: "complete"
+      }
+    };
+  };
+  const storage = new MemoryStorage();
+  const { runtime } = await createRuntime({ storage, driver });
+  const session = await armAndStart(runtime);
+  const observation = await observe(runtime, session.session_id);
+  const proposed = await runtime.dispatch(
+    "browser_execute",
+    executionArgs(session.session_id, observation.observation_id)
+  );
+  const completed = await runtime.approveOperation(proposed.operation_id);
+  const publicResult = JSON.stringify(completed.result);
+
+  assert.equal(completed.status, "completed");
+  assert.equal(completed.result.results[0].verification.changed, true);
+  assert.equal(completed.result.results[0].result.detail, "saved");
+  for (const field of [
+    "beforeFingerprint",
+    "afterFingerprint",
+    "semanticFingerprint",
+    "fingerprint"
+  ]) {
+    assert.doesNotMatch(publicResult, new RegExp(field));
+  }
+  assert.doesNotMatch(
+    JSON.stringify(
+      storage.snapshot().externalControlRuntimeV1.operations[proposed.operation_id].result
+    ),
+    /beforeFingerprint|afterFingerprint|semanticFingerprint|"fingerprint"/
+  );
 });
 
 test("a policy outage allows deterministic disclosure but still gates a consequential click", async () => {

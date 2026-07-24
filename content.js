@@ -6,6 +6,8 @@ globalThis.__myAssistantWebPluginLoaded = true;
 
 const assistantPageState = {
   elementsByRef: new Map(),
+  elementBindings: new WeakMap(),
+  elementStateBindings: new WeakMap(),
   picker: null,
   domRevision: 0,
   documentId: createDocumentId(),
@@ -76,7 +78,7 @@ async function handleContentMessage(message) {
     case "WAIT_FOR_PAGE_SETTLE":
       return waitForPageSettle(message.options || {});
     case "EXECUTE_PAGE_ACTIONS":
-      return executePageActions(message.actions || []);
+      return executePageActions(message.actions || [], message.executionBindings || []);
     case "VERIFY_PAGE_ACTION_EFFECT":
       return verifyPageActionEffect(message.action || {}, message.beforeFingerprint || "");
     case "UNDO_PAGE_ACTIONS":
@@ -368,6 +370,8 @@ function readObservationProbeDescriptor(probe) {
     return {
       ref,
       connected: true,
+      binding: createElementBinding(element),
+      stateBinding: createElementStateBinding(element),
       exposed: Boolean(point),
       rect: compactProbeRect(rect),
       hitPoint: point
@@ -769,13 +773,17 @@ function collectInteractiveElements(options) {
       hitPoint: candidate.hitPoint,
       rect: candidate.rect
     });
+    info.binding = createElementBinding(element);
+    info.stateBinding = createElementStateBinding(element);
     if (searchActive) {
       info.searchMatch = buildPublicSearchMatch(candidate, redactSensitiveData);
     }
     assistantPageState.elementsByRef.set(ref, {
       element,
       selector: info.selector,
-      label: info.label
+      label: info.label,
+      binding: info.binding,
+      stateBinding: info.stateBinding
     });
     return info;
   });
@@ -1456,6 +1464,80 @@ function describeInteractiveElement(element, ref, options = {}) {
   });
 }
 
+function createElementBinding(element) {
+  if (!element?.tagName) {
+    return "";
+  }
+  const existing = assistantPageState.elementBindings.get(element);
+  if (existing) {
+    return existing;
+  }
+  const binding = createOpaqueElementToken("binding");
+  assistantPageState.elementBindings.set(element, binding);
+  return binding;
+}
+
+function createElementStateBinding(element) {
+  if (!element?.tagName) {
+    return "";
+  }
+  const tag = element.tagName.toLowerCase();
+  const inputType = tag === "input"
+    ? String(element.getAttribute("type") || "text").toLowerCase()
+    : "";
+  const compositeControl = findConcreteCompositeControl(element);
+  const actionControl = compositeControl || element;
+  const form = isDomInstance(actionControl, "HTMLFormElement")
+    ? actionControl
+    : actionControl.form || actionControl.closest?.("form");
+  const signature = JSON.stringify({
+    tag,
+    role: element.getAttribute("role") || inferredRole(element, inputType),
+    type: inputType || ("type" in element ? String(element.type || "").toLowerCase() : ""),
+    name: element.getAttribute("name") || "",
+    accessibleName: getAccessibleName(element),
+    activationTag: compositeControl?.tagName?.toLowerCase() || "",
+    href: ["a", "area"].includes(actionControl.tagName?.toLowerCase())
+      ? readElementHref(actionControl)
+      : "",
+    formAction: readFormAction(actionControl),
+    formMethod: form ? String(form.method || "get").toLowerCase() : "",
+    disabled: "disabled" in element ? Boolean(element.disabled) : false,
+    ariaDisabled: element.getAttribute("aria-disabled") === "true",
+    readOnly: "readOnly" in element ? Boolean(element.readOnly) : false,
+    checked: "checked" in element ? Boolean(element.checked) : null,
+    value: "value" in element ? String(element.value ?? "") : "",
+    ariaExpanded: element.getAttribute("aria-expanded") || "",
+    ariaSelected: element.getAttribute("aria-selected") || "",
+    options: isDomInstance(element, "HTMLSelectElement")
+      ? Array.from(element.options).map((option) => ({
+          value: String(option.value ?? ""),
+          label: normalizeWhitespace(option.textContent || ""),
+          selected: Boolean(option.selected),
+          disabled: Boolean(option.disabled)
+        }))
+      : []
+  });
+  const existing = assistantPageState.elementStateBindings.get(element);
+  if (existing?.signature === signature) {
+    return existing.binding;
+  }
+  const binding = createOpaqueElementToken("state");
+  assistantPageState.elementStateBindings.set(element, { signature, binding });
+  return binding;
+}
+
+function createOpaqueElementToken(kind) {
+  const entropy = globalThis.crypto?.randomUUID?.()
+    || Array.from(globalThis.crypto?.getRandomValues?.(new Uint32Array(4)) || [
+      Date.now(),
+      Math.random() * 0xffffffff,
+      performance.now() * 1000,
+      Math.random() * 0xffffffff
+    ]).map((value) => Math.floor(Number(value) || 0).toString(16).padStart(8, "0")).join("");
+  return `${kind}-v1-${entropy}`;
+}
+
 function collectScrollRegions(limit, redactSensitiveData) {
   const candidates = queryAllDom("*")
     .filter((element) => isScrollableRegion(element) && isElementVisuallyExposed(element))
@@ -1489,10 +1571,14 @@ function collectScrollRegions(limit, redactSensitiveData) {
       maxScrollLeft: Math.max(0, Math.round(element.scrollWidth - element.clientWidth)),
       rect: rectToJson(rect)
     });
+    region.binding = createElementBinding(element);
+    region.stateBinding = createElementStateBinding(element);
     assistantPageState.elementsByRef.set(ref, {
       element,
       selector: region.selector,
-      label: region.label
+      label: region.label,
+      binding: region.binding,
+      stateBinding: region.stateBinding
     });
     return region;
   });
@@ -1542,10 +1628,14 @@ function collectVisualSurfaces(limit, redactSensitiveData) {
       actionability: "visual-coordinate-only",
       rect: rectToJson(rect)
     });
+    surface.binding = createElementBinding(element);
+    surface.stateBinding = createElementStateBinding(element);
     assistantPageState.elementsByRef.set(ref, {
       element,
       selector: surface.selector,
-      label: surface.label
+      label: surface.label,
+      binding: surface.binding,
+      stateBinding: surface.stateBinding
     });
     return surface;
   });
@@ -1974,21 +2064,32 @@ function isElementSubtreeDefinitelyHidden(element) {
   );
 }
 
-async function executePageActions(actions) {
+async function executePageActions(actions, executionBindings = []) {
   if (!Array.isArray(actions)) {
     throw new Error("Actions must be an array.");
   }
-
+  const bindingsByActionId = indexContentExecutionBindings(actions, executionBindings);
   const results = [];
   for (const [index, action] of actions.entries()) {
     const normalized = normalizeAction(action);
+    const runtimeBinding = bindingsByActionId.get(String(normalized.id || "")) || null;
+    if (runtimeBinding) {
+      Object.defineProperty(normalized, "_runtimeBinding", {
+        value: runtimeBinding,
+        enumerable: false,
+        configurable: false,
+        writable: false
+      });
+    }
     try {
+      assertRuntimeDocumentBinding(normalized);
+      bindResolvedActionTarget(normalized);
       const before = captureActionState(normalized);
       const undo = buildUndoForAction(normalized);
       const result = await executeSingleAction(normalized);
       const after = result?.mayNavigate
         ? null
-        : await observeInitialActionState(before, normalized);
+        : await observeInitialActionState(before, normalized, { allowObservedMutation: true });
       const verification = compareActionStates(before, after, result);
       results.push({ index, ok: true, action: normalized, result, undo, verification });
       if (result?.mayNavigate || normalized.type === "navigate" || normalized.type === "submit") {
@@ -2013,11 +2114,74 @@ async function executePageActions(actions) {
   return { results };
 }
 
-async function observeInitialActionState(before, action) {
+function indexContentExecutionBindings(actions, executionBindings) {
+  if (!Array.isArray(executionBindings)) {
+    throw new Error("Execution bindings must be an array.");
+  }
+  const indexed = new Map();
+  if (!executionBindings.length) {
+    return indexed;
+  }
+  const actionIds = (actions || []).map((action) => String(action?.id || ""));
+  if (
+    actionIds.some((actionId) => !actionId)
+    || new Set(actionIds).size !== actionIds.length
+  ) {
+    throw new Error("Every bound action must have a unique action ID.");
+  }
+  const expectedIds = new Set(actionIds);
+  for (const binding of executionBindings) {
+    const actionId = String(binding?.actionId || "");
+    if (!actionId || indexed.has(actionId) || !expectedIds.has(actionId)) {
+      throw new Error("Every execution binding must match exactly one action ID.");
+    }
+    indexed.set(actionId, binding);
+  }
+  if (indexed.size !== expectedIds.size) {
+    throw new Error("Every action must have an execution binding.");
+  }
+  return indexed;
+}
+
+function assertRuntimeDocumentBinding(action) {
+  const runtimeBinding = action?._runtimeBinding || null;
+  if (
+    runtimeBinding?.documentId
+    && runtimeBinding.documentId !== assistantPageState.documentId
+  ) {
+    throw createContentControlError(
+      "stale_target",
+      "The observed document changed before the action could execute.",
+      {
+        expectedDocumentId: runtimeBinding.documentId,
+        currentDocumentId: assistantPageState.documentId
+      }
+    );
+  }
+}
+
+function bindResolvedActionTarget(action) {
+  if (!action || !(action.ref || action.selector || action.text) || action.type === "wait_for") {
+    return;
+  }
+  const element = resolveElement(action);
+  Object.defineProperty(action, "_resolvedTarget", {
+    value: {
+      element,
+      binding: createElementBinding(element),
+      stateBinding: createElementStateBinding(element)
+    },
+    enumerable: false,
+    configurable: false,
+    writable: false
+  });
+}
+
+async function observeInitialActionState(before, action, options = {}) {
   if (action?.type !== "wait") {
     await waitForRenderOpportunity();
   }
-  let after = captureActionState(action);
+  let after = captureActionState(action, options);
   if (before?.fingerprint !== after.fingerprint || action?.type === "wait") {
     return after;
   }
@@ -2029,12 +2193,12 @@ async function observeInitialActionState(before, action) {
     if (JSON.stringify(readPageSettleSignal()) === initialSignal) {
       continue;
     }
-    after = captureActionState(action);
+    after = captureActionState(action, options);
     if (before?.fingerprint !== after.fingerprint) {
       return after;
     }
   }
-  return captureActionState(action);
+  return captureActionState(action, options);
 }
 
 function waitForRenderOpportunity() {
@@ -2248,9 +2412,14 @@ async function waitForCondition(action) {
   } catch {
     throw new Error("wait_for conditionJson must be valid JSON.");
   }
+  const boundConditionTargets = bindWaitConditionTargets(action, condition);
   const timeoutMs = clampNumber(action.ms, 250, 30000, 10000);
   const startedAt = Date.now();
-  let lastResult = evaluateWaitCondition(condition, { startedAt });
+  const evaluationState = {
+    startedAt,
+    boundConditionTargets
+  };
+  let lastResult = evaluateWaitCondition(condition, evaluationState);
   if (lastResult.matched) {
     return { matched: true, elapsedMs: 0, observation: lastResult.observation };
   }
@@ -2273,14 +2442,18 @@ async function waitForCondition(action) {
       }
     };
     const check = () => {
-      assistantPageState.scopes = collectDomScopes(assistantPageState.includeChildFrames);
-      lastResult = evaluateWaitCondition(condition, { startedAt });
-      if (lastResult.matched) {
-        finish(null, {
-          matched: true,
-          elapsedMs: Date.now() - startedAt,
-          observation: lastResult.observation
-        });
+      try {
+        assistantPageState.scopes = collectDomScopes(assistantPageState.includeChildFrames);
+        lastResult = evaluateWaitCondition(condition, evaluationState);
+        if (lastResult.matched) {
+          finish(null, {
+            matched: true,
+            elapsedMs: Date.now() - startedAt,
+            observation: lastResult.observation
+          });
+        }
+      } catch (error) {
+        finish(error);
       }
     };
     for (const scope of getDomScopes()) {
@@ -2298,6 +2471,59 @@ async function waitForCondition(action) {
       finish(new Error(`wait_for condition was not satisfied within ${timeoutMs}ms.`));
     }, timeoutMs);
   });
+}
+
+function bindWaitConditionTargets(action, condition) {
+  const targets = new WeakMap();
+  const runtimeBindings = Array.isArray(action?._runtimeBinding?.conditionBindings)
+    ? action._runtimeBinding.conditionBindings
+    : [];
+  const pending = [condition];
+  while (pending.length) {
+    const current = pending.pop();
+    if (!current || typeof current !== "object") {
+      continue;
+    }
+    if (Array.isArray(current)) {
+      pending.push(...current);
+      continue;
+    }
+    const lookup = {
+      ref: String(current.ref || ""),
+      selector: String(current.selector || ""),
+      text: String(current.text || "")
+    };
+    if (lookup.ref || lookup.selector || lookup.text) {
+      const conditionBinding = runtimeBindings.find((binding) => (
+        String(binding?.ref || "") === lookup.ref
+        && String(binding?.selector || "") === lookup.selector
+        && String(binding?.text || "") === lookup.text
+      )) || null;
+      if (runtimeBindings.length && !conditionBinding) {
+        throw createContentControlError(
+          "stale_target",
+          "A wait condition target is not bound to the current observation."
+        );
+      }
+      const lookupAction = {
+        type: "wait_for",
+        ...lookup
+      };
+      if (conditionBinding) {
+        Object.defineProperty(lookupAction, "_runtimeBinding", {
+          value: conditionBinding,
+          enumerable: false
+        });
+      }
+      const element = resolveElement(lookupAction);
+      targets.set(current, {
+        element,
+        binding: createElementBinding(element)
+      });
+    }
+    pending.push(...Object.values(current));
+  }
+  return targets;
 }
 
 function evaluateWaitCondition(condition, state) {
@@ -2349,7 +2575,7 @@ function evaluateWaitCondition(condition, state) {
     return { matched: elapsed >= stableMs, observation: { revision, stableForMs: elapsed } };
   }
   if (["element", "element_state"].includes(type)) {
-    const element = tryResolveWaitElement(condition);
+    const element = tryResolveWaitElement(condition, state);
     if (operator === "not_exists") {
       return { matched: !element, observation: { exists: Boolean(element) } };
     }
@@ -2392,7 +2618,20 @@ function compareWaitValue(actualValue, expectedValue, operator, label) {
   return { matched, observation: { label, operator, expected, actual: truncate(actual, 500) } };
 }
 
-function tryResolveWaitElement(condition) {
+function tryResolveWaitElement(condition, state) {
+  const boundTarget = state?.boundConditionTargets?.get(condition);
+  if (boundTarget) {
+    const currentBinding = boundTarget.element?.isConnected
+      ? createElementBinding(boundTarget.element)
+      : "";
+    if (!currentBinding || currentBinding !== boundTarget.binding) {
+      throw createContentControlError(
+        "stale_target",
+        "A wait condition element was replaced before the condition completed."
+      );
+    }
+    return boundTarget.element;
+  }
   try {
     return resolveElement({
       ref: condition.ref,
@@ -2400,7 +2639,10 @@ function tryResolveWaitElement(condition) {
       text: condition.text,
       type: "wait_for"
     });
-  } catch {
+  } catch (error) {
+    if (error?.code === "stale_target") {
+      throw error;
+    }
     return null;
   }
 }
@@ -2443,6 +2685,7 @@ async function uploadFiles(action) {
       lastModified: Number(descriptor.lastModified) || Date.now()
     }));
   }
+  resolveElement(action);
   element.files = transfer.files;
   element.dispatchEvent(new ownerWindow.Event("input", { bubbles: true, composed: true }));
   element.dispatchEvent(new ownerWindow.Event("change", { bubbles: true, composed: true }));
@@ -2470,12 +2713,10 @@ function clickElement(action) {
       "A canvas or application surface requires a screenshot-bound visual action."
     );
   }
-  const compositeControl = findConcreteCompositeControl(element);
-  const actionControl = compositeControl || element;
-  const mayNavigate = actionMayUnloadPage(actionControl);
   prepareElementForAction(element);
+  resolveElement(action);
   assistantPageState.visualOccluderCache = new WeakMap();
-  const point = findExposedPoint(element);
+  let point = findExposedPoint(element);
   if (!point) {
     throw createContentControlError(
       "target_not_exposed",
@@ -2483,6 +2724,18 @@ function clickElement(action) {
     );
   }
   dispatchPointerSequence(element, point, { activate: true });
+  resolveElement(action);
+  assistantPageState.visualOccluderCache = new WeakMap();
+  point = findExposedPoint(element);
+  if (!point) {
+    throw createContentControlError(
+      "stale_target",
+      "The target changed or became covered during pointer preparation. Re-observe the page."
+    );
+  }
+  const compositeControl = findConcreteCompositeControl(element);
+  const actionControl = compositeControl || element;
+  const mayNavigate = actionMayUnloadPage(actionControl);
   const mainWorldActivation = buildMainWorldAnchorActivation(actionControl, point);
   if (mainWorldActivation) {
     return {
@@ -2493,12 +2746,7 @@ function clickElement(action) {
       mainWorldActivation
     };
   }
-  const activate = () => activateDeepestHitTarget(actionControl, point);
-  if (mayNavigate) {
-    window.setTimeout(activate, 80);
-  } else {
-    activate();
-  }
+  activateDeepestHitTarget(actionControl, point);
   return {
     clicked: getAccessibleName(element) || element.tagName.toLowerCase(),
     mayNavigate,
@@ -2532,6 +2780,7 @@ function fillElement(action) {
   const element = resolveElement(action);
   const value = action.value === undefined || action.value === null ? "" : String(action.value);
   prepareElementForAction(element);
+  resolveElement(action);
 
   if ("readOnly" in element && element.readOnly) {
     throw new Error("Resolved element is read-only.");
@@ -2566,6 +2815,7 @@ function fillElement(action) {
 function selectElement(action) {
   const element = resolveElement(action);
   prepareElementForAction(element);
+  resolveElement(action);
 
   if (!isDomInstance(element, "HTMLSelectElement")) {
     throw new Error("Resolved element is not a select control.");
@@ -2588,6 +2838,7 @@ function selectElement(action) {
 function focusElement(action) {
   const element = resolveElement(action);
   prepareElementForAction(element);
+  resolveElement(action);
   element.focus();
   return { focused: getAccessibleName(element) || element.tagName.toLowerCase() };
 }
@@ -2595,6 +2846,7 @@ function focusElement(action) {
 function hoverElement(action) {
   const element = resolveElement(action);
   prepareElementForAction(element);
+  resolveElement(action);
   assistantPageState.visualOccluderCache = new WeakMap();
   const point = findExposedPoint(element);
   if (!point) {
@@ -2609,18 +2861,18 @@ function hoverElement(action) {
 
 function submitElement(action) {
   const element = resolveElement(action);
+  prepareElementForAction(element);
+  resolveElement(action);
   const form = isDomInstance(element, "HTMLFormElement") ? element : element.closest("form");
   if (!form) {
     throw new Error("No form found for submit action.");
   }
 
-  window.setTimeout(() => {
-    if (typeof form.requestSubmit === "function") {
-      form.requestSubmit();
-    } else {
-      form.submit();
-    }
-  }, 80);
+  if (typeof form.requestSubmit === "function") {
+    form.requestSubmit();
+  } else {
+    form.submit();
+  }
   return { submitted: true, mayNavigate: true };
 }
 
@@ -2630,8 +2882,13 @@ function pressKey(action) {
     throw new Error("Key is required for press action.");
   }
 
-  const element = action.ref || action.selector ? resolveElement(action) : document.activeElement || document.body;
+  const element = action.ref || action.selector || action.text
+    ? resolveElement(action)
+    : document.activeElement || document.body;
   prepareElementForAction(element);
+  if (action.ref || action.selector || action.text) {
+    resolveElement(action);
+  }
 
   for (const type of ["keydown", "keypress", "keyup"]) {
     element.dispatchEvent(
@@ -2649,7 +2906,10 @@ function pressKey(action) {
   }
 
   if (key === "Enter" && isDomInstance(element, "HTMLInputElement") && element.form) {
-    window.setTimeout(() => element.form?.requestSubmit?.(), 80);
+    if (action.ref || action.selector || action.text) {
+      resolveElement(action);
+    }
+    element.form.requestSubmit?.();
     return { pressed: key, mayNavigate: true };
   }
 
@@ -2659,6 +2919,7 @@ function pressKey(action) {
 function scrollPage(action) {
   if (action.ref || action.selector || action.text) {
     const element = resolveElement(action);
+    resolveElement(action);
     if (isScrollableRegion(element)) {
       const direction = String(action.direction || "down").toLowerCase();
       const verticalAmount = clampNumber(
@@ -2784,6 +3045,7 @@ function visualClickSurface(action) {
     hitTarget
   };
   dispatchPointerSequence(surface, point, { activate: true });
+  resolveElement(action);
   const ownerWindow = hitTarget.ownerDocument?.defaultView || window;
   hitTarget.dispatchEvent(new ownerWindow.MouseEvent("click", {
     bubbles: true,
@@ -2835,28 +3097,51 @@ function navigatePage(action) {
     throw new Error("Only http and https navigation is allowed.");
   }
 
-  window.setTimeout(() => location.assign(resolved.href), 80);
+  location.assign(resolved.href);
   return { url: resolved.href, mayNavigate: true };
 }
 
 function resolveElement(action) {
+  const runtimeBinding = action?._runtimeBinding || null;
+  assertRuntimeDocumentBinding(action);
+  if (action?._resolvedTarget) {
+    return validateResolvedElementBinding(action, action._resolvedTarget);
+  }
   if (action.ref) {
     const found = assistantPageState.elementsByRef.get(String(action.ref));
-    if (found?.element?.isConnected) {
-      return found.element;
+    const currentBinding = found?.element?.isConnected
+      ? createElementBinding(found.element)
+      : "";
+    const currentStateBinding = found?.element?.isConnected
+      ? createElementStateBinding(found.element)
+      : "";
+    if (
+      !found?.element?.isConnected
+      || !currentBinding
+      || currentBinding !== found.binding
+      || (runtimeBinding?.targetBinding && currentBinding !== runtimeBinding.targetBinding)
+      || !currentStateBinding
+      || currentStateBinding !== found.stateBinding
+      || (
+        runtimeBinding?.targetStateBinding
+        && currentStateBinding !== runtimeBinding.targetStateBinding
+      )
+    ) {
+      throw createContentControlError(
+        "stale_target",
+        "The observed element reference changed before the action could execute. Re-observe the page.",
+        { ref: String(action.ref) }
+      );
     }
-    if (found?.selector) {
-      const selected = deepQuerySelector(found.selector);
-      if (selected) {
-        return selected;
-      }
-    }
+    return found.element;
   }
 
   if (action.selector) {
     const selected = deepQuerySelector(String(action.selector));
     if (selected) {
-      return selected;
+      return validateLookupElementBinding(action, selected, {
+        selector: String(action.selector)
+      });
     }
   }
 
@@ -2867,7 +3152,9 @@ function resolveElement(action) {
       .filter((element) => isElementVisuallyExposed(element))
       .find((element) => getAccessibleName(element).toLowerCase().includes(text));
     if (matched) {
-      return matched;
+      return validateLookupElementBinding(action, matched, {
+        text: String(action.text)
+      });
     }
   }
 
@@ -2876,6 +3163,61 @@ function resolveElement(action) {
     `Element not found for action: ${action.ref || action.selector || action.text || action.type}`,
     { ref: action.ref || "", selector: action.selector || "", text: action.text || "" }
   );
+}
+
+function validateLookupElementBinding(action, element, details = {}) {
+  const runtimeBinding = action?._runtimeBinding || null;
+  const currentBinding = createElementBinding(element);
+  const currentStateBinding = createElementStateBinding(element);
+  if (
+    (runtimeBinding?.targetBinding && currentBinding !== runtimeBinding.targetBinding)
+    || (
+      runtimeBinding?.targetStateBinding
+      && currentStateBinding !== runtimeBinding.targetStateBinding
+    )
+  ) {
+    throw createContentControlError(
+      "stale_target",
+      "The lookup now resolves to a different element or element state. Re-observe the page.",
+      details
+    );
+  }
+  return element;
+}
+
+function validateResolvedElementBinding(action, resolved) {
+  const element = resolved?.element || null;
+  const currentBinding = element?.isConnected ? createElementBinding(element) : "";
+  if (!element?.isConnected || !currentBinding || currentBinding !== resolved.binding) {
+    throw createContentControlError(
+      "stale_target",
+      "The resolved element was replaced before the action completed. Re-observe the page."
+    );
+  }
+  const runtimeBinding = action?._runtimeBinding || null;
+  if (runtimeBinding?.targetBinding && currentBinding !== runtimeBinding.targetBinding) {
+    throw createContentControlError(
+      "stale_target",
+      "The resolved element no longer matches the observed target binding."
+    );
+  }
+  if (!action?._allowObservedMutation) {
+    const currentStateBinding = createElementStateBinding(element);
+    if (
+      !currentStateBinding
+      || currentStateBinding !== resolved.stateBinding
+      || (
+        runtimeBinding?.targetStateBinding
+        && currentStateBinding !== runtimeBinding.targetStateBinding
+      )
+    ) {
+      throw createContentControlError(
+        "stale_target",
+        "The resolved element state changed before the action could execute. Re-observe the page."
+      );
+    }
+  }
+  return element;
 }
 
 function prepareElementForAction(element) {
@@ -3022,10 +3364,33 @@ function dispatchInputEvents(element) {
   element.dispatchEvent(new Event("change", { bubbles: true }));
 }
 
-function captureActionState(action) {
+function captureActionState(action, options = {}) {
+  const lookupAction = options.allowObservedMutation
+    ? Object.assign(Object.create(null), action)
+    : action;
+  if (options.allowObservedMutation) {
+    Object.defineProperty(lookupAction, "_allowObservedMutation", {
+      value: true,
+      enumerable: false
+    });
+    if (action?._resolvedTarget) {
+      Object.defineProperty(lookupAction, "_resolvedTarget", {
+        value: action._resolvedTarget,
+        enumerable: false
+      });
+    }
+    if (action?._runtimeBinding) {
+      Object.defineProperty(lookupAction, "_runtimeBinding", {
+        value: action._runtimeBinding,
+        enumerable: false
+      });
+    }
+  }
   let target = null;
   try {
-    target = action.ref || action.selector || action.text ? resolveElement(action) : null;
+    target = lookupAction.ref || lookupAction.selector || lookupAction.text
+      ? resolveElement(lookupAction)
+      : null;
   } catch {
     target = null;
   }
@@ -3043,13 +3408,27 @@ function captureActionState(action) {
     url: location.href,
     title: document.title,
     domRevision: assistantPageState.domRevision,
+    visualRevision: assistantPageState.visualRevision,
     scrollX: Math.round(window.scrollX),
     scrollY: Math.round(window.scrollY),
     target: targetState,
     liveText: collectLiveRegions(8).map((item) => item.text).join("\n"),
     visibleText: collectVisibleText(2000)
   };
-  return { ...snapshot, fingerprint: hashState(snapshot) };
+  const semanticSnapshot = {
+    url: snapshot.url,
+    title: snapshot.title,
+    scrollX: snapshot.scrollX,
+    scrollY: snapshot.scrollY,
+    target: snapshot.target,
+    liveText: snapshot.liveText,
+    visibleText: snapshot.visibleText
+  };
+  return {
+    ...snapshot,
+    fingerprint: hashState(semanticSnapshot),
+    semanticFingerprint: hashState(semanticSnapshot)
+  };
 }
 
 function compareActionStates(before, after, result) {
@@ -3061,12 +3440,26 @@ function compareActionStates(before, after, result) {
       afterFingerprint: ""
     };
   }
-  const changed = before?.fingerprint !== after.fingerprint;
+  const changed = before?.semanticFingerprint !== after.semanticFingerprint;
+  const ambientChanged = Boolean(
+    before
+    && (
+      before.domRevision !== after.domRevision
+      || before.visualRevision !== after.visualRevision
+    )
+  );
   const beforeTarget = summarizeActionTargetTransition(before?.target);
   const afterTarget = summarizeActionTargetTransition(after.target);
   return {
     changed,
-    reason: changed ? "observable page state changed" : "no observable page state change",
+    materialChanged: changed,
+    ambientChanged,
+    indeterminate: !changed && ambientChanged,
+    reason: changed
+      ? "material observable page state changed"
+      : ambientChanged
+        ? "only ambient page revisions changed"
+        : "no observable page state change",
     beforeFingerprint: before?.fingerprint || "",
     afterFingerprint: after.fingerprint,
     urlChanged: before?.url !== after.url,
@@ -3094,7 +3487,7 @@ function summarizeActionTargetTransition(target) {
 }
 
 function verifyPageActionEffect(action, beforeFingerprint) {
-  const after = captureActionState(normalizeAction(action));
+  const after = captureActionState(normalizeAction(action), { allowObservedMutation: true });
   const changed = Boolean(beforeFingerprint) && beforeFingerprint !== after.fingerprint;
   return {
     changed,

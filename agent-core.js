@@ -668,6 +668,7 @@
     const effectKeys = new Set();
     const availableEvidenceIds = new Set(options.availableEvidenceIds || []);
     const actionClasses = new Set();
+    const actionIds = new Set();
     let visualActionCount = 0;
 
     if (decision.effectsTruncated) {
@@ -713,6 +714,11 @@
     }
 
     for (const action of decision.actions) {
+      if (!action.id || actionIds.has(action.id)) {
+        errors.push(`각 페이지 액션에는 서로 다른 id가 필요합니다: ${action.id || "missing"}`);
+      } else {
+        actionIds.add(action.id);
+      }
       if (!ACTION_TYPES.includes(action.type)) {
         errors.push(`지원하지 않는 페이지 액션입니다: ${action.type || "missing"}`);
         continue;
@@ -1046,7 +1052,7 @@
 
     if (unchangedObservation && repeatedDecision) {
       session.noProgressCount = positiveInteger(session.noProgressCount, 0) + 1;
-    } else if (!unchangedObservation) {
+    } else {
       session.noProgressCount = 0;
     }
 
@@ -1072,8 +1078,29 @@
       url: context.url || "",
       title: context.title || "",
       viewport: context.viewport || null,
-      pageState: context.pageState || null,
-      elementDiscovery: context.elementDiscovery || null,
+      documentId: context.documentId || "",
+      pageState: {
+        readyState: context.pageState?.readyState || "",
+        visibilityState: context.pageState?.visibilityState || "",
+        scrollWidth: context.pageState?.scrollWidth ?? null,
+        scrollHeight: context.pageState?.scrollHeight ?? null,
+        activeElement: context.pageState?.activeElement || null,
+        frameBindings: (context.pageState?.frameRevisions || []).map((frame) => ({
+          frameId: frame.frameId,
+          documentId: frame.documentId || "",
+          viewport: frame.viewport || null,
+          visuallyVerified: Boolean(frame.visuallyVerified)
+        }))
+      },
+      elementDiscovery: context.elementDiscovery ? {
+        query: context.elementDiscovery.query || "",
+        search: context.elementDiscovery.search || null,
+        returned: context.elementDiscovery.returned ?? null,
+        total: context.elementDiscovery.total ?? null,
+        visited: context.elementDiscovery.visited ?? null,
+        remaining: context.elementDiscovery.remaining ?? null,
+        hasMore: Boolean(context.elementDiscovery.hasMore)
+      } : null,
       visibleText: String(context.visibleText || "").slice(0, 12000),
       elements: (context.interactiveElements || []).map((element) => ({
         ref: element.ref,
@@ -1112,8 +1139,15 @@
     return hashString(stableStringify({
       status: decision.status,
       elementSearch: decision.elementSearch,
-      toolCalls: decision.toolCalls,
-      actions: decision.actions,
+      toolCalls: (decision.toolCalls || []).map((call) => ({
+        toolName: call.toolName || "",
+        arguments: call.arguments || {}
+      })),
+      actions: (decision.actions || []).map((action) => Object.fromEntries(
+        Object.entries(action || {})
+          .filter(([key, value]) => !["id", "reason"].includes(key) && value !== undefined)
+          .sort(([left], [right]) => left.localeCompare(right))
+      )),
       successCriteria: decision.verification?.successCriteria || []
     }));
   }
@@ -1129,7 +1163,7 @@ Use visual_click only when the latest context contains visualObservation and a v
 Use the runtime-resolved immutable turn intent. Do not re-expand it from raw conversation history or retry a failed prior effect unless that intent explicitly carries the prior deliverable.
 A terminal message is the exact response shown to the user. For answer or completed, include the requested result itself. Never end with a promise to inspect, summarize, compare, or report later, and never say that information was summarized without presenting that information.
 Keep each turn small. Prefer one effect class per turn. If the previous attempt made no progress, choose a materially different action, gather missing evidence, ask one focused clarification, or stop with a precise blocker.
-An executed request is not proof of progress. Use the reported observable change and do not repeat the same failed, unchanged, or disclosure-toggle attempt from the same evidence state.
+An executed request is not proof of progress. Use the reported observable change and do not repeat the same failed, unchanged, indeterminate, or disclosure-toggle attempt from the same evidence state.
 Do not expose chain-of-thought. summary and progress must contain only concise conclusions and observable facts.`;
   }
 

@@ -217,6 +217,12 @@ test("normal DOM turns use latency fast paths without weakening state-changing p
   assert.match(policyFunction, /ExecutionContract\.actionChangesState\(action,\s*target,\s*context\) === false/);
   assert.match(policyFunction, /decision\.toolCalls\?\.length/);
   assert.match(settleFunction, /type:\s*"WAIT_FOR_PAGE_SETTLE"/);
+  assert.match(settleFunction, /if \(!results\.length\)/);
+  assert.ok(
+    settleFunction.indexOf("if (!results.length)") < settleFunction.indexOf('type: "WAIT_FOR_PAGE_SETTLE"'),
+    "tool-only turns must return before requesting page settle"
+  );
+  assert.doesNotMatch(settleFunction, /refreshActiveTabSummary/);
   assert.doesNotMatch(settleFunction, /delay\(mayNavigate\s*\?\s*1200\s*:\s*450\)/);
   assert.match(background, /case "WAIT_FOR_PAGE_SETTLE"/);
   assert.match(background, /function recoverNavigationInterruptedAction/);
@@ -366,6 +372,19 @@ test("tab changes are deferred without losing or clearing a running session", ()
   assert.match(script, /queueMicrotask\(resumeActiveTabTransition\)/);
 });
 
+test("tool-only effects stay bound to the exact planning observation", () => {
+  const script = fs.readFileSync(path.join(root, "panel.js"), "utf8");
+  assert.match(script, /decision\.observedPageProbe = structuredClone\(context\.observationProbe \|\| null\)/);
+  assert.match(script, /decision\.observedBrowserContext = structuredClone\(context\.browser \|\| null\)/);
+  assert.match(script, /decision\.observedVisualObservationId = context\.visualObservation\?\.id \|\| ""/);
+  assert.match(script, /verifyToolOnlyPlanningEvidence\(decision, state\.lastContext\)/);
+  assert.match(script, /observationProbe: decision\?\.observedPageProbe \|\| context\?\.observationProbe/);
+  assert.match(script, /type: "GET_BROWSER_CONTEXT"/);
+  assert.match(script, /createVisualObservationId\(context, screenshotDataUrl\)/);
+  assert.match(script, /crypto\.subtle\.digest\("SHA-256", payload\)/);
+  assert.match(script, /도구 실행 계획을 만든 뒤 페이지 상태가 변경/);
+});
+
 test("terminal response verification uses one immutable turn intent and current visual evidence", () => {
   const script = fs.readFileSync(path.join(root, "panel.js"), "utf8");
   const completionStart = script.indexOf("async function requestCompletionVerification");
@@ -378,6 +397,11 @@ test("terminal response verification uses one immutable turn intent and current 
   assert.match(completionFunction, /actually delivers every requested result/);
   assert.match(groundingFunction, /session\.currentPageEvidenceId/);
   assert.match(groundingFunction, /entry\.id === currentPageEvidenceId/);
+  assert.match(script, /function getCompletionVerificationEvidence/);
+  assert.match(script, /function completionRequiresCurrentPageEvidence/);
+  assert.match(completionFunction, /const requiresCurrentPageEvidence = completionRequiresCurrentPageEvidence\(session\)/);
+  assert.match(completionFunction, /requiredPageEvidenceId:\s*requiresCurrentPageEvidence \? currentPageEvidenceId : ""/);
+  assert.match(completionFunction, /verifier\.status === "verified"\s*&& requiresCurrentPageEvidence/);
   assert.match(groundingFunction, /getEffectiveTurnIntent\(session\)/);
   assert.doesNotMatch(groundingFunction, /formatConversationObjectiveContext\(\)/);
   assert.match(groundingFunction, /merely promising future work/);

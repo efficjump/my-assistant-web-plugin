@@ -20,6 +20,8 @@ function observedContext(overrides = {}) {
       href: "",
       formAction: "https://example.test/account",
       formMethod: "post",
+      binding: "binding-v1-work-email",
+      stateBinding: "state-v1-work-email",
       disabled: false,
       readOnly: false,
       sensitive: false,
@@ -56,6 +58,8 @@ test("preconditions bind execution to the complete observed target fingerprint",
     sensitive: { sensitive: true },
     formAction: { formAction: "https://example.test/delete-account" },
     formMethod: { formMethod: "get" },
+    binding: { binding: "binding-v1-rebound-target" },
+    stateBinding: { stateBinding: "state-v1-mutated-work-email" },
     ariaHasPopup: { ariaHasPopup: "menu" },
     ariaExpanded: { ariaExpanded: "false" },
     readOnly: { readOnly: true },
@@ -125,6 +129,130 @@ test("preconditions keep a target bound to its observed child frame and top-view
     ...context.interactiveElements[0],
     rect: { x: 120, y: 280, width: 220, height: 32 }
   })).valid, false);
+});
+
+test("wait_for preconditions bind every nested element lookup", () => {
+  const context = observedContext();
+  context.interactiveElements.push({
+    ...structuredClone(context.interactiveElements[0]),
+    ref: "e2",
+    selector: "#status-control",
+    label: "Status control",
+    binding: "binding-v1-status-control"
+  });
+  const action = {
+    id: "wait-for-nested-targets",
+    type: "wait_for",
+    conditionJson: JSON.stringify({
+      all: [
+        { type: "element_state", ref: "e1", state: "enabled" },
+        {
+          any: [
+            {
+              not: {
+                type: "element",
+                selector: "#status-control",
+                operator: "not_exists"
+              }
+            },
+            { type: "element", text: "Work email", operator: "exists" }
+          ]
+        }
+      ]
+    })
+  };
+  const preconditions = Contract.buildActionPreconditions([action], context);
+
+  assert.deepEqual(
+    preconditions[0].conditionTargets.map((entry) => entry.lookup),
+    [
+      { ref: "e1" },
+      { selector: "#status-control" },
+      { text: "Work email" }
+    ]
+  );
+  assert.equal(preconditions[0].conditionTargets.every((entry) => entry.target), true);
+  assert.equal(Contract.validateActionPreconditions(preconditions, context).valid, true);
+  assert.equal(Contract.validateActionPreconditions(
+    preconditions,
+    {
+      ...context,
+      interactiveElements: context.interactiveElements.map((element) => (
+        element.ref === "e2"
+          ? { ...element, binding: "binding-v1-rebound-status-control" }
+          : element
+      ))
+    }
+  ).valid, false);
+  assert.equal(Contract.validateActionPreconditions(
+    preconditions,
+    {
+      ...context,
+      interactiveElements: context.interactiveElements.filter((element) => element.ref !== "e2")
+    }
+  ).valid, false);
+});
+
+test("wait_for preconditions fail closed for invalid JSON and missing observed targets", () => {
+  const context = observedContext();
+  const invalidPreconditions = Contract.buildActionPreconditions([{
+    id: "invalid-wait",
+    type: "wait_for",
+    conditionJson: "{"
+  }], context);
+  const missingTargetPreconditions = Contract.buildActionPreconditions([{
+    id: "missing-wait-target",
+    type: "wait_for",
+    conditionJson: JSON.stringify({
+      all: [{ type: "element", ref: "not-observed", operator: "exists" }]
+    })
+  }], context);
+
+  assert.equal(invalidPreconditions[0].conditionTargets, null);
+  assert.equal(Contract.validateActionPreconditions(invalidPreconditions, context).valid, false);
+  assert.equal(missingTargetPreconditions[0].conditionTargets[0].target, null);
+  assert.equal(Contract.validateActionPreconditions(missingTargetPreconditions, context).valid, false);
+});
+
+test("external action ids reject explicit duplicates and generated ids avoid collisions", () => {
+  assert.throws(
+    () => Contract.normalizeExternalActions([
+      { id: "same-action", type: "click", ref: "e1" },
+      { id: " same-action ", type: "focus", ref: "e1" }
+    ]),
+    /reuses the explicit action id/
+  );
+  const validation = Contract.validateExternalActions([
+    { id: "same-action", type: "click", ref: "e1" },
+    { id: "same-action", type: "focus", ref: "e1" }
+  ], observedContext());
+  assert.equal(validation.valid, false);
+
+  const normalized = Contract.normalizeExternalActions([
+    { id: "action-2", type: "click", ref: "e1" },
+    { type: "focus", ref: "e1" },
+    { type: "hover", ref: "e1" }
+  ]);
+  assert.equal(normalized[0].id, "action-2");
+  assert.equal(new Set(normalized.map((action) => action.id)).size, normalized.length);
+});
+
+test("semantic context digests ignore revision-only churn but retain target changes", () => {
+  const first = observedContext();
+  first.pageState = {
+    domRevision: 1,
+    visualRevision: 2,
+    frameRevisions: [{ frameId: 0, documentId: "document-1", domRevision: 1 }]
+  };
+  const revisionOnly = structuredClone(first);
+  revisionOnly.pageState.domRevision = 99;
+  revisionOnly.pageState.visualRevision = 100;
+  revisionOnly.pageState.frameRevisions[0].domRevision = 99;
+  const changedTarget = structuredClone(revisionOnly);
+  changedTarget.interactiveElements[0].label = "Personal email";
+
+  assert.equal(Contract.contextDigest(first), Contract.contextDigest(revisionOnly));
+  assert.notEqual(Contract.contextDigest(first), Contract.contextDigest(changedTarget));
 });
 
 test("effect digests are deterministic and bind the material action content", () => {
