@@ -273,6 +273,24 @@ test("bridge allows deterministic disclosure and same-origin navigation clicks w
     Contract.semanticEffectKey({ type: "click", ref: "e1" }, disclosureContext),
     ""
   );
+  assert.match(
+    Contract.semanticEffectKey(
+      { type: "click", ref: "e1" },
+      disclosureContext,
+      { includeLowRisk: true }
+    ),
+    /^semantic-effect-v1:/
+  );
+  assert.equal(
+    Contract.isDisclosureClick(
+      { type: "click", ref: "e1" },
+      disclosureContext.interactiveElements[0]
+    ),
+    true
+  );
+  assert.equal(Contract.actionCanSucceedWithoutPageChange({ type: "extract" }), true);
+  assert.equal(Contract.actionCanSucceedWithoutPageChange({ type: "wait_for" }), true);
+  assert.equal(Contract.actionCanSucceedWithoutPageChange({ type: "scroll" }), false);
 
   const formDisclosureContext = observedContext({
     tag: "button",

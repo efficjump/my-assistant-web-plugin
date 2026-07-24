@@ -868,6 +868,19 @@ test("a policy outage allows deterministic disclosure but still gates a conseque
 
   assert.equal(disclosureOperation.status, "completed");
   assert.equal(disclosureOperation.policy.verdict, "allow");
+  assert.equal(disclosureOperation.progress.outcome, "unchanged");
+  assert.equal(disclosureDriver.pageExecutions.length, 1);
+  const disclosureObservationAfter = await observe(
+    disclosureRuntime.runtime,
+    disclosureSession.session_id
+  );
+  const repeatedDisclosure = await disclosureRuntime.runtime.dispatch(
+    "browser_execute",
+    executionArgs(disclosureSession.session_id, disclosureObservationAfter.observation_id, {
+      idempotency_key: "request-2"
+    })
+  );
+  assert.equal(repeatedDisclosure.status, "blocked");
   assert.equal(disclosureDriver.pageExecutions.length, 1);
 
   const destructiveDriver = new FakeDriver({ observations: [pageContext()] });
@@ -891,6 +904,26 @@ test("a policy outage allows deterministic disclosure but still gates a conseque
     (reason) => reason.includes("state-changing")
   ));
   assert.equal(destructiveDriver.pageExecutions.length, 0);
+});
+
+test("a result-bearing read operation succeeds without pretending that the page changed", async () => {
+  const driver = new FakeDriver({ observations: [pageContext()] });
+  const { runtime } = await createRuntime({ driver });
+  const session = await armAndStart(runtime);
+  const observation = await observe(runtime, session.session_id);
+  const operation = await runtime.dispatch(
+    "browser_execute",
+    executionArgs(session.session_id, observation.observation_id, {
+      actions: [{
+        type: "extract",
+        reason: "Read the current visible page result"
+      }]
+    })
+  );
+
+  assert.equal(operation.status, "completed");
+  assert.equal(operation.progress.outcome, "succeeded");
+  assert.equal(operation.progress.changed, false);
 });
 
 test("a changed target makes an approved operation stale without executing it", async () => {

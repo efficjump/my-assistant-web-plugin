@@ -936,14 +936,6 @@ function collectInteractiveSearchContext(element, contextCache) {
   );
   const collection = element.closest?.("table,[role='table'],[role='grid'],[role='tree'],[role='listbox'],[role='menu']");
 
-  append("cell", cell, 240, { cacheKey: "visible-240" });
-  append("row", row, 560, { cacheKey: "visible-560" });
-  append("collection", collection, 260, { cacheKey: "semantic", accessibleOnly: true });
-  append("region", semanticContainer, 260, { cacheKey: "semantic", accessibleOnly: true });
-
-  const heading = findNearestContextHeading(element, semanticContainer);
-  append("heading", heading, 220, { cacheKey: "visible-220" });
-
   let ancestor = element.parentElement;
   for (let depth = 1; ancestor && depth <= 5; depth += 1) {
     const tag = ancestor.tagName?.toLowerCase() || "";
@@ -956,7 +948,14 @@ function collectInteractiveSearchContext(element, contextCache) {
     });
     ancestor = ancestor.parentElement;
   }
-  return parts.slice(0, 5);
+
+  append("cell", cell, 240, { cacheKey: "visible-240" });
+  append("row", row, 560, { cacheKey: "visible-560" });
+  const heading = findNearestContextHeading(element, semanticContainer);
+  append("heading", heading, 220, { cacheKey: "visible-220" });
+  append("collection", collection, 260, { cacheKey: "semantic", accessibleOnly: true });
+  append("region", semanticContainer, 260, { cacheKey: "semantic", accessibleOnly: true });
+  return parts.slice(0, 9);
 }
 
 function getSemanticContainerName(element) {
@@ -1025,7 +1024,19 @@ function scoreInteractiveCandidateForSearch(record, search) {
     title: 220,
     description: 180,
     testId: 130,
-    context: search.nearText ? 0 : 75
+    context: search.nearText ? 0 : 30,
+    contextByKind: search.nearText ? {} : {
+      "ancestor-1": 140,
+      "ancestor-2": 120,
+      cell: 110,
+      "ancestor-3": 90,
+      row: 65,
+      "ancestor-4": 55,
+      heading: 45,
+      "ancestor-5": 35,
+      collection: 25,
+      region: 20
+    }
   });
   if (search.query && !queryMatch.matched) {
     return { matched: false, score: 0, matchedFields: [], contextSnippet: "" };
@@ -1041,7 +1052,19 @@ function scoreInteractiveCandidateForSearch(record, search) {
     title: 35,
     description: 35,
     testId: 10,
-    context: 320
+    context: 80,
+    contextByKind: {
+      "ancestor-1": 520,
+      "ancestor-2": 440,
+      cell: 400,
+      "ancestor-3": 330,
+      row: 260,
+      "ancestor-4": 210,
+      heading: 160,
+      "ancestor-5": 130,
+      collection: 100,
+      region: 80
+    }
   });
   if (search.nearText && !nearMatch.matched) {
     return { matched: false, score: 0, matchedFields: [], contextSnippet: "" };
@@ -1073,10 +1096,7 @@ function scoreSearchTerms(value, record, weights) {
   const matchedFields = [];
   const matchedTokens = new Set();
   let score = 0;
-  for (const [field, fieldValue] of Object.entries({
-    ...record.normalizedFields,
-    context: record.normalizedContext
-  })) {
+  for (const [field, fieldValue] of Object.entries(record.normalizedFields || {})) {
     if (!fieldValue) {
       continue;
     }
@@ -1084,25 +1104,37 @@ function scoreSearchTerms(value, record, weights) {
     if (!weight) {
       continue;
     }
-    let fieldScore = 0;
-    if (fieldValue === normalizedQuery) {
-      fieldScore += weight * 3;
-    } else if (fieldValue.includes(normalizedQuery) || normalizedQuery.includes(fieldValue)) {
-      fieldScore += weight * 2;
-    }
-    let fieldTokenMatches = 0;
-    for (const token of tokens) {
-      if (fieldValue.includes(token)) {
-        fieldTokenMatches += 1;
-        matchedTokens.add(token);
-        fieldScore += weight + Math.min(60, token.length * 6);
-      }
-    }
-    if (fieldScore) {
+    const fieldMatch = scoreSearchField(normalizedQuery, tokens, fieldValue, weight);
+    if (fieldMatch.score) {
       matchedFields.push(field);
-      score += fieldScore;
+      score += fieldMatch.score;
+      fieldMatch.matchedTokens.forEach((token) => matchedTokens.add(token));
     }
   }
+
+  const contextParts = Array.isArray(record.contextParts) && record.contextParts.length
+    ? record.contextParts
+    : record.normalizedContext
+      ? [{ kind: "context", text: record.normalizedContext }]
+      : [];
+  const contextMatches = contextParts
+    .map((part, partIndex) => {
+      const kind = String(part?.kind || "context");
+      const fieldValue = normalizeSearchText(part?.text || "");
+      const weight = Number(weights.contextByKind?.[kind] ?? weights.context ?? 0);
+      const match = fieldValue && weight
+        ? scoreSearchField(normalizedQuery, tokens, fieldValue, weight)
+        : { score: 0, matchedTokens: [] };
+      return { ...match, partIndex };
+    })
+    .filter((match) => match.score > 0)
+    .sort((left, right) => right.score - left.score || left.partIndex - right.partIndex)[0];
+  if (contextMatches) {
+    matchedFields.push("context");
+    score += contextMatches.score;
+    contextMatches.matchedTokens.forEach((token) => matchedTokens.add(token));
+  }
+
   const requiredTokenMatches = tokens.length > 2 ? Math.ceil(tokens.length / 2) : 1;
   const matched = score > 0 && matchedTokens.size >= requiredTokenMatches;
   return {
@@ -1110,6 +1142,23 @@ function scoreSearchTerms(value, record, weights) {
     score: matched ? score : 0,
     matchedFields: matched ? matchedFields : []
   };
+}
+
+function scoreSearchField(normalizedQuery, tokens, fieldValue, weight) {
+  let score = 0;
+  if (fieldValue === normalizedQuery) {
+    score += weight * 3;
+  } else if (fieldValue.includes(normalizedQuery) || normalizedQuery.includes(fieldValue)) {
+    score += weight * 2;
+  }
+  const matchedTokens = [];
+  for (const token of tokens) {
+    if (fieldValue.includes(token)) {
+      matchedTokens.push(token);
+      score += weight + Math.min(60, token.length * 6);
+    }
+  }
+  return { score, matchedTokens };
 }
 
 function findBestSearchContextSnippet(record, searchValues) {
@@ -3013,6 +3062,8 @@ function compareActionStates(before, after, result) {
     };
   }
   const changed = before?.fingerprint !== after.fingerprint;
+  const beforeTarget = summarizeActionTargetTransition(before?.target);
+  const afterTarget = summarizeActionTargetTransition(after.target);
   return {
     changed,
     reason: changed ? "observable page state changed" : "no observable page state change",
@@ -3020,7 +3071,25 @@ function compareActionStates(before, after, result) {
     afterFingerprint: after.fingerprint,
     urlChanged: before?.url !== after.url,
     domChanged: before?.domRevision !== after.domRevision,
-    targetChanged: JSON.stringify(before?.target || null) !== JSON.stringify(after.target || null)
+    targetChanged: JSON.stringify(before?.target || null) !== JSON.stringify(after.target || null),
+    valueChanged: before?.target?.value !== after.target?.value,
+    beforeTarget,
+    afterTarget
+  };
+}
+
+function summarizeActionTargetTransition(target) {
+  if (!target) {
+    return null;
+  }
+  return {
+    tag: target.tag || "",
+    label: target.label || "",
+    checked: target.checked,
+    expanded: target.expanded,
+    selected: target.selected,
+    disabled: target.disabled,
+    text: target.text || ""
   };
 }
 

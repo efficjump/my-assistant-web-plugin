@@ -703,6 +703,12 @@ try {
     });
     assert.equal(internalDiscovery.modelCalls, 2);
     assert.equal(internalDiscovery.userHandoffSuppressed, true);
+    assert.equal(internalDiscovery.recoveryDecisionStatus, "continue");
+    assert.equal(internalDiscovery.recoveryActionRef, "request-type-lookup");
+    assert.deepEqual(internalDiscovery.recoveryPurposes, ["decision", "repair", "decision"]);
+    assert.deepEqual(internalDiscovery.recoveryNearTexts, ["", "Request type"]);
+    assert.equal(internalDiscovery.repeatedDisclosureWasNotReturned, true);
+    assert.equal(internalDiscovery.genericContractFailureHidden, true);
 
     const turnBoundaryContracts = await exerciseTurnBoundaryContracts({
       cdp,
@@ -712,6 +718,10 @@ try {
     });
     assert.equal(turnBoundaryContracts.freshIntentModelCalls, 0);
     assert.equal(turnBoundaryContracts.freshIntentMode, "standalone");
+    assert.equal(turnBoundaryContracts.correctiveIntentMode, "continue_prior");
+    assert.equal(turnBoundaryContracts.correctiveIntentModelCalls, 2);
+    assert.equal(turnBoundaryContracts.correctiveIntentCarriedPriorRun, true);
+    assert.equal(turnBoundaryContracts.correctiveIntentReplacedFailedTarget, true);
     assert.equal(turnBoundaryContracts.intentMode, "standalone");
     assert.equal(turnBoundaryContracts.intentRepeatPolicy, "once");
     assert.equal(turnBoundaryContracts.standaloneObjectiveStayedExact, true);
@@ -726,6 +736,9 @@ try {
     assert.equal(turnBoundaryContracts.internalJsonRejected, true);
     assert.equal(turnBoundaryContracts.staleElementSearchCleared, true);
     assert.equal(turnBoundaryContracts.repeatBlockedAfterOneSuccess, true);
+    assert.equal(turnBoundaryContracts.disclosureRepeatBlockedWithoutMaterialProgress, true);
+    assert.equal(turnBoundaryContracts.unchangedAttemptNotCountedAsSuccess, true);
+    assert.equal(turnBoundaryContracts.unchangedAttemptRepeatBlocked, true);
     assert.equal(turnBoundaryContracts.stateChangingToolRepeatBlocked, true);
     assert.equal(turnBoundaryContracts.readOnlyToolRepeatAllowed, true);
     assert.equal(turnBoundaryContracts.runtimeErrorStoppedSession, true);
@@ -1164,6 +1177,34 @@ try {
         <= broadSearch.data.elementDiscovery.visited + 20
     );
     assert.deepEqual(continuedSearch.data.elementDiscovery.search, broadSearch.data.elementDiscovery.search);
+    const relationalSearch = await extensionMessage(cdp, panelSessionId, {
+      type: "COLLECT_PAGE_CONTEXT",
+      targetTabId: firstTabId,
+      options: {
+        maxTextChars: 8000,
+        maxElements: 20,
+        elementQuery: "",
+        elementRoles: ["button"],
+        elementNearText: "Request type",
+        redactSensitiveData: true
+      }
+    });
+    assert.equal(
+      relationalSearch.data.interactiveElements[0]?.selector,
+      "#request-type-lookup",
+      `nearText should rank the icon in the nearest field above controls that only share a broad form context: ${JSON.stringify(
+        relationalSearch.data.interactiveElements.map((element) => ({
+          selector: element.selector,
+          label: element.label,
+          score: element.searchMatch?.score,
+          context: element.searchMatch?.contextSnippet
+        }))
+      )}`
+    );
+    assert.match(
+      relationalSearch.data.interactiveElements[0]?.searchMatch?.contextSnippet || "",
+      /ancestor-[1-5]: Request type/
+    );
     const mismatchedSearchCursor = await extensionMessage(cdp, panelSessionId, {
       type: "COLLECT_PAGE_CONTEXT",
       targetTabId: firstTabId,
@@ -2082,6 +2123,9 @@ async function startFixtureServer() {
       #advanced-structure-lab { position: fixed; right: 8px; bottom: 8px; z-index: 4; width: 270px; padding: 4px; background: white; }
       #legacy-pagination { position: fixed; left: 300px; top: 82px; z-index: 5; width: 220px; padding: 4px; background: white; font: 12px sans-serif; }
       #legacy-pagination ul { display: flex; gap: 8px; margin: 2px 0; padding: 0; list-style: none; }
+      #relational-controls { position: fixed; left: 300px; top: 330px; z-index: 6; width: 250px; padding: 6px; background: white; border: 1px solid #cbd5e1; font: 12px sans-serif; }
+      #relational-controls .relation-field { display: grid; grid-template-columns: 1fr 28px; align-items: center; gap: 6px; margin: 4px 0; }
+      #relational-controls button { width: 28px; height: 24px; padding: 0; }
       #hidden-cross-frame { display: none; }
       #covered-frame-shell { position: fixed; left: 300px; bottom: 8px; z-index: 3; width: 180px; height: 70px; }
       #covered-frame-shell iframe { position: absolute; inset: 0; margin: 0; }
@@ -2112,6 +2156,21 @@ async function startFixtureServer() {
           </ul>
         </div>
         <div id="legacy-page-status" role="status">Legacy page 1 loaded</div>
+      </div>
+      <div id="relational-controls" role="group" aria-label="Workflow filters">
+        <div class="relation-field">
+          <span>Request form</span>
+          <button id="request-form-options" type="button" aria-label="Request form options" aria-haspopup="listbox" aria-expanded="false">▼</button>
+        </div>
+        <div class="relation-field">
+          <span>Request type</span>
+          <button id="request-type-lookup" type="button">
+            <svg aria-hidden="true" width="14" height="14" viewBox="0 0 14 14">
+              <circle cx="6" cy="6" r="4" fill="none" stroke="currentColor"></circle>
+              <path d="M9 9l4 4" stroke="currentColor"></path>
+            </svg>
+          </button>
+        </div>
       </div>
       <div id="robustness-lab">
         <div id="display-contents-copy">Display contents direct visible fact</div>
@@ -3091,11 +3150,11 @@ async function exerciseInternalElementDiscoveryContract({ cdp, panelSessionId, t
       };
 
       const decision = await requestChatDecision(state.agentSession);
-      return {
+      const firstScenario = {
         decisionStatus: decision.status,
         actionRef: decision.actions[0]?.ref || "",
-        requestedCursors,
-        requestedSearches,
+        requestedCursors: [...requestedCursors],
+        requestedSearches: [...requestedSearches],
         boundObservationSearch: {
           query: decision.observationRequest?.elementQuery || "",
           roles: decision.observationRequest?.elementRoles || [],
@@ -3105,6 +3164,230 @@ async function exerciseInternalElementDiscoveryContract({ cdp, panelSessionId, t
         userHandoffSuppressed: !state.conversation.some(
           (message) => message.role === "assistant" && /직접|수동/.test(message.text || "")
         )
+      };
+
+      const wrongDisclosureContext = {
+        ...structuredClone(firstContext),
+        pageState: {
+          ...(structuredClone(firstContext.pageState || {})),
+          domRevision: 500
+        },
+        interactiveElements: [{
+          ref: "request-form-options",
+          scope: "main",
+          tag: "button",
+          role: "button",
+          type: "button",
+          label: "Request form options",
+          selector: "#request-form-options",
+          ariaHasPopup: "listbox",
+          ariaExpanded: "true",
+          disabled: false,
+          actionability: "interactive"
+        }],
+        elementDiscovery: {
+          scope: "current-visual-viewport",
+          query: "",
+          search: { query: "", roles: [], nearText: "" },
+          pageSize: 80,
+          returned: 1,
+          total: 1,
+          availableTotal: 2,
+          visited: 1,
+          remaining: 0,
+          hasMore: false,
+          nextCursor: ""
+        }
+      };
+      const lookupContext = {
+        ...structuredClone(wrongDisclosureContext),
+        interactiveElements: [{
+          ref: "request-type-lookup",
+          scope: "main",
+          tag: "button",
+          role: "button",
+          type: "button",
+          label: "",
+          selector: "#request-type-lookup",
+          disabled: false,
+          actionability: "interactive",
+          searchMatch: {
+            score: 1700,
+            matchedFields: ["role", "context"],
+            contextSnippet: "ancestor-2: Request type"
+          }
+        }],
+        elementDiscovery: {
+          scope: "current-visual-viewport",
+          query: "",
+          search: { query: "", roles: ["button"], nearText: "Request type" },
+          pageSize: 80,
+          returned: 1,
+          total: 1,
+          availableTotal: 2,
+          visited: 1,
+          remaining: 0,
+          hasMore: false,
+          nextCursor: ""
+        }
+      };
+      state.agentSession = {
+        runId: "loop-recovery-e2e",
+        targetTabId: ${JSON.stringify(tabId)},
+        documentId: ${JSON.stringify(context.documentId)},
+        latestUserMessage: "요청 유형을 선택해줘",
+        turnIntent: createFallbackTurnIntent("요청 유형을 선택해줘"),
+        successfulEffects: [],
+        successfulInteractions: [],
+        attemptLedger: [],
+        effectSequence: 0,
+        effectKeySalt: "loop-recovery",
+        step: 0,
+        history: [],
+        evidence: [],
+        currentPageEvidenceId: "",
+        status: "running",
+        stopRequested: false,
+        pendingRequestId: "",
+        noProgressCount: 0,
+        lastObservationFingerprint: "",
+        lastDecisionFingerprint: "",
+        startedAt: new Date().toISOString()
+      };
+      const seedDisclosureDecision = {
+        step: 0,
+        status: "continue",
+        toolCalls: [],
+        actions: [{
+          id: "seed-wrong-disclosure",
+          type: "click",
+          ref: "request-form-options",
+          reason: "잘못 선택한 요청양식 표시 컨트롤"
+        }],
+        verification: {
+          required: true,
+          expectedChange: "요청 유형 선택지가 열린다.",
+          successCriteria: ["요청 유형을 선택할 수 있다."]
+        }
+      };
+      enforceTurnEffectBoundary(
+        state.agentSession,
+        seedDisclosureDecision,
+        wrongDisclosureContext
+      );
+      recordExecutionOutcomes(state.agentSession, seedDisclosureDecision, [], [{
+        ok: true,
+        action: seedDisclosureDecision.actions[0],
+        result: { mayNavigate: false },
+        verification: {
+          changed: true,
+          targetChanged: true,
+          beforeTarget: { expanded: "false" },
+          afterTarget: { expanded: "true" }
+        }
+      }]);
+
+      const recoveryPurposes = [];
+      const recoveryNearTexts = [];
+      collectDecisionObservation = async (discovery = {}) => {
+        recoveryNearTexts.push(discovery.elementNearText || "");
+        const observed = discovery.elementNearText ? lookupContext : wrongDisclosureContext;
+        state.lastContext = observed;
+        return { context: observed, screenshotDataUrl: "" };
+      };
+      requestAiDecision = async (_session, request) => {
+        recoveryPurposes.push(request.purpose);
+        const call = recoveryPurposes.length;
+        if (call === 1) {
+          return {
+            text: JSON.stringify({
+              version: "1.0",
+              status: "continue",
+              message: "같은 드롭다운을 다시 확인합니다.",
+              summary: "요청양식 드롭다운 재실행",
+              progress: "요청 유형은 아직 선택되지 않았습니다.",
+              doneReason: "",
+              completionEvidence: [],
+              needsUserApproval: false,
+              plan: ["같은 드롭다운 다시 클릭"],
+              elementSearch: { query: "", roles: [], nearText: "", reason: "" },
+              toolCalls: [],
+              actions: [{
+                id: "repeat-wrong-disclosure",
+                type: "click",
+                ref: "request-form-options",
+                reason: "다시 열어 확인"
+              }],
+              verification: {
+                required: true,
+                expectedChange: "요청 유형 선택지가 열린다.",
+                successCriteria: ["요청 유형을 선택할 수 있다."]
+              }
+            })
+          };
+        }
+        if (call === 2) {
+          return {
+            text: JSON.stringify({
+              version: "1.0",
+              status: "discover",
+              message: "",
+              summary: "요청 유형 필드 주변의 버튼을 다시 찾습니다.",
+              progress: "같은 표시 컨트롤은 반복하지 않습니다.",
+              doneReason: "",
+              completionEvidence: [],
+              needsUserApproval: false,
+              plan: ["요청 유형 필드 주변 버튼 검색"],
+              elementSearch: {
+                query: "",
+                roles: ["button"],
+                nearText: "Request type",
+                reason: "아이콘 자체 이름이 없으므로 인접 필드 라벨과 버튼 역할로 검색"
+              },
+              toolCalls: [],
+              actions: [],
+              verification: { required: false, expectedChange: "", successCriteria: [] }
+            })
+          };
+        }
+        return {
+          text: JSON.stringify({
+            version: "1.0",
+            status: "continue",
+            message: "요청 유형 필드 옆 조회 버튼을 누릅니다.",
+            summary: "올바른 관계형 대상 선택",
+            progress: "인접 라벨 검색으로 다른 버튼을 찾았습니다.",
+            doneReason: "",
+            completionEvidence: [],
+            needsUserApproval: false,
+            plan: ["조회 버튼 클릭", "선택지 확인"],
+            elementSearch: { query: "", roles: [], nearText: "", reason: "" },
+            toolCalls: [],
+            actions: [{
+              id: "open-request-type-lookup",
+              type: "click",
+              ref: "request-type-lookup",
+              reason: "요청 유형 필드와 가장 가까운 버튼"
+            }],
+            verification: {
+              required: true,
+              expectedChange: "요청 유형 선택 화면이 열린다.",
+              successCriteria: ["요청 유형 선택 후보가 보인다."]
+            }
+          })
+        };
+      };
+      const recoveryDecision = await requestChatDecision(state.agentSession);
+      return {
+        ...firstScenario,
+        recoveryDecisionStatus: recoveryDecision.status,
+        recoveryActionRef: recoveryDecision.actions[0]?.ref || "",
+        recoveryPurposes,
+        recoveryNearTexts,
+        repeatedDisclosureWasNotReturned:
+          recoveryDecision.actions.every((action) => action.ref !== "request-form-options"),
+        genericContractFailureHidden:
+          !recoveryDecision.message.includes("안전한 실행 계획으로 변환")
       };
     } finally {
       collectDecisionObservation = originalCollectDecisionObservation;
@@ -3181,6 +3464,79 @@ async function exerciseTurnBoundaryContracts({ cdp, panelSessionId, tabId, conte
         throw new Error("a fresh standalone request must not need a model intent round trip");
       };
       const freshIntent = await resolveAgentTurnIntent(state.agentSession);
+
+      state.agentSession.status = "blocked";
+      state.agentSession.turnIntent = AgentCore.normalizeTurnIntent({
+        version: "1.0",
+        mode: "standalone",
+        objective: "요청 유형을 선택한다.",
+        contextSummary: "",
+        repeatPolicy: "once",
+        repeatLimit: 1,
+        completionCriteria: ["요청 유형이 선택되어 표시된다."],
+        reason: "최초 요청"
+      }, { latestUserMessage: "요청 유형을 선택한다." });
+      state.agentSession.history = [{
+        kind: "decision",
+        step: 3,
+        status: "blocked",
+        message: "같은 요청양식 드롭다운을 반복해 대상을 특정하지 못했습니다.",
+        summary: "잘못된 표시 컨트롤 반복",
+        progress: "요청 유형은 선택되지 않았습니다.",
+        elementSearch: { query: "요청 유형", roles: ["button"], nearText: "", reason: "대상 검색" },
+        actions: [{ type: "click", ref: "e28", reason: "요청양식 드롭다운 열기" }]
+      }];
+      state.conversation = [
+        {
+          role: "user",
+          text: "요청 유형을 선택해줘.",
+          tone: "",
+          kind: "",
+          taskStatus: ""
+        },
+        {
+          role: "assistant",
+          text: "같은 요청양식 드롭다운을 반복해 대상을 특정하지 못했습니다.",
+          tone: "error",
+          kind: "agent-decision",
+          taskStatus: "blocked"
+        },
+        {
+          role: "user",
+          text: "요청 유형의 돋보기 누르면 돼.",
+          tone: "",
+          kind: "",
+          taskStatus: ""
+        }
+      ];
+      createAgentSession("요청 유형의 돋보기 누르면 돼.");
+      let correctiveIntentModelCalls = 0;
+      const correctiveIntentRequests = [];
+      requestAiDecision = async (_activeSession, request) => {
+        correctiveIntentModelCalls += 1;
+        correctiveIntentRequests.push(request);
+        if (correctiveIntentModelCalls === 1) {
+          return { text: '{"mode":"continue_prior"}' };
+        }
+        return {
+          text: JSON.stringify({
+            version: "1.0",
+            mode: "continue_prior",
+            objective: "이전의 잘못된 요청양식 드롭다운 대신 요청 유형 필드 옆 돋보기 버튼을 사용해 요청 유형을 선택한다.",
+            contextSummary: "직전 실행은 요청양식 드롭다운을 반복했고, 최신 교정은 요청 유형 필드의 돋보기 버튼을 새 대상으로 지정한다.",
+            repeatPolicy: "once",
+            repeatLimit: 1,
+            completionCriteria: ["요청 유형 필드에 선택 결과가 표시된다."],
+            reason: "최신 메시지는 직전 실패의 대상을 교정하는 문맥 의존 지시다."
+          })
+        };
+      };
+      const correctiveIntent = await resolveAgentTurnIntent(state.agentSession);
+      const correctiveIntentCarriedPriorRun = correctiveIntentRequests[0]?.user.includes(
+        '"status": "blocked"'
+      ) && correctiveIntentRequests[0]?.user.includes(
+        "잘못된 표시 컨트롤 반복"
+      );
 
       state.conversation = [
         {
@@ -3301,7 +3657,7 @@ async function exerciseTurnBoundaryContracts({ cdp, panelSessionId, tabId, conte
         { enabled: false, tools: [] }
       );
       enforceTurnEffectBoundary(session, firstAction, currentContext);
-      recordSuccessfulEffects(session, firstAction, [], [{
+      recordExecutionOutcomes(session, firstAction, [], [{
         ok: true,
         action: firstAction.actions[0],
         result: { changed: true }
@@ -3333,6 +3689,126 @@ async function exerciseTurnBoundaryContracts({ cdp, panelSessionId, tabId, conte
       }), 2);
       enforceTurnEffectBoundary(session, repeatedAction, currentContext);
 
+      const disclosureContext = {
+        ...structuredClone(currentContext),
+        interactiveElements: [{
+          ref: "disclosure-e1",
+          scope: "main",
+          tag: "button",
+          role: "button",
+          type: "button",
+          label: "Request form options",
+          selector: "#request-form-options",
+          ariaHasPopup: "listbox",
+          ariaExpanded: "false",
+          disabled: false,
+          actionability: "interactive"
+        }]
+      };
+      const disclosureSession = {
+        ...session,
+        turnIntent: createFallbackTurnIntent("요청 유형을 한 번 선택해줘."),
+        successfulEffects: [],
+        successfulInteractions: [],
+        attemptLedger: [],
+        effectSequence: 0,
+        effectKeySalt: "disclosure-loop"
+      };
+      const disclosureDecision = {
+        step: 1,
+        status: "continue",
+        toolCalls: [],
+        actions: [{
+          id: "open-wrong-dropdown",
+          type: "click",
+          ref: "disclosure-e1",
+          reason: "옵션을 확인"
+        }],
+        verification: {
+          required: true,
+          expectedChange: "올바른 요청 유형 선택지가 열린다.",
+          successCriteria: ["요청 유형 선택지가 보인다."]
+        }
+      };
+      enforceTurnEffectBoundary(disclosureSession, disclosureDecision, disclosureContext);
+      recordExecutionOutcomes(disclosureSession, disclosureDecision, [], [{
+        ok: true,
+        action: disclosureDecision.actions[0],
+        result: { mayNavigate: false },
+        verification: {
+          changed: true,
+          targetChanged: true,
+          beforeTarget: { expanded: "false" },
+          afterTarget: { expanded: "true" }
+        }
+      }]);
+      const repeatedDisclosureDecision = structuredClone(disclosureDecision);
+      repeatedDisclosureDecision.step = 2;
+      enforceTurnEffectBoundary(disclosureSession, repeatedDisclosureDecision, {
+        ...structuredClone(disclosureContext),
+        interactiveElements: [{
+          ...structuredClone(disclosureContext.interactiveElements[0]),
+          ariaExpanded: "true"
+        }]
+      });
+
+      const unchangedSession = {
+        ...session,
+        turnIntent: createFallbackTurnIntent("현재 대상에서 한 번 실행해줘."),
+        successfulEffects: [],
+        successfulInteractions: [],
+        attemptLedger: [],
+        effectSequence: 0,
+        effectKeySalt: "unchanged-loop"
+      };
+      const unchangedDecision = normalizeAiDecisionResponse(JSON.stringify({
+        version: "1.0",
+        status: "continue",
+        message: "대상을 실행합니다.",
+        summary: "대상 실행",
+        progress: "",
+        doneReason: "",
+        completionEvidence: [],
+        needsUserApproval: false,
+        plan: ["대상 실행", "변화 확인"],
+        elementSearch: { query: "", roles: [], nearText: "", reason: "" },
+        toolCalls: [],
+        actions: [{
+          id: "unchanged-attempt",
+          type: "click",
+          ref: "e1",
+          reason: "현재 대상 실행"
+        }],
+        verification: {
+          required: true,
+          expectedChange: "현재 화면이 변경된다.",
+          successCriteria: ["관찰 가능한 변화가 생긴다."]
+        }
+      }), 1);
+      enforceTurnEffectBoundary(unchangedSession, unchangedDecision, currentContext);
+      recordExecutionOutcomes(unchangedSession, unchangedDecision, [], [{
+        ok: true,
+        action: unchangedDecision.actions[0],
+        result: { mayNavigate: false },
+        verification: {
+          changed: false,
+          reason: "no observable page state change",
+          targetChanged: false
+        }
+      }]);
+      const repeatedUnchangedDecision = normalizeAiDecisionResponse(JSON.stringify({
+        ...unchangedDecision,
+        step: 2,
+        message: "같은 대상을 다시 실행합니다.",
+        actions: [{
+          id: "unchanged-attempt-again",
+          type: "click",
+          ref: "e1",
+          reason: "변화가 없어서 같은 대상 재시도"
+        }]
+      }), 2);
+      enforceTurnEffectBoundary(unchangedSession, repeatedUnchangedDecision, currentContext);
+
       const writeToolContext = {
         tools: [{
           name: "fixture.update",
@@ -3351,7 +3827,7 @@ async function exerciseTurnBoundaryContracts({ cdp, panelSessionId, tabId, conte
         mcpContext: writeToolContext
       };
       enforceTurnEffectBoundary(session, writeToolDecision, currentContext);
-      recordSuccessfulEffects(session, writeToolDecision, [{ ok: true }], []);
+      recordExecutionOutcomes(session, writeToolDecision, [{ ok: true }], []);
       const repeatedWriteToolDecision = structuredClone(writeToolDecision);
       enforceTurnEffectBoundary(session, repeatedWriteToolDecision, currentContext);
 
@@ -3373,7 +3849,7 @@ async function exerciseTurnBoundaryContracts({ cdp, panelSessionId, tabId, conte
         mcpContext: readToolContext
       };
       enforceTurnEffectBoundary(session, readToolDecision, currentContext);
-      recordSuccessfulEffects(session, readToolDecision, [{ ok: true }], []);
+      recordExecutionOutcomes(session, readToolDecision, [{ ok: true }], []);
       const repeatedReadToolDecision = structuredClone(readToolDecision);
       enforceTurnEffectBoundary(session, repeatedReadToolDecision, currentContext);
 
@@ -3396,6 +3872,12 @@ async function exerciseTurnBoundaryContracts({ cdp, panelSessionId, tabId, conte
       return {
         freshIntentModelCalls,
         freshIntentMode: freshIntent.mode,
+        correctiveIntentMode: correctiveIntent.mode,
+        correctiveIntentModelCalls,
+        correctiveIntentCarriedPriorRun,
+        correctiveIntentReplacedFailedTarget:
+          correctiveIntent.objective.includes("돋보기 버튼")
+          && !correctiveIntent.objective.includes("요청양식 드롭다운을 반복"),
         intentMode: intent.mode,
         intentRepeatPolicy: intent.repeatPolicy,
         standaloneObjectiveStayedExact: intent.objective
@@ -3417,6 +3899,16 @@ async function exerciseTurnBoundaryContracts({ cdp, panelSessionId, tabId, conte
           && firstAction.elementSearch.query === "",
         repeatBlockedAfterOneSuccess: repeatedAction.status === "blocked"
           && repeatedAction.actions.length === 0,
+        disclosureRepeatBlockedWithoutMaterialProgress:
+          repeatedDisclosureDecision.status === "blocked"
+          && repeatedDisclosureDecision.actions.length === 0
+          && disclosureSession.successfulInteractions.length === 1,
+        unchangedAttemptNotCountedAsSuccess:
+          unchangedSession.attemptLedger[0]?.outcome === "unchanged"
+          && unchangedSession.successfulEffects.length === 0,
+        unchangedAttemptRepeatBlocked:
+          repeatedUnchangedDecision.status === "blocked"
+          && repeatedUnchangedDecision.actions.length === 0,
         stateChangingToolRepeatBlocked: repeatedWriteToolDecision.status === "blocked"
           && repeatedWriteToolDecision.toolCalls.length === 0,
         readOnlyToolRepeatAllowed: repeatedReadToolDecision.status === "continue"

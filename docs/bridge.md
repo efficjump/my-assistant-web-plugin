@@ -89,9 +89,9 @@ A development tool should follow this loop:
 3. If the needed visible control is absent, first call `browser_elements` with a goal-derived `query`, optional `roles`, and optional `near_text`. Continue its `nextCursor` only when more matching results are needed.
 4. Use a `scroll` action and observe again when the target is outside the current viewport; element paging covers only controls already visible in that viewport.
 5. Call `browser_act` with the next required DOM action or small action group. For an exposed canvas or application surface without a DOM ref, call `browser_visual_act` with only its surface ref and visible target description.
-6. Call `browser_continue` after every proposal.
+6. Call `browser_continue` after every proposal and inspect the operation's `progress.outcome`; an error-free transport can still be `unchanged`.
 7. If the response is `approval_required`, ask the user to review the extension and call `browser_continue` again after their decision. Do not resubmit the action.
-8. Repeat discovery, action, and continuation only while the refreshed snapshot has not met the goal and the returned intent still authorizes the next effect.
+8. Repeat discovery, action, and continuation only while the refreshed snapshot has not met the goal and the returned intent still authorizes the next effect. If progress is `unchanged`, choose a different target, relation, or approach instead of resubmitting the same action.
 9. If an operation returns `failed`, `blocked`, `rejected`, `cancelled`, or `unknown_after_restart`, do not propose another action in that task.
 10. Call `browser_end` after completion or a terminal operation and before returning the final answer.
 
@@ -117,7 +117,7 @@ Calling `browser_begin` again with the same goal and MCP client resumes the curr
 
 The exact objective and criteria are produced dynamically from the supplied goal. `once` is the safe default. An explicit numeric request can resolve to `bounded` with that count, while a request that names an observable stopping condition can resolve to `until_condition`. The same visible control remaining after a successful action is not permission to repeat it.
 
-The extension records a semantic effect key from the action type, stable target description, and material parameters rather than relying on short-lived refs or action IDs. It checks the limit when an action is proposed and again immediately before execution. This second check prevents two approved or retried proposals from crossing the boundary. If the goal really needs more occurrences, end the current task and begin a new complete goal with an explicit count or stopping condition.
+The extension records a semantic effect key from the action type, stable target description, and material parameters rather than relying on short-lived refs or action IDs. It also classifies the executed operation as changed, unchanged, or failed by combining per-action verification with a post-execution observation digest. It checks the repetition limit when an action is proposed and again immediately before execution. A disclosure control receives a separate interaction key even though opening a menu is low risk; the same menu cannot be toggled again without an intervening material effect. This prevents open/close oscillation as well as two approved or retried proposals crossing the boundary. If the goal really needs more occurrences, end the current task and begin a new complete goal with an explicit count or stopping condition.
 
 Element refs remain observation-scoped. A refreshed snapshot or element window can assign different refs, so every new action must use only the latest `page` result.
 
@@ -134,6 +134,8 @@ Element refs remain observation-scoped. A refreshed snapshot or element window c
 The extension evaluates this against currently exposed controls without sending the unfiltered control list back to the caller. It searches accessible names, semantic roles, tags, input types, placeholders, titles, ARIA descriptions, names, test identifiers, and bounded context from the nearest visible cell, row, collection, form, dialog, or region. When the filter allows it, cheap identity matching runs before expensive exposure and nearby-context scoring. Each returned control includes `searchMatch` with its score, matched fields, and a redacted context snippet so the caller can check why it was retrieved.
 
 When both `query` and `near_text` are supplied, the query must match the control's own identity and the nearby text must match its bounded context. Older pagination markup without semantic containers can contribute a small, complete ancestor group, but large ancestor text is rejected. For example, `{ "query": "2", "roles": ["link"], "near_text": "[1/5] [총 484건]" }` returns the literal page link instead of links whose table rows merely contain dates.
+
+For an unnamed icon identified only by its relation to a field, leave `query` empty, constrain `roles` to the actual control type, and put the adjacent field label in `near_text`. Local scoring gives the smallest complete ancestor or field group more weight than a broad form or region, so a nearby lookup button outranks an unrelated dropdown that happens to share the same form text.
 
 `page.elementDiscovery.search` reports the normalized `query`, `roles`, and `nearText`, along with returned and visited counts, matching `total`, `hasMore`, and an opaque `nextCursor`. Broad observations report an exact unfiltered `availableTotal`. An optimized targeted search instead reports `availableTotal: null`, `availableTotalExact: false`, and `potentialTotal`, because it deliberately avoids a second full unfiltered visibility pass; `potentialTotal` is only the inexpensive identity-candidate count, not a claim that every candidate is exposed. The cursor is bound to the complete search filter, document IDs, DOM revisions, frame visibility, viewport position, and the ranked visible-control digest. If any of those change, the runtime discards the old offsets and returns a first window with `cursorReset: true`. A client must not treat the configured element-window size as an accessibility boundary or ask the user to click until relevant searches and visible windows have been exhausted.
 
@@ -279,6 +281,7 @@ By default, state is stored in the operating system's per-user application-state
 - Visual actions are located and independently verified inside the extension. External callers cannot provide coordinates, screenshot bindings, policy verdicts, or approval grants, and the target is resolved again after approval.
 - Every proposal is schema-checked and independently assessed. Sensitive-data handling can be blocked outright.
 - Every session freezes its goal into a repetition policy before execution. Completed semantic effects are counted independently of observation-scoped refs and cannot exceed that policy.
+- Operation progress distinguishes changed, unchanged, and failed outcomes. Error-free transport is not treated as task progress, and repeated disclosure toggles are blocked before they can reverse the prior UI state.
 - Failed, blocked, rejected, cancelled, and restart-unknown guided operations are terminal until the caller closes the session.
 - Approval grants are bound to the operation digest, observation, document, tab, and expiry.
 - A service-worker restart never blindly retries an operation whose execution outcome is unknown.
@@ -325,6 +328,10 @@ For `failed`, `blocked`, `rejected`, `cancelled`, or `unknown_after_restart`, ca
 ### A repeated action is blocked after one success
 
 Inspect the `intent` returned by `browser_begin`. A standalone goal normally has `repeatPolicy: "once"`, so the same semantic state change cannot run again merely because its button remains visible. End the task and state an explicit count or observable stopping condition in a new goal when repetition is intentional.
+
+### An operation completed with `progress.outcome: "unchanged"`
+
+The browser accepted the action, but neither per-action verification nor the post-execution observation proved a visible state change. Call `browser_continue` for fresh evidence and choose a different target or search relation. Do not submit the same action again unchanged; the runtime blocks that loop, including repeated menu or dropdown toggles.
 
 ### A visible control is missing from `interactiveElements`
 

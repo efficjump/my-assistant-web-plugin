@@ -730,18 +730,35 @@
           salt: session.effectKeySalt
         })
       ));
+      const structuralInteractionKeys = actions.map((action) => {
+        const target = Contract.findActionTarget(action, session.observation.context);
+        return Contract.isDisclosureClick(action, target)
+          ? Contract.semanticEffectKey(action, session.observation.context, {
+              salt: session.effectKeySalt,
+              includeLowRisk: true
+            })
+          : "";
+      });
       const repeatBoundary = this.#evaluateRepeatBoundary(
         session,
-        semanticEffectKeys
+        semanticEffectKeys,
+        { structuralInteractionKeys }
       );
 
       let policy;
       if (!repeatBoundary.valid) {
+        const disclosureLoop = repeatBoundary.violations.some(
+          (violation) => violation.kind === "disclosure-toggle-repeat"
+        );
         policy = {
           version: "1.0",
           verdict: "block",
-          message: "The same semantic state-changing effect already reached this browser task's resolved repetition limit.",
-          risks: ["Repeating the effect could advance beyond the user's requested scope."],
+          message: disclosureLoop
+            ? "The same disclosure control was already activated without material progress."
+            : "The same semantic state-changing effect already reached this browser task's resolved repetition limit.",
+          risks: [disclosureLoop
+            ? "Repeating the control would most likely reverse its open or closed state."
+            : "Repeating the effect could advance beyond the user's requested scope."],
           sensitiveData: [],
           approvalReasons: []
         };
@@ -790,6 +807,7 @@
         goal,
         effectDigest: digest,
         semanticEffectKeys,
+        structuralInteractionKeys,
         actionSummary: Contract.sanitizeActions(actions),
         targetSummary: actions.map((action) => ({
           actionId: action.id,
@@ -835,22 +853,36 @@
       const intent = Contract.normalizeTurnIntent(session.turnIntent, {
         latestUserMessage: session.goal
       });
-      if (intent.repeatPolicy === "until_condition") {
-        return { valid: true, violations: [] };
-      }
-      const limit = Math.max(1, Number(intent.repeatLimit) || 1);
+      const limit = intent.repeatPolicy === "until_condition"
+        ? Number.POSITIVE_INFINITY
+        : Math.max(1, Number(intent.repeatLimit) || 1);
       const counts = new Map();
-      for (const operation of Object.values(this.state.operations)) {
-        if (
-          operation.sessionId !== session.id
-          || operation.id === options.excludeOperationId
-          || operation.status !== "completed"
-        ) {
-          continue;
-        }
+      const completedOperations = Object.values(this.state.operations)
+        .filter((operation) => (
+          operation.sessionId === session.id
+          && operation.id !== options.excludeOperationId
+          && (
+            operation.status === "completed"
+            || (operation.status === "failed" && operation.progress)
+          )
+        ))
+        .sort((left, right) => (
+          Number(left.completedAt || left.createdAt || 0)
+          - Number(right.completedAt || right.createdAt || 0)
+        ));
+      const structuralCounts = new Map();
+      for (const operation of completedOperations) {
         for (const key of operation.semanticEffectKeys || []) {
           if (key) {
             counts.set(key, (counts.get(key) || 0) + 1);
+          }
+        }
+        if ((operation.semanticEffectKeys || []).some(Boolean)) {
+          structuralCounts.clear();
+        }
+        for (const key of operation.structuralInteractionKeys || []) {
+          if (key) {
+            structuralCounts.set(key, (structuralCounts.get(key) || 0) + 1);
           }
         }
       }
@@ -865,6 +897,22 @@
         }
         counts.set(key, count + 1);
       }
+      const structuralLimit = intent.repeatPolicy === "bounded" ? limit : 1;
+      for (const key of options.structuralInteractionKeys || []) {
+        if (!key) {
+          continue;
+        }
+        const count = structuralCounts.get(key) || 0;
+        if (count >= structuralLimit) {
+          violations.push({
+            key,
+            count,
+            limit: structuralLimit,
+            kind: "disclosure-toggle-repeat"
+          });
+        }
+        structuralCounts.set(key, count + 1);
+      }
       return { valid: violations.length === 0, violations };
     }
 
@@ -877,11 +925,19 @@
       const repeatBoundary = this.#evaluateRepeatBoundary(
         session,
         operation.semanticEffectKeys || [],
-        { excludeOperationId: operation.id }
+        {
+          excludeOperationId: operation.id,
+          structuralInteractionKeys: operation.structuralInteractionKeys || []
+        }
       );
       if (!repeatBoundary.valid) {
+        const disclosureLoop = repeatBoundary.violations.some(
+          (violation) => violation.kind === "disclosure-toggle-repeat"
+        );
         operation.status = "blocked";
-        operation.error = "The semantic state-changing effect reached this browser task's resolved repetition limit before execution.";
+        operation.error = disclosureLoop
+          ? "The same disclosure control was already activated without material progress, so it was not toggled again."
+          : "The semantic state-changing effect reached this browser task's resolved repetition limit before execution.";
         operation.completedAt = this.now();
         delete operation.actions;
         delete operation.approvalGrant;
@@ -1008,11 +1064,21 @@
           await this.driver.waitAfterExecution(executionResult);
         }
         const postContext = await this.#collectObservation(operation.targetTabId);
+        const progress = classifyExecutionProgress(
+          executionResult,
+          freshContext,
+          postContext,
+          actionsForExecution
+        );
         const evidenceId = this.randomId("evidence");
         const completedAt = this.now();
-        operation.status = "completed";
+        operation.status = progress.outcome === "failed" ? "failed" : "completed";
         operation.completedAt = completedAt;
         operation.result = sanitizeExecutionResult(executionResult);
+        operation.progress = progress;
+        operation.error = progress.outcome === "failed"
+          ? progress.reason || "One or more browser actions failed."
+          : "";
         operation.evidence = {
           id: evidenceId,
           observedAt: completedAt,
@@ -1209,6 +1275,7 @@
             }
           : { required: false },
         result: cloneJson(operation.result || null),
+        progress: cloneJson(operation.progress || null),
         evidence: cloneJson(operation.evidence || null),
         error: stringValue(operation.error),
         next: operationNextInstruction(operation)
@@ -1350,6 +1417,50 @@
     return redactObjectValues(output);
   }
 
+  function classifyExecutionProgress(result, beforeContext, afterContext, actions = []) {
+    const results = Array.isArray(result?.results) ? result.results : [];
+    const failed = results.filter((item) => item?.ok === false);
+    const verifiedChanged = results.some((item) => (
+      item?.verification?.changed === true
+      || item?.result?.mayNavigate === true
+    ));
+    const contextChanged = Contract.contextDigest(beforeContext) !== Contract.contextDigest(afterContext);
+    if (failed.length) {
+      return {
+        outcome: "failed",
+        changed: verifiedChanged || contextChanged,
+        reason: safeExternalErrorMessage(
+          failed[0]?.error || "One or more browser actions failed."
+        ),
+        failedActions: failed.length
+      };
+    }
+    if (verifiedChanged || contextChanged) {
+      return {
+        outcome: "changed",
+        changed: true,
+        reason: verifiedChanged
+          ? "The executed action produced an observable change."
+          : "The post-execution browser observation changed."
+      };
+    }
+    if (
+      actions.length
+      && actions.every((action) => Contract.actionCanSucceedWithoutPageChange(action))
+    ) {
+      return {
+        outcome: "succeeded",
+        changed: false,
+        reason: "The operation returned its requested result without requiring a browser-state change."
+      };
+    }
+    return {
+      outcome: "unchanged",
+      changed: false,
+      reason: "The operation completed without an observable browser-state change."
+    };
+  }
+
   function sanitizeTargetForClient(target) {
     if (!target) return null;
     return {
@@ -1436,6 +1547,9 @@
       return "Wait for the user to approve this operation in the extension, then call browser_operation_get with the same operation_id. Do not create a duplicate proposal.";
     }
     if (operation.status === "completed") {
+      if (operation.progress?.outcome === "unchanged") {
+        return "Call browser_observe for fresh evidence and choose a different target or approach. Do not repeat the same operation unchanged.";
+      }
       return "Call browser_observe to verify the visible outcome, then close the session when the objective is satisfied.";
     }
     if (["stale", "expired"].includes(operation.status)) {

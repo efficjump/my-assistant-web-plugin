@@ -367,7 +367,7 @@ test("terminal response verification uses one immutable turn intent and current 
   assert.match(script, /allowVerifierEvidenceBinding:\s*false/);
   assert.match(script, /resolveAgentTurnIntent\(state\.agentSession\)/);
   assert.match(script, /repeatPolicy === "until_condition"/);
-  assert.match(script, /recordSuccessfulEffects/);
+  assert.match(script, /recordExecutionOutcomes/);
 });
 
 test("malformed decision output and internal JSON stay out of user-facing chat", () => {

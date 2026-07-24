@@ -21,6 +21,7 @@
   );
   const EXTERNAL_ACTION_TYPE_SET = new Set(EXTERNAL_ACTION_TYPES);
   const READ_ONLY_ACTION_TYPES = new Set(["focus", "hover", "scroll", "wait", "wait_for", "extract"]);
+  const RESULT_PROGRESS_ACTION_TYPES = new Set(["extract", "wait", "wait_for", "download_wait"]);
   const EXTERNAL_ACTION_FIELDS = Object.freeze([
     "id",
     "type",
@@ -333,7 +334,10 @@
       return "";
     }
     const target = findActionTarget(action, context);
-    if (!actionChangesState(action, target, context)) {
+    const changesState = actionChangesState(action, target, context);
+    const includeLowRisk = options.includeLowRisk === true
+      && isLowRiskUiAction(action, target, context);
+    if (!changesState && !includeLowRisk) {
       return "";
     }
     const semanticContext = stringValue(target?.searchMatch?.contextSnippet);
@@ -478,6 +482,10 @@
     return !isLowRiskUiAction(action, target, context);
   }
 
+  function actionCanSucceedWithoutPageChange(action) {
+    return RESULT_PROGRESS_ACTION_TYPES.has(action?.type);
+  }
+
   function assessActionSafety(input, positionalContext, positionalSettings) {
     const options = Array.isArray(input)
       ? { actions: input, context: positionalContext, settings: positionalSettings }
@@ -563,6 +571,7 @@
   const api = Object.freeze({
     EXTERNAL_ACTION_FIELDS,
     EXTERNAL_ACTION_TYPES,
+    actionCanSucceedWithoutPageChange,
     actionChangesState,
     assessActionSafety,
     buildActionPreconditions,
@@ -572,6 +581,7 @@
     findActionTarget,
     getExternalActionSchema,
     isApprovalSensitiveAction,
+    isDisclosureClick,
     isSensitiveTarget,
     normalizeExternalActions,
     normalizeTurnIntent: AgentCore.normalizeTurnIntent,

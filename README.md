@@ -4,7 +4,7 @@ A Manifest V3 browser extension that turns a configured language model into a bo
 
 ![Agent side panel](docs/assets/agent-panel.png)
 
-Version `0.9.8` with Bridge protocol `2.3` targets Chromium-based browsers version 116 or later. This repository contains a source-loaded development build rather than a store package. The extension UI screenshots in this README were regenerated from the current version with a temporary browser profile and local fixtures.
+Version `0.9.9` with Bridge protocol `2.3` targets Chromium-based browsers version 116 or later. This repository contains a source-loaded development build rather than a store package. The extension UI screenshots in this README were regenerated from the current version with a temporary browser profile and local fixtures.
 
 ## Choose the workflow
 
@@ -34,7 +34,9 @@ flowchart LR
     V -->|"Evidence is sufficient"| R["Return the result"]
 ```
 
-Completion is not accepted from model prose alone. Before any page effect, the runtime resolves one immutable intent for the latest message. A complete command starts a new standalone task even when it resembles an earlier failed request; only a semantically incomplete follow-up that explicitly resumes one unfinished deliverable carries prior context forward. The runtime also resolves whether the same semantic effect is allowed once, an explicit number of times, or until an explicit condition. A successful effect cannot be repeated beyond that boundary merely because the same control remains visible. Runtime-issued evidence and separate verifiers then check both the completion claim and the exact user-facing result. A terminal response must contain the requested result rather than announce future work or merely say that a summary was produced.
+Completion is not accepted from model prose alone. Before any page effect, the runtime resolves one immutable intent for the latest message. A complete command starts a new standalone task even when it resembles an earlier failed request. A context-dependent correction such as “use the icon beside that field instead” can carry one prior task forward without requiring a literal “continue” phrase; the new wording replaces the failed target or method and never authorizes replay of the rejected action. Invalid intent output gets one schema-bound repair before the runtime falls back to a standalone request. The runtime also resolves whether the same semantic effect is allowed once, an explicit number of times, or until an explicit condition. A successful effect cannot be repeated beyond that boundary merely because the same control remains visible. Runtime-issued evidence and separate verifiers then check both the completion claim and the exact user-facing result. A terminal response must contain the requested result rather than announce future work or merely say that a summary was produced.
+
+The loop keeps an execution-attempt ledger instead of treating an error-free click as progress. Each attempt binds the target and evidence state to its expected change, observable result, and outcome: changed, unchanged, navigation, succeeded tool call, or failed. An unchanged or failed attempt is not added to the successful-effect ledger and cannot be proposed again from the same evidence state. Disclosure controls have an additional transition boundary: reopening the same menu, select, or tree control without an intervening material effect is treated as a likely open/close reversal and is repaired into a different target or focused element search before any second click. The built-in agent and the Bridge apply the same distinction between transport success and task progress.
 
 The planner may cite only IDs already present in the runtime evidence ledger, but it no longer has to copy an opaque ID correctly to reach verification. An empty completion-evidence candidate proceeds to the independent verifier, which selects valid runtime-issued IDs and binds them to the decision. Unissued IDs are discarded, and the terminal state still fails closed unless the verifier returns at least one valid supporting ID. Contract diagnostics remain in the internal trace instead of being shown as a `completionEvidence` error in the conversation.
 
@@ -51,13 +53,15 @@ The planner may cite only IDs already present in the runtime evidence ledger, bu
 - Supports `tab_open`, `tab_focus`, `tab_adopt`, `tab_close`, `download`, and `download_wait`
 - Waits for element state, text, URL, title, live-region, and DOM-stability conditions
 - Compares observable state before and after every effect
+- Records expected-versus-observed execution outcomes and prevents unchanged or failed attempts from being retried against the same evidence
+- Detects repeated disclosure toggles even when open and closed DOM states alternate, then requires a materially different target or search
 - Validates element references, runtime-issued evidence, and MCP input schemas
 - Applies the shared deterministic safety contract to provably read-only or structural UI actions, and runs an independent policy decision for actions that may change external state
 - Requires approval for sensitive or externally visible effects
 - Supports Streamable HTTP MCP tools, resources, prompts, protocol negotiation, and session recovery
 - Supports MCP OAuth 2.1 Authorization Code with PKCE S256 and refresh-token rotation
 - Exposes one explicitly shared tab to MCP-capable development tools through an authenticated loopback companion
-- Freezes each latest request into a standalone or explicit-continuation intent and prevents successful effects from exceeding its resolved repetition boundary
+- Freezes each latest request into a standalone or context-dependent correction/continuation intent and prevents successful effects from exceeding its resolved repetition boundary
 - Restores conversations by tab and URL and exports traces as Markdown, JSON, or CSV
 - Records privacy-preserving AI request audit metadata
 - Treats an HTTP success with no usable output as an explicit failure
@@ -71,7 +75,7 @@ The **Context** inspector shows what the current browser observation actually co
 
 ### Recognition and latency model
 
-Recognition remains structure-driven rather than site-specific. A focused element search first filters generic identity fields such as accessible name, role, tag, input type, placeholder, title, and safe attributes, and only then performs the more expensive visibility and nearby-context checks. Full observations still enumerate all currently exposed controls so broad cursor paging remains complete.
+Recognition remains structure-driven rather than site-specific. A focused element search first filters generic identity fields such as accessible name, role, tag, input type, placeholder, title, and safe attributes, and only then performs the more expensive visibility and nearby-context checks. Nearby text is scored by structural distance: the smallest complete ancestor group and field container outrank a row, collection, form, dialog, or region that merely contains the same words somewhere else. This lets an unnamed lookup icon beside one field outrank a labeled dropdown in an adjacent field without adding page-specific selectors. For an unnamed icon, the planner searches with the control role and the adjacent label as `nearText` instead of misrepresenting that label as the icon's own name. Full observations still enumerate all currently exposed controls so broad cursor paging remains complete.
 
 One observation reuses query, style, rectangle, exposure, text, and image-map geometry results for the duration of that collection. Embedded-origin permission discovery uses a lightweight frame-boundary pass instead of collecting every control in every frame. A normal semantic DOM page does not send a screenshot with every planning request; the configured screenshot path activates when the DOM has no usable evidence, a visual surface is present, or a fresh screenshot is explicitly required. When a screenshot is required, a compact observation probe verifies that the DOM, viewport, frame boundaries, and bound targets have not changed; an unchanged page does not need a second full collection.
 
@@ -148,7 +152,7 @@ Authentication values are session-only by default and are persisted only when th
 
 The agent can dynamically request another visible-control window with a `discover` decision. It searches accessible labels, roles, safe attributes, and nearby table/row/form/dialog/region text locally, similar to using a targeted source search instead of loading an entire file. Only matched control descriptors are sent to the model. If the target is outside the viewport, the agent must scroll and observe again; local search does not expose offscreen or hidden content.
 
-Write a numeric count or an observable stopping condition when an action genuinely needs repetition, for example “apply this to the next three rows” or “continue until no pending rows remain.” Without that explicit scope, the same successful state-changing effect is limited to one occurrence in the request. If a task ends with an error, rejection, or cancellation, send the next complete request as a new task; the failed run is retained as context but is not treated as permission to replay its actions.
+Write a numeric count or an observable stopping condition when an action genuinely needs repetition, for example “apply this to the next three rows” or “continue until no pending rows remain.” Without that explicit scope, the same successful state-changing effect is limited to one occurrence in the request. If a task ends with an error, rejection, or cancellation, a complete next request starts a new task. A concise, context-dependent correction can instead reuse the unfinished objective while replacing the failed target or method. In both cases, the failed run is context rather than permission to replay its actions.
 
 ## Settings and workspace placement
 
