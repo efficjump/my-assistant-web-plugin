@@ -1,7 +1,7 @@
 # My Assistant Web Plugin
 
 > [!IMPORTANT]
-> **Project status / 프로젝트 상태: Ended / 종료 — 2026-07-26**
+> **Project status: Ended — 2026-07-26**
 >
 > Development, maintenance, support, and releases have ended. This repository remains available as a historical reference; future browser, model-provider, or dependency changes may make the final build obsolete.
 
