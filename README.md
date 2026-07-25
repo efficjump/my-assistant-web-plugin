@@ -20,21 +20,30 @@ The Bridge is not required for normal use of the built-in agent. Conversely, ena
 
 ## Why this project exists
 
-Fixed browser automation scripts often keep replaying an initial action list even after the page behaves differently than expected. This extension uses a closed feedback loop: it observes the page again after each effect, validates the next decision, requests approval when required, and checks whether the expected change actually happened.
+Fixed browser automation scripts often keep replaying an initial action list even after the page behaves differently than expected. A single heavyweight model loop has the opposite problem: even obvious actions pay for a complete page observation, planning, policy classification, execution, and completion verification. This extension separates those workloads before it reads the page.
 
 ```mermaid
-flowchart LR
-    U["User goal"] --> O["Observe current state"]
-    O --> P["Plan the next effect"]
-    P --> G["Validate policy and schema"]
-    G --> A["Request approval when required"]
-    A --> E["Execute a tool or page action"]
-    E --> V["Verify state change and evidence"]
-    V -->|"Goal not met"| O
-    V -->|"Evidence is sufficient"| R["Return the result"]
+flowchart TD
+    U["User goal"] --> R["Compact intent and route request"]
+    R --> D["Direct DOM actions"]
+    R --> Q["Focused page answer"]
+    R --> C["Structured collection"]
+    R --> A["General agent"]
+    D --> S["Targeted rendered-DOM search"]
+    S --> N["Browser-native input"]
+    N --> V["Target-bound verification"]
+    Q --> F["Focused rendered-text evidence"]
+    C --> L["Runtime collection ledger"]
+    A --> O["Observe, plan, approve, act, verify"]
+    V --> X["Result"]
+    F --> X
+    L --> X
+    O --> X
 ```
 
-Completion is not accepted from model prose alone. Before any page effect, the runtime resolves one immutable intent for the latest message. A complete command starts a new standalone task even when it resembles an earlier failed request. A context-dependent correction such as “use the icon beside that field instead” can carry one prior task forward without requiring a literal “continue” phrase; the new wording replaces the failed target or method and never authorizes replay of the rejected action. Invalid intent output gets one schema-bound repair before the runtime falls back to a standalone request. The runtime also resolves whether the same semantic effect is allowed once, an explicit number of times, or until an explicit condition. A successful effect cannot be repeated beyond that boundary merely because the same control remains visible. Runtime-issued evidence and separate verifiers then check both the completion claim and the exact user-facing result. A terminal response must contain the requested result rather than announce future work or merely say that a summary was produced.
+The first model call sees the latest request, a bounded slice of relevant conversation, and an optional prior-run summary; it does not receive a page dump or screenshot. It freezes one immutable intent and selects one of four routes. One to three concrete DOM operations use the direct route. A current-page question uses focused text retrieval. An exact record request uses the collection ledger. Visual, external-tool, tab-management, authentication, consequential submission, ambiguous, and open-ended work stays in the complete agent loop.
+
+Completion is not accepted from model prose alone. A complete command starts a new standalone task even when it resembles an earlier failed request. A context-dependent correction such as “use the icon beside that field instead” can carry one prior task forward without requiring a literal “continue” phrase; the new wording replaces the failed target or method and never authorizes replay of the rejected action. The runtime also resolves whether the same semantic effect is allowed once, an explicit number of times, or until an explicit condition. A successful effect cannot be repeated beyond that boundary merely because the same control remains visible. Direct actions are completed from the bound target and the browser-observed result. The general route retains runtime-issued evidence and independent verifiers for uncertain completion. A terminal response must contain the requested result rather than announce future work or merely say that a summary was produced.
 
 The loop keeps an execution-attempt ledger instead of treating an error-free click as progress. Each attempt binds the target and evidence state to its expected change, observable result, and outcome: changed, unchanged, indeterminate ambient change, navigation, succeeded tool call, or failed. An unchanged, indeterminate, or failed attempt is not added to the successful-effect ledger and cannot be proposed again from the same semantic evidence state. Raw DOM and visual revision counters do not reset that state by themselves. Disclosure controls have an additional transition boundary: reopening the same menu, select, or tree control without an intervening material effect is treated as a likely open/close reversal and is repaired into a different target or focused element search before any second click. The built-in agent and the Bridge apply the same distinction between transport success and task progress.
 
@@ -42,14 +51,15 @@ The planner may cite only IDs already present in the runtime evidence ledger, bu
 
 ## Capabilities
 
-- Observes the URL and only the text, controls, forms, tables, and live regions that are visually exposed in the current viewport
+- Observes the URL and the text, controls, forms, tables, and live regions exposed in the current viewport for general planning
+- Searches the rendered document directly for a user-named target or focused fact, including offscreen rendered content, without exposing hidden subtrees or scanning every node
 - Exposes dense visible controls through observation-bound windows and dynamic label/role search instead of treating the configured element count as a browser limit
 - Traverses open Shadow DOM and visually verified same-origin or permission-granted `iframe` and legacy `frame` documents, while keeping every child-frame ref bound to its document
 - Discovers visible nested scroll regions and scrolls the intended container before observing newly revealed controls
 - Supports `click`, screenshot-bound `visual_click`, `fill`, `select`, `focus`, `hover`, `submit`, `press`, `scroll`, `navigate`, `wait`, `wait_for`, `extract`, and `upload`
 - Collects exact-size structured record sets from repeated rendered content, deduplicates records across result pages, and stops at the target or when another page produces no new records
 - Uses visual coordinates only inside an observed canvas or application surface; coordinates are created inside the extension, require approval, and are independently verified against a fresh screenshot before execution
-- Recognizes semantic controls, visible custom pointer controls, legacy image-map areas, and SVG links, then sends a pointer/mouse sequence before click activation
+- Recognizes semantic controls, rendered custom pointer controls, legacy image-map areas, and SVG links, then uses browser-native pointer or keyboard input when the browser API is available
 - Resolves semantic menu or tree-item containers to their single rendered child link or button when the container owns the visible label, so icon hit points do not replace the intended navigation effect
 - Supports `tab_open`, `tab_focus`, `tab_adopt`, `tab_close`, `download`, and `download_wait`
 - Waits for element state, text, URL, title, live-region, and DOM-stability conditions
@@ -72,6 +82,7 @@ The planner may cite only IDs already present in the runtime evidence ledger, bu
 - Repairs malformed structured decisions without exposing model JSON or internal validation details in the conversation
 - Renders CommonMark and GFM assistant output as structured headings, emphasis, nested and task lists, tables, quotes, code, and safe links instead of exposing source delimiters
 - Switches the extension-owned interface between browser-detected language, Korean, and English without a reload
+- Locks model-authored explanations, progress, action reasons, and final answers to an independently selected Korean or English response language
 
 The **Context** inspector shows what the current browser observation actually contains: visible text and controls, mapped frames, nested scroll regions, visual surfaces, automation constraints, collection time, selection, and recent logs. It is useful for distinguishing a model-planning problem from a browser-permission, page-structure, or collection-performance boundary.
 
@@ -79,11 +90,15 @@ The **Context** inspector shows what the current browser observation actually co
 
 ### Recognition and latency model
 
-Recognition remains structure-driven rather than site-specific. A focused element search first filters generic identity fields such as accessible name, role, tag, input type, placeholder, title, and safe attributes, and only then performs the more expensive visibility and nearby-context checks. Nearby text is scored by structural distance: the smallest complete ancestor group and field container outrank a row, collection, form, dialog, or region that merely contains the same words somewhere else. This lets an unnamed lookup icon beside one field outrank a labeled dropdown in an adjacent field without adding page-specific selectors. For an unnamed icon, the planner searches with the control role and the adjacent label as `nearText` instead of misrepresenting that label as the icon's own name. A query must match the control itself; nearby text cannot lend its identity to an unrelated control. If an exact local search returns no control, the runtime relaxes semantic constraints in bounded stages and then restarts from a fresh unfiltered observation before asking the planner to decide again. Full observations still enumerate all currently exposed controls so broad cursor paging remains complete.
+Recognition remains structure-driven rather than site-specific. A direct route searches a strong generic control selector across the rendered document and adds text-node anchors only for the requested terms, instead of calling `querySelectorAll("*")` for the normal case. Identity fields include accessible name, role, tag, input type, placeholder, title, description, name, and safe test identifiers. Nearby text is scored by structural distance: the smallest complete ancestor group and field container outrank a row, collection, form, dialog, or region that merely contains the same words somewhere else. Hidden, inert, `aria-hidden`, non-rendered, disabled, clipped, or covered targets remain unavailable. A rendered offscreen match is scrolled into view and must expose a valid hit point before it can execute.
 
-One observation reuses query, style, rectangle, exposure, text, and image-map geometry results for the duration of that collection. Embedded-origin permission discovery uses a lightweight frame-boundary pass instead of collecting every control in every frame. A normal semantic DOM page does not send a screenshot with every planning request; the configured screenshot path activates when the DOM has no usable evidence, a visual surface is present, or a fresh screenshot is explicitly required. When a screenshot is required, a compact observation probe verifies that the DOM, viewport, frame boundaries, and bound targets have not changed; an unchanged page does not need a second full collection.
+The compact router is the only normal planning call for a clear low-risk direct operation. A unique local score wins without another model request; if the top candidates are too close, a small arbiter sees at most eight redacted descriptors. A focused answer uses one additional call over matching rendered-text snippets. A collection binds one representative record and then advances through runtime-verified pagination without general replanning. A direct effect that cannot be proven read-only, a disclosure, a same-origin navigation, or verified collection traversal still passes through the independent policy gate. Only the general route collects the complete planning context and uses the iterative planner and terminal verifier. This changes the common-case model-call shape from several serial requests to one route request for a low-risk direct action, while preserving the conservative path for work that actually needs it.
 
-The built-in model loop also avoids serial work that does not add evidence. A fresh request resolves its immutable intent and first executable decision in one structured model response instead of waiting for a separate intent-only round trip. The initial DOM observation and MCP capability discovery still run together, and the prefetched page state is reused only after a compact probe confirms that it is current. If the combined intent is malformed, one bounded structured repair runs before the runtime falls back to a safe standalone intent and replans; the independent terminal verifier remains unchanged. Planner input excludes duplicate page text and evidence payloads, and a successful terminal decision uses one verifier for completion evidence and current-page grounding. Later page observation and MCP discovery also run together, and one capability snapshot is reused across the bounded discovery windows of the same turn. Tool-only turns skip page-settle work, while observation retries wait only for transient navigation or message-channel failures and never sleep after the final failed attempt.
+One observation reuses query, style, rectangle, exposure, text, and image-map geometry results for the duration of that collection. Embedded-origin permission discovery uses a lightweight frame-boundary pass instead of collecting every control in every frame. A normal semantic DOM page does not send a screenshot with every request; screenshots activate when the DOM has no usable evidence, a visual surface is present, or a fresh screenshot is explicitly required. When a screenshot is required, a compact observation probe verifies that the DOM, viewport, frame boundaries, and bound targets have not changed.
+
+Clicks, hovers, key presses, and normal text fills are prepared in the content frame, bound to the observed node and point, dispatched through the browser's native input channel, and verified again in the content frame. Child-frame points are transformed through freshly verified frame geometry. If the native channel cannot be attached before any input is sent, the runtime records the reason and uses the existing target-bound content fallback. Once native input starts, an uncertain outcome is never replayed through the fallback.
+
+For multi-page record collection, the observer identifies pagination from semantic navigation state, `rel` relationships, current-page state, compact numeric control groups, and same-view numeric URL variants. Record or detail links never qualify merely because they appear near the list. The runtime extracts the current page, advances by one verified pagination control, deduplicates the next batch, and stops at the exact target or a repeated/no-new-record page. Reaching the exact target causes the local runtime to generate every explicitly requested CSV or XLSX artifact and finalize from runtime evidence, avoiding separate export-planning and completion-verifier round trips.
 
 Read-only actions, disclosure controls, and same-origin navigation links use the same deterministic state-change classification as the execution gate instead of making a second policy-model request; unknown clicks, submissions, cross-origin movement, tools, and other consequential effects still use the independent policy path. Immediately before either automatic or approved execution, an unchanged observation probe takes the fast path; a changed probe triggers a full recollection and target-precondition check for page actions. Tool-only effects remain bound to the original page probe and model-visible browser context, and screenshot-backed plans also recapture and compare a SHA-256 pixel binding. Any mismatch returns to planning without executing the stale tool arguments or performing an unnecessary full DOM collection. At the content boundary, every page action checks the bound document; element actions additionally check the frame, exact DOM node, and mutable state. Each document assigns monotonic, document-namespaced refs to live DOM nodes: the same connected node keeps its ref across observation windows, a replacement node receives a new ref, and only refs returned by the current observation are executable. Old refs are never reassigned through a former selector, and nested `wait_for` lookups stay attached to the exact observed nodes while their expected state is allowed to change. These private bindings are removed from model and Bridge-client observations. When a plan still fails the executable contract after its schema-repair pass, the runtime uses the remaining observation budget for a bounded fresh replan unless the failure is an actual repetition or stalled-collection safety boundary. Action verification follows the exact executed node, returns after the first semantic observable change, and treats revision-only churn as indeterminate rather than success. After page actions, the runtime observes document readiness and DOM, visual, URL, and scroll revisions until the page is quiet instead of always sleeping for a fixed interval. If a navigation replaces the document before the content response arrives, the runtime accepts it only when the browser proves that the bound frame's document ID or sanitized URL actually changed.
 
@@ -158,7 +173,7 @@ Authentication values are session-only by default and are persisted only when th
 4. Keep the target tab open while the task runs.
 5. Check the final answer and the compact **Task flow** dock above the composer. Expand the dock when you need the full phase history. A task is complete only after the extension has re-observed the result and verified the returned evidence.
 
-The agent can dynamically request another visible-control window with a `discover` decision. It searches accessible labels, roles, safe attributes, and nearby table/row/form/dialog/region text locally, similar to using a targeted source search instead of loading an entire file. Only matched control descriptors are sent to the model. If the target is outside the viewport, the agent must scroll and observe again; local search does not expose offscreen or hidden content.
+For a clear direct request, the runtime searches accessible labels, roles, safe attributes, and nearby table/row/form/dialog/region text across the rendered document before invoking the general planner. Only a small ranked candidate set is considered. A rendered offscreen target is scrolled into view and rechecked locally; hidden, inert, transparent, clipped, or covered content remains unavailable. The general agent and external Bridge still use visible-control windows and bounded `discover` cursors when the request cannot use this direct path.
 
 Write a numeric count or an observable stopping condition when an action genuinely needs repetition, for example “apply this to the next three rows” or “continue until no pending rows remain.” Without that explicit scope, the same successful state-changing effect is limited to one occurrence in the request. If a task ends with an error, rejection, or cancellation, a complete next request starts a new task. A concise, context-dependent correction can instead reuse the unfinished objective while replacing the failed target or method. In both cases, the failed run is context rather than permission to replay its actions.
 
@@ -170,7 +185,7 @@ The settings dialog starts with a live overview of the model, automation mode, e
 
 ![Settings overview and workspace placement](docs/assets/settings-overview.png)
 
-### Display language
+### Interface and AI response languages
 
 Open **Settings → General → Display language** and choose:
 
@@ -178,7 +193,9 @@ Open **Settings → General → Display language** and choose:
 - **Korean** to keep the interface in Korean regardless of the browser language
 - **English** to keep the interface in English regardless of the browser language
 
-The selection is saved with the other extension settings and applies immediately to the panel, settings, approval controls, runtime status messages, and built-in task templates. Reloading the extension or target page is not required. Switching the display language does not translate user input, saved personal templates, page titles or content, or model-generated answers; those values remain byte-for-byte user or source content. The model's response language is controlled separately by the request and system instruction.
+The selection is saved with the other extension settings and applies immediately to the panel, settings, approval controls, runtime status messages, and built-in task templates. Reloading the extension or target page is not required.
+
+**AI response language** is a separate Korean/English setting. It is frozen into every request as a runtime contract and covers model-authored messages, summaries, progress, plan items, search/tool/action reasons, verification text, and final answers. The runtime validates that contract and uses the existing bounded repair path when a response clearly switches languages. Extension-generated terminal fallbacks follow the same selection. User input, saved personal templates, quoted page text, titles, names, URLs, filenames, code, and tool identifiers remain in their original form; changing either language setting never rewrites source content.
 
 The browser action is not limited to a right-side panel:
 
@@ -200,7 +217,7 @@ Each submitted message becomes one immutable agent objective. A complete new req
 
 ![Template editor with a selected personal template](docs/assets/template-manager.png)
 
-The export dialog keeps collected datasets separate from conversation traces. A completed or safely stalled dataset remains in local extension storage and can be downloaded directly as CSV or XLSX; no remote conversion service is used. When the request itself names CSV or Excel output, that format becomes part of the immutable collection contract. The agent cannot report completion until the exact record target is reached and the local runtime has generated every requested artifact; page traversal and unrelated tools are blocked while an artifact is still missing.
+The export dialog keeps collected datasets separate from conversation traces. A completed or safely stalled dataset remains in local extension storage and can be downloaded directly as CSV or XLSX; no remote conversion service is used. When the request itself names CSV or Excel output, that format becomes part of the immutable collection contract. The agent cannot report completion until the exact record target is reached and the local runtime has generated every requested artifact. At that boundary, explicitly requested files are generated and verified directly from the runtime-owned ledger, so the planner does not spend another round trip asking for an export it already has enough evidence to perform.
 
 Completed requests can also be saved as an **Automation set** or **Test set**, exported as JSON, and imported on another local installation. Each step stores the semantic goal, completion criteria, output contract, and test assertions rather than transient element refs or CSS selectors. Replay starts each step as a new browser task and plans again from the current page. Automation sets stop on a failed step, while test sets retain per-step outcomes so later checks can still run.
 
@@ -426,6 +443,7 @@ See [Web structure compatibility](docs/web-compatibility.md) for frame, Shadow D
 | Permission | Type | Purpose |
 | --- | --- | --- |
 | `activeTab` | Required | Restricts page access to the tab where the user starts a task |
+| `debugger` | Required | Dispatches browser-native mouse and keyboard input to the already approved target tab, then detaches immediately |
 | `scripting` | Required | Injects observation and action code into an approved tab |
 | `sidePanel` | Required | Displays the agent interface |
 | `storage` | Required | Stores settings, conversations, and traces |
@@ -442,7 +460,7 @@ The production manifest does not require `<all_urls>`. Site and endpoint origins
 ## Safety and privacy
 
 - Page text, DOM labels, MCP results, resources, and prompts are treated as untrusted data.
-- Offscreen, clipped, fully occluded, fully transparent, and hidden DOM content is excluded from model-visible page observations until it is revealed and observed again.
+- General page observations exclude offscreen, clipped, fully occluded, fully transparent, and hidden DOM content. A focused route can retrieve only user-matching text or controls from the rendered document; an offscreen control must be scrolled into an exposed point before execution, and hidden subtrees remain excluded.
 - Child-frame content is merged only when one fully exposed `iframe` or legacy `frame` boundary maps unambiguously to one browser frame; named duplicate-URL frames can be distinguished by their document binding, while anonymous ambiguous frames remain an explicit capability gap.
 - The model can use only element references and tools present in the current observation.
 - Each run is pinned to an exact tab and document identity.
@@ -504,7 +522,7 @@ Run the local panel harness with:
 npm run serve:test
 ```
 
-The command reports the temporary development address. The E2E suite exercises the Manifest V3 service worker, document replacement during an action response, targetless document checks, opaque node and mutable-state bindings, recycled-ref rejection, selector/text child-frame routing, nested `wait_for` bindings, post-action ref-map races, ambient-only change classification, semantic menu containers with nested links, cached viewport-scoped deep DOM observation on an 8,000-node fixture, lightweight frame-origin discovery, screenshot observation probes, DOM-first screenshot selection, tool-only page/browser/pixel freshness, deterministic low-risk policy fast paths, event-driven page settling, first-change action verification, contextual element retrieval, structured-search cursor binding, approval-time search-window reconstruction, dense-control pagination, bounded discovery exhaustion, final effect-free verification, capability-loading overlap, current-viewport completion evidence, semantic page and MCP-tool repetition boundaries, malformed-response containment, named duplicate-URL legacy frames, image-map actions, SVG links, hidden-frame exclusion, nested scroll regions, guarded visual-surface clicks, extension-owned Bridge visual targeting, terminal Bridge failures, occlusion and clipping filters, file handoff, tab lifecycle, worker restart, and empty-response protection. The optional live-site variables add a temporary-profile smoke test that discovers credential fields semantically, logs in, and follows the supplied visible menu labels while asserting expected paths; credential values are never printed. The opt-in local-harness scenario additionally launches a compatible CLI, loads a temporary secret-protected MCP configuration, confirms that every assistant turn reports the local `default` model alias, and requires the model to complete the guided begin → act → approval/continue → verification → end workflow against a temporary browser profile.
+The command reports the temporary development address. The E2E suite exercises the Manifest V3 service worker, compact routing without page evidence, rendered-document offscreen target and text retrieval, browser-native trusted pointer input, document replacement during an action response, targetless document checks, opaque node and mutable-state bindings, recycled-ref rejection, selector/text child-frame routing, nested `wait_for` bindings, post-action ref-map races, ambient-only change classification, semantic menu containers with nested links, cached viewport-scoped deep DOM observation on an 8,000-node fixture, lightweight frame-origin discovery, screenshot observation probes, DOM-first screenshot selection, tool-only page/browser/pixel freshness, deterministic low-risk policy fast paths, event-driven page settling, first-change action verification, contextual element retrieval, structured-search cursor binding, approval-time search-window reconstruction, dense-control pagination, bounded discovery exhaustion, final effect-free verification, capability-loading overlap, current-viewport completion evidence, semantic page and MCP-tool repetition boundaries, malformed-response containment, named duplicate-URL legacy frames, image-map actions, SVG links, hidden-frame exclusion, nested scroll regions, guarded visual-surface clicks, extension-owned Bridge visual targeting, terminal Bridge failures, occlusion and clipping filters, file handoff, tab lifecycle, worker restart, and empty-response protection. The optional live-site variables add a temporary-profile smoke test that discovers credential fields semantically, logs in, and follows the supplied visible menu labels while asserting expected paths; credential values are never printed. The opt-in local-harness scenario additionally launches a compatible CLI, loads a temporary secret-protected MCP configuration, confirms that every assistant turn reports the local `default` model alias, and requires the model to complete the guided begin → act → approval/continue → verification → end workflow against a temporary browser profile.
 
 ## Public-release audit
 

@@ -250,6 +250,69 @@ try {
     assert.ok(firstContext.data.collectionDiagnostics.wallDurationMs >= 0);
     assert.ok(firstContext.data.collectionDiagnostics.phaseDurationsMs.interactiveElements >= 0);
     assert.ok(firstContext.data.collectionDiagnostics.cacheHits.style > 0);
+    const renderedTargetSearch = await extensionMessage(cdp, panelSessionId, {
+      type: "COLLECT_PAGE_CONTEXT",
+      targetTabId: firstTabId,
+      options: {
+        maxTextChars: 4000,
+        maxElements: 12,
+        elementQuery: "Offscreen action",
+        elementRoles: ["button"],
+        targetSearchScope: "rendered-document",
+        redactSensitiveData: true
+      }
+    });
+    assert.equal(renderedTargetSearch.ok, true);
+    assert.equal(renderedTargetSearch.data.observationScope.kind, "rendered-document-target-search");
+    assert.equal(
+      renderedTargetSearch.data.interactiveElements.find(
+        (element) => element.label === "Offscreen action"
+      )?.exposure,
+      "offscreen-rendered"
+    );
+    const focusedRenderedText = await extensionMessage(cdp, panelSessionId, {
+      type: "COLLECT_PAGE_CONTEXT",
+      targetTabId: firstTabId,
+      options: {
+        maxTextChars: 4000,
+        maxElements: 8,
+        elementQuery: "Offscreen viewport fact",
+        targetSearchScope: "rendered-document",
+        redactSensitiveData: true
+      }
+    });
+    assert.ok(
+      focusedRenderedText.data.focusedTextMatches.some(
+        (match) => /Offscreen viewport fact/.test(match.text || "")
+      ),
+      "focused rendered-document search should retrieve only matching rendered text without a full document prompt"
+    );
+    const paginationContext = await extensionMessage(cdp, panelSessionId, {
+      type: "COLLECT_PAGE_CONTEXT",
+      targetTabId: firstTabId,
+      options: {
+        maxTextChars: 4000,
+        maxElements: 20,
+        elementRoles: ["pagination"],
+        redactSensitiveData: true
+      }
+    });
+    assert.equal(paginationContext.ok, true);
+    assert.deepEqual(
+      paginationContext.data.interactiveElements.map((element) => element.label),
+      ["2", "3"]
+    );
+    assert.ok(paginationContext.data.interactiveElements.every((element) => (
+      element.navigationKind === "pagination"
+      && Number.isInteger(element.navigationOrdinal)
+    )));
+    assert.equal(
+      paginationContext.data.interactiveElements.some((element) => (
+        /record title/i.test(element.label || "")
+      )),
+      false,
+      "pagination discovery must exclude record and detail links"
+    );
     const observationProbe = await extensionMessage(cdp, panelSessionId, {
       type: "VERIFY_PAGE_OBSERVATION",
       targetTabId: firstTabId
@@ -385,7 +448,11 @@ try {
         }]
       });
       assert.equal(compositeNavigation.ok, true);
-      assert.equal(compositeNavigation.data.results[0].ok, true);
+      assert.equal(
+        compositeNavigation.data.results[0].ok,
+        true,
+        JSON.stringify(compositeNavigation.data.results[0])
+      );
       assert.equal(compositeNavigation.data.results[0].result.mayNavigate, true);
       const compositeSettled = await extensionMessage(cdp, panelSessionId, {
         type: "WAIT_FOR_PAGE_SETTLE",
@@ -600,6 +667,7 @@ try {
         lang: "en",
         preference: "en",
         storedPreference: "en",
+        responseLanguage: "ko",
         settingsTitle: "Settings",
         generalTab: "General",
         composerPlaceholder: "What would you like to do?",
@@ -625,6 +693,8 @@ try {
       },
       korean: {
         lang: "ko",
+        responseLanguage: "en",
+        responseContract: "en",
         settingsTitle: "설정",
         systemMessage: "설정이 저장되었습니다.",
         builtInTemplateTitle: "페이지 요약",
@@ -633,6 +703,16 @@ try {
         timelineTitle: "작업 흐름",
         timelinePhase: "화면 관찰",
         timelineDetail: "3번째 턴 화면 관찰 중"
+      },
+      responseValidation: {
+        englishRejectedForKorean: true,
+        englishAcceptedForEnglish: true,
+        terminalEnglishRejectedForKorean: true,
+        terminalKoreanRejectedForEnglish: true,
+        sourceContentPreserved: true,
+        runtimeFallbackUsesEnglish: true,
+        verifierNarrativeLocalized: true,
+        policyNarrativeLocalized: true
       }
     });
     assert.deepEqual(panelContracts.markdown, {
@@ -835,6 +915,9 @@ try {
     assert.deepEqual(collectionLedgerContracts, {
       firstPageCollected: true,
       requestedColumnsOnly: true,
+      packedExtractAndPaginationAllowed: true,
+      runtimeRemainingCountBound: true,
+      wrongRecordLinkRejectedAsPagination: true,
       multipleTraversalBlocked: true,
       spaPaginationIsTransport: true,
       intermediatePageCannotBeSkipped: true,
@@ -850,6 +933,7 @@ try {
       exportArtifactRecorded: true,
       terminalAllowedAfterExport: true,
       runtimeTerminalMessageGrounded: true,
+      runtimeFinalizationCompleted: true,
       unrequestedFormatRejected: true,
       repeatedPageStalled: true,
       zeroNewPageStalled: true
@@ -883,6 +967,22 @@ try {
       disclosurePolicyAllowed: true,
       readOnlyPolicyAllowed: true,
       unresolvedClickNeedsPolicy: true
+    });
+
+    const routedFastPaths = await exerciseRoutedFastPathContracts({
+      cdp,
+      panelSessionId
+    });
+    assert.deepEqual(routedFastPaths, {
+      strategy: "direct",
+      requestPurposes: ["turn-routing"],
+      requestCount: 1,
+      targetQuery: "Save",
+      targetRoles: ["button"],
+      screenshotOmitted: true,
+      pageEvidenceOmitted: true,
+      compactInput: true,
+      runtimeNarrativeLocalized: true
     });
 
     const loopRuntimeContracts = await exerciseLoopRuntimeContracts({
@@ -1323,13 +1423,77 @@ try {
     assert.equal(structuredBatch.pageIdentity.domRevision, structuredCollectionContext.data.pageState.domRevision);
     assert.equal(structuredBatch.pageIdentity.sourceSliceDigest, structuredBatch.sourceSliceDigest);
 
+    const packedPaginationContext = await extensionMessage(cdp, panelSessionId, {
+      type: "COLLECT_PAGE_CONTEXT",
+      targetTabId: firstTabId,
+      options: {
+        maxTextChars: 4000,
+        maxElements: 80,
+        elementRoles: ["link", "pagination"],
+        redactSensitiveData: true
+      }
+    });
+    const packedStructuredTarget = packedPaginationContext.data.interactiveElements.find(
+      (element) => element.label === "A complete first record title"
+    );
+    const packedPaginationTarget = packedPaginationContext.data.interactiveElements.find(
+      (element) => element.label === "2"
+    );
+    assert.ok(packedStructuredTarget?.ref);
+    assert.ok(packedPaginationTarget?.ref);
+    const packedEarlyStopResult = await extensionMessage(cdp, panelSessionId, {
+      type: "EXECUTE_PAGE_ACTIONS",
+      targetTabId: firstTabId,
+      actions: [{
+        id: "extract-before-unneeded-pagination",
+        type: "extract",
+        ref: packedStructuredTarget.ref,
+        collectionId: "fixture-packed-stop",
+        collectionName: "Fixture packed stop",
+        targetCount: 4,
+        runtimeCollectionRemainingCount: 4,
+        reason: "collect the remaining records"
+      }, {
+        id: "unneeded-pagination-click",
+        type: "click",
+        ref: packedPaginationTarget.ref,
+        reason: "advance only when more records are still needed"
+      }],
+      executionBindings: [{
+        actionId: "extract-before-unneeded-pagination",
+        frameId: packedStructuredTarget.frameId || 0,
+        documentId: packedStructuredTarget.frameDocumentId || packedPaginationContext.data.documentId,
+        targetBinding: packedStructuredTarget.binding,
+        targetStateBinding: packedStructuredTarget.stateBinding,
+        conditionBindings: []
+      }, {
+        actionId: "unneeded-pagination-click",
+        frameId: packedPaginationTarget.frameId || 0,
+        documentId: packedPaginationTarget.frameDocumentId || packedPaginationContext.data.documentId,
+        targetBinding: packedPaginationTarget.binding,
+        targetStateBinding: packedPaginationTarget.stateBinding,
+        conditionBindings: []
+      }]
+    });
+    assert.equal(packedEarlyStopResult.data.results.length, 1);
+    assert.equal(packedEarlyStopResult.data.results[0].result.collection.returnedCount, 4);
+    const packedPaginationStatus = await evaluate(cdp, panelSessionId, `(async () => {
+      const [result] = await chrome.scripting.executeScript({
+        target: { tabId: ${JSON.stringify(firstTabId)} },
+        world: "MAIN",
+        func: () => document.getElementById("legacy-page-status").textContent
+      });
+      return result.result;
+    })()`);
+    assert.equal(packedPaginationStatus, "Legacy page 1 loaded");
+
     const repeatedStructuredCollectionResult = await extensionMessage(cdp, panelSessionId, {
       type: "EXECUTE_PAGE_ACTIONS",
       targetTabId: firstTabId,
       actions: [{
         id: "repeat-structured-records",
         type: "extract",
-        ref: structuredExemplar.ref,
+        ref: packedStructuredTarget.ref,
         collectionId: "fixture-records",
         collectionName: "Fixture records",
         targetCount: 40,
@@ -1337,10 +1501,10 @@ try {
       }],
       executionBindings: [{
         actionId: "repeat-structured-records",
-        frameId: structuredExemplar.frameId || 0,
-        documentId: structuredExemplar.frameDocumentId || structuredCollectionContext.data.documentId,
-        targetBinding: structuredExemplar.binding,
-        targetStateBinding: structuredExemplar.stateBinding,
+        frameId: packedStructuredTarget.frameId || 0,
+        documentId: packedStructuredTarget.frameDocumentId || packedPaginationContext.data.documentId,
+        targetBinding: packedStructuredTarget.binding,
+        targetStateBinding: packedStructuredTarget.stateBinding,
         conditionBindings: []
       }]
     });
@@ -1556,7 +1720,26 @@ try {
     });
     assert.equal(pointerResult.ok, true);
     assert.equal(pointerResult.data.results[0].ok, true);
-    assert.equal(pointerResult.data.results[0].result.inputSequence, "pointer-mouse-click");
+    assert.equal(pointerResult.data.results[0].result.inputSequence, "browser-native");
+    const trustedPointerInput = await evaluate(cdp, panelSessionId, `(async () => {
+      const [result] = await chrome.scripting.executeScript({
+        target: { tabId: ${JSON.stringify(firstTabId)} },
+        world: "MAIN",
+        func: () => {
+          const target = document.getElementById("pointer-action");
+          return {
+            pointerDown: target?.dataset.pointerTrusted === "true",
+            click: target?.dataset.clickTrusted === "true"
+          };
+        }
+      });
+      return result.result;
+    })()`);
+    assert.deepEqual(
+      trustedPointerInput,
+      { pointerDown: true, click: true },
+      "browser-native input must reach page handlers as trusted pointer and click events"
+    );
     const pointerContext = await extensionMessage(cdp, panelSessionId, {
       type: "COLLECT_PAGE_CONTEXT",
       targetTabId: firstTabId,
@@ -1747,8 +1930,8 @@ try {
       JSON.stringify(legacyImageMapResult.data.results[0])
     );
     assert.equal(
-      legacyImageMapResult.data.results[0].result.activation,
-      "page-owned-legacy-handler"
+      legacyImageMapResult.data.results[0].result.inputSequence,
+      "browser-native"
     );
     const legacyImageMapDomStatus = await evaluate(cdp, panelSessionId, `(async () => {
       const [result] = await chrome.scripting.executeScript({
@@ -3113,8 +3296,12 @@ async function startFixtureServer() {
           setTimeout(() => { document.querySelector('#async-status').textContent = 'Async complete'; }, 180);
         });
         const pointerAction = document.querySelector('#pointer-action');
-        pointerAction.addEventListener('pointerdown', () => { pointerAction.dataset.pointerArmed = 'true'; });
-        pointerAction.addEventListener('click', () => {
+        pointerAction.addEventListener('pointerdown', (event) => {
+          pointerAction.dataset.pointerArmed = 'true';
+          pointerAction.dataset.pointerTrusted = String(event.isTrusted);
+        });
+        pointerAction.addEventListener('click', (event) => {
+          pointerAction.dataset.clickTrusted = String(event.isTrusted);
           document.querySelector('#pointer-status').textContent = pointerAction.dataset.pointerArmed === 'true'
             ? 'Pointer sequence complete'
             : 'Pointer sequence missing';
@@ -3662,6 +3849,7 @@ async function exercisePanelContracts({ cdp, panelSessionId, tabId, context }) {
         renderTemplateSelect("custom-language-source");
         startRunTimeline("사용자 작업 원문");
         updateRunTimeline("observe", "active", "3번째 턴 화면 관찰 중");
+        elements.inputs.responseLanguage.value = "ko";
         elements.inputs.uiLanguage.value = "en";
         await saveSettingsFromForm({ quiet: true });
         appendChatMessage("system", "설정이 저장되었습니다.", { record: false });
@@ -3672,6 +3860,7 @@ async function exercisePanelContracts({ cdp, panelSessionId, tabId, context }) {
           lang: document.documentElement.lang,
           preference: state.settings.uiLanguage,
           storedPreference: (await chrome.storage.local.get("settings")).settings?.uiLanguage,
+          responseLanguage: state.settings.responseLanguage,
           settingsTitle: document.getElementById("settingsTitle").textContent,
           generalTab: document.getElementById("generalTab").textContent,
           composerPlaceholder: elements.chatInput.placeholder,
@@ -3697,10 +3886,13 @@ async function exercisePanelContracts({ cdp, panelSessionId, tabId, context }) {
         };
 
         elements.inputs.uiLanguage.value = "ko";
+        elements.inputs.responseLanguage.value = "en";
         await saveSettingsFromForm({ quiet: true });
         await new Promise((resolve) => setTimeout(resolve, 20));
         const koreanLocale = {
           lang: document.documentElement.lang,
+          responseLanguage: state.settings.responseLanguage,
+          responseContract: getResponseLanguageContract().code,
           settingsTitle: document.getElementById("settingsTitle").textContent,
           systemMessage: elements.messageList.querySelector(".message.system:last-child .message-text")?.textContent,
           builtInTemplateTitle: getTaskTemplates().find((item) => item.id === "summarize-page")?.title,
@@ -3710,7 +3902,111 @@ async function exercisePanelContracts({ cdp, panelSessionId, tabId, context }) {
           timelinePhase: state.agentRunUi.phaseElements.observe.name.textContent,
           timelineDetail: state.agentRunUi.phaseElements.observe.detail.textContent
         };
-        const locale = { english: englishLocale, korean: koreanLocale };
+        const languageDecision = {
+          status: "continue",
+          message: "The next action is ready.",
+          summary: "Navigate to the next result page.",
+          progress: "The current page was collected.",
+          doneReason: "",
+          plan: ["Collect and continue"],
+          elementSearch: { reason: "" },
+          toolCalls: [],
+          actions: [{ reason: "Use the verified pagination control." }],
+          verification: {
+            expectedChange: "The next result page appears.",
+            successCriteria: ["A new page of records is visible."]
+          }
+        };
+        const mismatchedVerifier = {
+          version: "1.0",
+          status: "verified",
+          message: "현재 근거로 완료를 확인했습니다.",
+          evidenceIds: [],
+          missingEvidence: [],
+          confidence: 0.9
+        };
+        enforceVerifierResponseLanguage(mismatchedVerifier);
+        const mismatchedPolicy = {
+          version: "1.0",
+          verdict: "approval",
+          message: "이 작업은 사용자 승인이 필요합니다.",
+          risks: [],
+          sensitiveData: [],
+          approvalReasons: ["외부 상태를 변경할 수 있습니다."]
+        };
+        enforcePolicyResponseLanguage(mismatchedPolicy);
+        const locale = {
+          english: englishLocale,
+          korean: koreanLocale,
+          responseValidation: {
+            englishRejectedForKorean: validateDecisionResponseLanguage(
+              languageDecision,
+              { responseLanguage: "ko" }
+            ).valid === false,
+            englishAcceptedForEnglish: validateDecisionResponseLanguage(
+              languageDecision,
+              { responseLanguage: "en" }
+            ).valid === true,
+            terminalEnglishRejectedForKorean: validateDecisionResponseLanguage(
+              {
+                ...languageDecision,
+                status: "completed",
+                message: "Successfully collected every requested record and generated the local workbook.",
+                summary: "수집과 파일 생성을 완료했습니다.",
+                progress: "",
+                doneReason: ""
+              },
+              { responseLanguage: "ko" }
+            ).valid === false,
+            terminalKoreanRejectedForEnglish: validateDecisionResponseLanguage(
+              {
+                ...languageDecision,
+                status: "completed",
+                message: "요청한 게시물 수집과 로컬 엑셀 파일 생성을 모두 완료했습니다.",
+                summary: "Collection and file generation completed.",
+                progress: "",
+                doneReason: ""
+              },
+              { responseLanguage: "en" }
+            ).valid === false,
+            sourceContentPreserved: validateDecisionResponseLanguage(
+              {
+                ...languageDecision,
+                status: "answer",
+                message: [
+                  "요청한 결과입니다.",
+                  "- First English Source Record With Its Original Title",
+                  "- Second English Source Record With Its Original Title",
+                  "- Third English Source Record With Its Original Title"
+                ].join("\\n"),
+                summary: "현재 화면의 원문 제목을 정리했습니다.",
+                progress: "",
+                doneReason: "",
+                plan: ["현재 화면의 원문 제목 정리"],
+                actions: [],
+                verification: {
+                  expectedChange: "",
+                  successCriteria: []
+                }
+              },
+              { responseLanguage: "ko" }
+            ).valid === true,
+            runtimeFallbackUsesEnglish: normalizeAiDecisionResponse(
+              "not valid structured output",
+              1
+            ).message === "The AI decision response format needs to be checked.",
+            verifierNarrativeLocalized: (
+              /[A-Za-z]/.test(mismatchedVerifier.message)
+              && !/[가-힣]/.test(mismatchedVerifier.message)
+            ),
+            policyNarrativeLocalized: (
+              /[A-Za-z]/.test(mismatchedPolicy.message)
+              && mismatchedPolicy.approvalReasons.every((reason) => (
+                /[A-Za-z]/.test(reason) && !/[가-힣]/.test(reason)
+              ))
+            )
+          }
+        };
 
         appendChatMessage("user", "**사용자 원문은 그대로**", { record: false });
         const plainUserMessage = elements.messageList.querySelector(".message.user:last-child .message-text");
@@ -4856,22 +5152,48 @@ async function exerciseTurnBoundaryContracts({ cdp, panelSessionId, tabId, conte
         }
         return {
           text: JSON.stringify({
-            version: "1.0",
-            mode: "continue_prior",
-            objective: "이전의 잘못된 요청양식 드롭다운 대신 요청 유형 필드 옆 돋보기 버튼을 사용해 요청 유형을 선택한다.",
-            contextSummary: "직전 실행은 요청양식 드롭다운을 반복했고, 최신 교정은 요청 유형 필드의 돋보기 버튼을 새 대상으로 지정한다.",
-            repeatPolicy: "once",
-            repeatLimit: 1,
-            deliverable: {
-              kind: "effect",
-              itemDescription: "",
-              targetCount: null,
-              fields: [],
-              includeCriteria: [],
-              formats: []
+            turnIntent: {
+              version: "1.0",
+              mode: "continue_prior",
+              objective: "이전의 잘못된 요청양식 드롭다운 대신 요청 유형 필드 옆 돋보기 버튼을 사용해 요청 유형을 선택한다.",
+              contextSummary: "직전 실행은 요청양식 드롭다운을 반복했고, 최신 교정은 요청 유형 필드의 돋보기 버튼을 새 대상으로 지정한다.",
+              repeatPolicy: "once",
+              repeatLimit: 1,
+              deliverable: {
+                kind: "effect",
+                itemDescription: "",
+                targetCount: null,
+                fields: [],
+                includeCriteria: [],
+                formats: []
+              },
+              completionCriteria: ["요청 유형 필드에 선택 결과가 표시된다."],
+              reason: "최신 메시지는 직전 실패의 대상을 교정하는 문맥 의존 지시다."
             },
-            completionCriteria: ["요청 유형 필드에 선택 결과가 표시된다."],
-            reason: "최신 메시지는 직전 실패의 대상을 교정하는 문맥 의존 지시다."
+            route: {
+              version: "1.0",
+              strategy: "direct",
+              actions: [{
+                type: "click",
+                target: {
+                  query: "돋보기",
+                  roles: ["button"],
+                  nearText: "요청 유형",
+                  reason: "최신 교정에서 지정한 필드 옆 컨트롤을 찾는다."
+                },
+                value: null,
+                checked: null,
+                key: null,
+                code: null,
+                direction: null,
+                amount: null,
+                url: null,
+                reason: "요청 유형 선택기를 연다."
+              }],
+              evidenceSearch: { query: "", roles: [], nearText: "", reason: "" },
+              confidence: 0.95,
+              reason: "교정된 대상이 구체적인 단일 DOM 조작이다."
+            }
           })
         };
       };
@@ -4914,22 +5236,48 @@ async function exerciseTurnBoundaryContracts({ cdp, panelSessionId, tabId, conte
         intentRequest = request;
         return {
           text: JSON.stringify({
-            version: "1.0",
-            mode: "standalone",
-            objective: "이전 요청까지 합쳐 다음 페이지 이동을 계속 반복한다.",
-            contextSummary: "",
-            repeatPolicy: "once",
-            repeatLimit: 1,
-            deliverable: {
-              kind: "effect",
-              itemDescription: "",
-              targetCount: null,
-              fields: [],
-              includeCriteria: [],
-              formats: []
+            turnIntent: {
+              version: "1.0",
+              mode: "standalone",
+              objective: "이전 요청까지 합쳐 다음 페이지 이동을 계속 반복한다.",
+              contextSummary: "",
+              repeatPolicy: "once",
+              repeatLimit: 1,
+              deliverable: {
+                kind: "effect",
+                itemDescription: "",
+                targetCount: null,
+                fields: [],
+                includeCriteria: [],
+                formats: []
+              },
+              completionCriteria: ["요청 시작 시점보다 한 페이지 앞으로 이동한 현재 화면이 관찰된다."],
+              reason: "최신 메시지는 자체로 완결된 새 명령이며 한 번이라는 범위를 명시한다."
             },
-            completionCriteria: ["요청 시작 시점보다 한 페이지 앞으로 이동한 현재 화면이 관찰된다."],
-            reason: "최신 메시지는 자체로 완결된 새 명령이며 한 번이라는 범위를 명시한다."
+            route: {
+              version: "1.0",
+              strategy: "direct",
+              actions: [{
+                type: "click",
+                target: {
+                  query: "next page",
+                  roles: ["pagination"],
+                  nearText: "",
+                  reason: "현재 페이지의 다음 이동 컨트롤을 찾는다."
+                },
+                value: null,
+                checked: null,
+                key: null,
+                code: null,
+                direction: null,
+                amount: null,
+                url: null,
+                reason: "한 페이지 앞으로 이동한다."
+              }],
+              evidenceSearch: { query: "", roles: [], nearText: "", reason: "" },
+              confidence: 0.95,
+              reason: "완결된 단일 DOM 조작이다."
+            }
           })
         };
       };
@@ -5437,6 +5785,9 @@ async function exerciseCollectionLedgerContracts({ cdp, panelSessionId, tabId, c
       agentRunUi: state.agentRunUi,
       datasets: structuredClone(state.datasets),
       evaluationLogs: structuredClone(state.evaluationLogs),
+      conversation: structuredClone(state.conversation),
+      currentPlan: state.currentPlan,
+      runtimeSettings: structuredClone(state.runtimeSettings),
       downloadBlobFile
     };
     const makeRows = (start) => Array.from({ length: 20 }, (_, index) => ({
@@ -5517,6 +5868,9 @@ async function exerciseCollectionLedgerContracts({ cdp, panelSessionId, tabId, c
           type: "button",
           label: "Next page",
           selector: "#next-page",
+          navigationKind: "pagination",
+          navigationRel: "next",
+          navigationOrdinal: 2,
           disabled: false,
           actionability: "interactive"
         }]
@@ -5540,6 +5894,43 @@ async function exerciseCollectionLedgerContracts({ cdp, panelSessionId, tabId, c
       const requestedColumnsOnly = session.datasets[0]?.columnsExplicit === true
         && session.datasets[0]?.columns.length === 1
         && session.datasets[0]?.columns[0]?.key === "title";
+      const packedDecision = {
+        ...makeExtractDecision(2),
+        actions: [
+          makeExtractDecision(2).actions[0],
+          { id: "packed-page-2", type: "click", ref: "next-page", reason: "advance once" }
+        ]
+      };
+      const packedExtractAndPaginationAllowed = validateCollectionBoundary(
+        makeSession(),
+        packedDecision,
+        state.lastContext
+      ).valid === true;
+      attachRuntimeCollectionExecutionBounds(packedDecision);
+      const runtimeRemainingCountBound = packedDecision.actions[0].runtimeCollectionRemainingCount === 40;
+      const wrongLinkContext = {
+        ...structuredClone(state.lastContext),
+        interactiveElements: [{
+          ref: "record-detail",
+          tag: "a",
+          role: "link",
+          label: "A board post",
+          href: "https://example.test/post/21",
+          selector: "#record-detail",
+          disabled: false,
+          actionability: "interactive"
+        }]
+      };
+      const wrongRecordLinkRejectedAsPagination = validateCollectionBoundary(
+        session,
+        {
+          step: 2,
+          status: "continue",
+          toolCalls: [],
+          actions: [{ id: "wrong-page-2", type: "click", ref: "record-detail", reason: "advance" }]
+        },
+        wrongLinkContext
+      ).valid === false;
 
       const multipleTraversalDecision = {
         step: 2,
@@ -5798,6 +6189,36 @@ async function exerciseCollectionLedgerContracts({ cdp, panelSessionId, tabId, c
         unrequestedFormatRejected = true;
       }
 
+      const runtimeFinalSession = makeSession(["xlsx"]);
+      const runtimeFinalPageOne = {
+        ok: true,
+        action: pageOneDecision.actions[0],
+        result: { collection: makeBatch(1, 1) },
+        verification: {}
+      };
+      ingestStructuredCollectionResults(runtimeFinalSession, pageOneDecision, [runtimeFinalPageOne]);
+      runtimeFinalSession.collectionAwaitingExtraction = true;
+      const runtimeFinalPageTwo = {
+        ok: true,
+        action: pageTwoDecision.actions[0],
+        result: { collection: makeBatch(2, 21) },
+        verification: {}
+      };
+      ingestStructuredCollectionResults(runtimeFinalSession, pageTwoDecision, [runtimeFinalPageTwo]);
+      state.agentSession = runtimeFinalSession;
+      state.runtimeSettings = { ...state.runtimeSettings, responseLanguage: "ko" };
+      const runtimeFinalizedWithoutPlanner = finalizeReachedCollectionFromRuntime(runtimeFinalSession);
+      const runtimeFinalDecision = runtimeFinalSession.history
+        .filter((entry) => entry.kind === "decision")
+        .at(-1);
+      const runtimeFinalizationCompleted = runtimeFinalizedWithoutPlanner === true
+        && runtimeFinalSession.status === "completed"
+        && runtimeFinalSession.stopRequested === true
+        && runtimeFinalSession.collectionExports.length === 1
+        && runtimeFinalDecision?.source === "runtime-collection-finalization"
+        && runtimeFinalDecision?.message.includes("40개")
+        && runtimeFinalDecision?.message.includes(".xlsx");
+
       const repeatedSession = makeSession();
       const repeatedFirst = {
         ok: true,
@@ -5849,6 +6270,9 @@ async function exerciseCollectionLedgerContracts({ cdp, panelSessionId, tabId, c
       return {
         firstPageCollected,
         requestedColumnsOnly,
+        packedExtractAndPaginationAllowed,
+        runtimeRemainingCountBound,
+        wrongRecordLinkRejectedAsPagination,
         multipleTraversalBlocked,
         spaPaginationIsTransport,
         intermediatePageCannotBeSkipped,
@@ -5864,6 +6288,7 @@ async function exerciseCollectionLedgerContracts({ cdp, panelSessionId, tabId, c
         exportArtifactRecorded,
         terminalAllowedAfterExport,
         runtimeTerminalMessageGrounded,
+        runtimeFinalizationCompleted,
         unrequestedFormatRejected,
         repeatedPageStalled,
         zeroNewPageStalled
@@ -5874,7 +6299,17 @@ async function exerciseCollectionLedgerContracts({ cdp, panelSessionId, tabId, c
       state.agentSession = original.agentSession;
       state.datasets = original.datasets;
       state.evaluationLogs = original.evaluationLogs;
+      state.conversation = original.conversation;
+      state.currentPlan = original.currentPlan;
+      state.runtimeSettings = original.runtimeSettings;
       downloadBlobFile = original.downloadBlobFile;
+      clearRenderedChatMessages();
+      for (const message of state.conversation) {
+        appendChatMessage(message.role, message.text, {
+          tone: message.tone || "",
+          record: false
+        });
+      }
       clearRunTimeline();
       state.agentRunUi = original.agentRunUi;
       updateAgentButtons();
@@ -6187,6 +6622,116 @@ async function exerciseLatencyFastPathContracts({ cdp, panelSessionId, context }
           buildDeterministicLowRiskPolicy(unresolvedClickDecision, domContext) === null
       };
     } finally {
+      state.runtimeSettings = originalRuntimeSettings;
+    }
+  })()`);
+}
+
+async function exerciseRoutedFastPathContracts({ cdp, panelSessionId }) {
+  return evaluate(cdp, panelSessionId, `(async () => {
+    const originalRequestAiDecision = requestAiDecision;
+    const originalRuntimeSettings = structuredClone(state.runtimeSettings);
+    const requests = [];
+    try {
+      requestAiDecision = async (_session, request) => {
+        requests.push({
+          purpose: request.purpose,
+          user: request.user,
+          screenshotDataUrl: request.screenshotDataUrl
+        });
+        return {
+          text: JSON.stringify({
+            turnIntent: {
+              version: "1.0",
+              mode: "standalone",
+              objective: "Click the Save button.",
+              contextSummary: "",
+              repeatPolicy: "once",
+              repeatLimit: 1,
+              deliverable: {
+                kind: "effect",
+                itemDescription: "",
+                targetCount: null,
+                fields: [],
+                includeCriteria: [],
+                formats: []
+              },
+              completionCriteria: [
+                "The uniquely matched Save button receives one verified click."
+              ],
+              reason: "The latest request is one concrete browser effect."
+            },
+            route: {
+              version: "1.0",
+              strategy: "direct",
+              actions: [{
+                type: "click",
+                target: {
+                  query: "Save",
+                  roles: ["button"],
+                  nearText: "",
+                  reason: "Resolve the user-named control from rendered DOM semantics."
+                },
+                value: null,
+                checked: null,
+                key: null,
+                code: null,
+                direction: null,
+                amount: null,
+                url: null,
+                reason: "Activate the requested control exactly once."
+              }],
+              evidenceSearch: {
+                query: "",
+                roles: [],
+                nearText: "",
+                reason: ""
+              },
+              confidence: 0.98,
+              reason: "One concrete DOM action can be resolved locally."
+            }
+          }),
+          audit: {}
+        };
+      };
+      const session = {
+        latestUserMessage: "Click the Save button.",
+        priorRunContext: null,
+        workflowStepContract: null
+      };
+      const route = await resolveAgentTurnRoute(session);
+      const request = requests[0] || {};
+      state.runtimeSettings = {
+        ...state.runtimeSettings,
+        responseLanguage: "ko"
+      };
+      const localizedAction = buildExecutableRouteAction(route.actions[0], {
+        ref: "save-button",
+        label: "저장"
+      });
+      const localizedExpectedChange = describeDirectExpectedChange(
+        localizedAction,
+        { label: "저장" }
+      );
+      return {
+        strategy: route.strategy,
+        requestPurposes: requests.map((entry) => entry.purpose),
+        requestCount: requests.length,
+        targetQuery: route.actions[0]?.target?.query || "",
+        targetRoles: route.actions[0]?.target?.roles || [],
+        screenshotOmitted: request.screenshotDataUrl === "",
+        pageEvidenceOmitted: !/visibleText|interactiveElements|focusedTextMatches|screenshotDataUrl/.test(
+          request.user || ""
+        ),
+        compactInput: String(request.user || "").length < 12_000,
+        runtimeNarrativeLocalized: (
+          /[가-힣]/.test(localizedAction.reason)
+          && /[가-힣]/.test(localizedExpectedChange)
+          && !localizedAction.reason.includes(route.actions[0].reason)
+        )
+      };
+    } finally {
+      requestAiDecision = originalRequestAiDecision;
       state.runtimeSettings = originalRuntimeSettings;
     }
   })()`);
@@ -7719,7 +8264,7 @@ async function captureAgentPanelDocs(cdp, panelSessionId) {
     }
     startRunTimeline("Summarize the current-page checks in a table.");
     updateRunTimeline("observe", "done", "Visible page content collected");
-    updateRunTimeline("think", "done", "Scope and plan resolved in one request");
+    updateRunTimeline("think", "done", "Focused answer route selected");
     updateRunTimeline("tools", "skipped", "No tool execution");
     updateRunTimeline("actions", "skipped", "No page actions");
     updateRunTimeline("verify", "done", "Current-page evidence verified");
@@ -7782,6 +8327,7 @@ async function captureSettingsOverviewDocs(cdp, panelSessionId) {
     state.settings = {
       ...state.settings,
       uiLanguage: "ko",
+      responseLanguage: "en",
       panelOpenMode: "side-panel",
       apiProfile: "custom-json",
       model: "local-instruct-model",
@@ -7804,6 +8350,7 @@ async function captureSettingsOverviewDocs(cdp, panelSessionId) {
   })()`);
   try {
     await capturePanelScreenshot(cdp, panelSessionId, "settings-overview.png");
+    await capturePanelScreenshot(cdp, panelSessionId, "language-settings-en.png");
   } finally {
     await evaluate(cdp, panelSessionId, `(() => {
       const snapshot = globalThis.__settingsCaptureSnapshot;

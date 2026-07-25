@@ -82,6 +82,8 @@
     "브라우저 언어": "Browser language",
     "한국어": "Korean",
     "브라우저 언어를 따르거나 한국어와 영어를 직접 선택합니다. 변경 즉시 적용됩니다.": "Follow the browser language or choose Korean or English. Changes apply immediately.",
+    "AI 응답 언어": "AI response language",
+    "화면 표시 언어와 별개로 AI의 설명, 진행 문구와 최종 답변 언어를 고정합니다.": "Fix the language of AI explanations, progress messages, and final answers independently of the interface language.",
     "사이드 패널 위치 확인 중": "Checking side panel position",
     "좌우 위치는 확장 프로그램이 아니라 브라우저의 모양 설정을 따릅니다.": "The browser appearance setting controls whether the side panel is on the left or right.",
     "현재 구성": "Current configuration",

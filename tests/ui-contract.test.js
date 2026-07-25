@@ -103,6 +103,27 @@ test("display language is a persisted immediate setting", () => {
   assert.match(script, /localizeUiText\(`승인 사유:/);
 });
 
+test("AI response language is persisted separately from the interface language", () => {
+  const html = fs.readFileSync(path.join(root, "panel.html"), "utf8");
+  const script = fs.readFileSync(path.join(root, "panel.js"), "utf8");
+  const select = readOpeningTag(html, "select", "responseLanguageInput");
+
+  assert.ok(select);
+  assert.match(html, /id="responseLanguageInput"[\s\S]*value="ko"[\s\S]*value="en"/);
+  assert.doesNotMatch(
+    html.match(/<select\b[^>]*id="responseLanguageInput"[^>]*>[\s\S]*?<\/select>/i)?.[0] || "",
+    /value="auto"/
+  );
+  assert.match(script, /responseLanguage:\s*"ko"/);
+  assert.match(script, /responseLanguage:\s*normalizeResponseLanguage\(elements\.inputs\.responseLanguage\.value\)/);
+  assert.match(script, /Response language is an immutable runtime setting/);
+  assert.match(script, /validateDecisionResponseLanguage\(decision\)/);
+  assert.match(script, /enforcePolicyResponseLanguage\(policy\)/);
+  assert.match(script, /enforceVerifierResponseLanguage\(verifier\)/);
+  assert.match(script, /answerLanguageValidation/);
+  assert.match(script, /model-authored user-visible narrative must use/i);
+});
+
 test("the design does not use a left accent bar", () => {
   const css = fs.readFileSync(path.join(root, "styles.css"), "utf8");
   assert.doesNotMatch(css, /border-left\s*:/i);
@@ -267,6 +288,52 @@ test("normal DOM turns use latency fast paths without weakening state-changing p
   assert.match(content, /before\?\.fingerprint !== after\.fingerprint/);
   assert.doesNotMatch(content, /delay\(normalized\.type === "wait" \? 50 : 220\)/);
   assert.doesNotMatch(content, /await delay\(120\)/);
+});
+
+test("compact routing bypasses the general planner for deterministic DOM work", () => {
+  const panel = fs.readFileSync(path.join(root, "panel.js"), "utf8");
+  const core = fs.readFileSync(path.join(root, "agent-core.js"), "utf8");
+  const instructionStart = panel.indexOf("async function executeAgentInstruction");
+  const instructionEnd = panel.indexOf("function prefetchInitialDecisionContext", instructionStart);
+  const instructionFunction = panel.slice(instructionStart, instructionEnd);
+  const routedStart = panel.indexOf("async function runRoutedAgentSession");
+  const routedEnd = panel.indexOf("async function runChatAgentLoop", routedStart);
+  const routedFunctions = panel.slice(routedStart, routedEnd);
+
+  assert.match(instructionFunction, /resolveAgentTurnRoute/);
+  assert.match(instructionFunction, /runRoutedAgentSession/);
+  assert.doesNotMatch(instructionFunction, /prefetchInitialDecisionContext/);
+  assert.match(routedFunctions, /route\?\.strategy === "direct"/);
+  assert.match(routedFunctions, /targetSearchScope:\s*"rendered-document"/);
+  assert.match(routedFunctions, /chooseUniqueRouteCandidate/);
+  assert.match(routedFunctions, /TARGET_SELECTION_SCHEMA/);
+  assert.match(routedFunctions, /FAST_ANSWER_SCHEMA/);
+  assert.match(routedFunctions, /runDirectCollectionRoute/);
+  assert.match(routedFunctions, /describeDirectActionReason/);
+  assert.match(routedFunctions, /validateDecisionResponseLanguage/);
+  assert.doesNotMatch(routedFunctions, /summary:\s*options\.routeAction\.reason/);
+  assert.match(routedFunctions, /requestExecutionPolicy\(session,\s*decision,\s*resolved\.context\)/);
+  assert.match(core, /ROUTED_TURN_SCHEMA/);
+  assert.match(core, /FAST_ANSWER_SCHEMA/);
+});
+
+test("page input uses browser-native dispatch with target-bound verification and fallback", () => {
+  const manifest = JSON.parse(fs.readFileSync(path.join(root, "manifest.json"), "utf8"));
+  const background = fs.readFileSync(path.join(root, "background.js"), "utf8");
+  const content = fs.readFileSync(path.join(root, "content.js"), "utf8");
+
+  assert.ok(manifest.permissions.includes("debugger"));
+  assert.match(background, /Input\.dispatchMouseEvent/);
+  assert.match(background, /Input\.dispatchKeyEvent/);
+  assert.match(background, /Input\.insertText/);
+  assert.match(background, /executeNativePageAction/);
+  assert.match(background, /browser_native_input_unavailable/);
+  assert.match(content, /case "PREPARE_NATIVE_ACTION"/);
+  assert.match(content, /case "VERIFY_NATIVE_ACTION"/);
+  assert.match(content, /nativeActionPreparations:\s*new Map/);
+  assert.match(content, /inputSequence:\s*"browser-native"/);
+  assert.match(content, /focusedTextMatches/);
+  assert.match(content, /rendered-document-target-search/);
 });
 
 test("template tool is a closed popover above a single-row composer", () => {

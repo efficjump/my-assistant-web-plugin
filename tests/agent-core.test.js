@@ -650,3 +650,101 @@ test("context fingerprints are stable across object key order", () => {
   });
   assert.equal(left, right);
 });
+
+test("routes concrete DOM work through a semantic direct-action contract", () => {
+  const validation = Core.validateExecutionRoute({
+    version: "1.0",
+    strategy: "direct",
+    actions: [{
+      type: "click",
+      target: {
+        query: "Save",
+        roles: ["button"],
+        nearText: "Profile",
+        reason: "Resolve the requested control locally."
+      },
+      value: null,
+      checked: null,
+      key: null,
+      code: null,
+      direction: null,
+      amount: null,
+      url: null,
+      reason: "Activate the requested control."
+    }],
+    evidenceSearch: { query: "", roles: [], nearText: "", reason: "" },
+    confidence: 0.96,
+    reason: "One concrete DOM action can be resolved locally."
+  }, { deliverableKind: "effect" });
+
+  assert.equal(validation.valid, true);
+  assert.equal(validation.route.strategy, "direct");
+  assert.equal(validation.route.actions[0].target.query, "Save");
+  assert.equal(validation.route.actions[0].target.roles[0], "button");
+});
+
+test("collection routing binds one semantic exemplar and rejects generic agent actions", () => {
+  const valid = Core.validateExecutionRoute({
+    version: "1.0",
+    strategy: "collection",
+    actions: [{
+      type: "extract",
+      target: {
+        query: "post title",
+        roles: ["link"],
+        nearText: "Free board",
+        reason: "Find one representative rendered record."
+      },
+      value: null,
+      checked: null,
+      key: null,
+      code: null,
+      direction: null,
+      amount: null,
+      url: null,
+      reason: "Expand the repeated rendered record structure."
+    }],
+    evidenceSearch: {
+      query: "post title",
+      roles: ["link"],
+      nearText: "Free board",
+      reason: "Limit collection discovery to the requested records."
+    },
+    confidence: 0.9,
+    reason: "The user requested a bounded rendered collection."
+  }, { deliverableKind: "collection" });
+  assert.equal(valid.valid, true);
+
+  const invalid = Core.validateExecutionRoute({
+    ...valid.route,
+    strategy: "agent",
+    actions: valid.route.actions
+  }, { deliverableKind: "collection" });
+  assert.equal(invalid.valid, false);
+  assert.match(invalid.errors.join(" "), /cannot pre-authorize/i);
+});
+
+test("compact answer and candidate-selection contracts stay strict", () => {
+  const answer = Core.validateJsonAgainstSchema({
+    status: "answer",
+    message: "The focused runtime evidence supports this answer.",
+    confidence: 0.92,
+    reason: "One focused rendered-text match contains the requested fact."
+  }, Core.FAST_ANSWER_SCHEMA);
+  assert.deepEqual(answer, []);
+
+  const missingMessage = Core.validateJsonAgainstSchema({
+    status: "answer",
+    confidence: 0.92,
+    reason: "The response omitted its user-facing result."
+  }, Core.FAST_ANSWER_SCHEMA);
+  assert.ok(missingMessage.length > 0);
+
+  const selection = Core.validateJsonAgainstSchema({
+    status: "selected",
+    candidateIndex: 2,
+    confidence: 0.88,
+    reason: "Only the third candidate matches both the label and nearby context."
+  }, Core.TARGET_SELECTION_SCHEMA);
+  assert.deepEqual(selection, []);
+});

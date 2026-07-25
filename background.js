@@ -12,6 +12,8 @@ const PANEL_PATH = "panel.html";
 const PANEL_OPEN_MODE_SIDE_PANEL = "side-panel";
 const PANEL_OPEN_MODE_TAB = "tab";
 const DEFAULT_MCP_PROTOCOL_VERSION = "2025-11-25";
+const DEBUGGER_PROTOCOL_VERSION = "1.3";
+const NATIVE_INPUT_ACTION_TYPES = new Set(["click", "visual_click", "fill", "hover", "press"]);
 const BRIDGE_CREDENTIAL_STORAGE_KEY = "bridgeCredentialsV1";
 const SETTINGS_SECRET_STORAGE_KEY = "settingsSecrets";
 const mcpSessions = new Map();
@@ -241,6 +243,9 @@ async function collectPageContextFromFrames(targetTabId, options = {}) {
           elementQuery: elementSearch.query,
           elementRoles: elementSearch.roles,
           elementNearText: elementSearch.nearText,
+          targetSearchScope: options.targetSearchScope === "rendered-document"
+            ? "rendered-document"
+            : "visual-viewport",
           redactSensitiveData: options.redactSensitiveData,
           includeChildFrames: frameRecords.length === 1
         }
@@ -317,12 +322,20 @@ async function executePageActionsInFrames(targetTabId, actions, executionBinding
     }
     const navigationBefore = await readActionFrameNavigationStamp(tab.id, routed.frameId);
     let response;
+    let nativeInputFallback = "";
     try {
-      response = await sendTabMessage(tab.id, {
-        type: "EXECUTE_PAGE_ACTIONS",
-        actions: [routed.action],
-        executionBindings: routed.executionBinding ? [routed.executionBinding] : []
-      }, { frameId: routed.frameId });
+      const nativeOutcome = NATIVE_INPUT_ACTION_TYPES.has(String(routed.action?.type || ""))
+        ? await executeNativePageAction(tab.id, routed, navigationBefore)
+        : null;
+      response = nativeOutcome?.response || null;
+      nativeInputFallback = nativeOutcome?.fallbackReason || "";
+      if (!response) {
+        response = await sendTabMessage(tab.id, {
+          type: "EXECUTE_PAGE_ACTIONS",
+          actions: [routed.action],
+          executionBindings: routed.executionBinding ? [routed.executionBinding] : []
+        }, { frameId: routed.frameId });
+      }
     } catch (error) {
       const recovered = await recoverNavigationInterruptedAction(
         tab.id,
@@ -341,6 +354,15 @@ async function executePageActionsInFrames(targetTabId, actions, executionBinding
       action: routed.action,
       error: "The target frame returned no action result."
     };
+    if (nativeInputFallback) {
+      result = {
+        ...result,
+        nativeInputFallback: {
+          code: "browser_native_input_unavailable",
+          reason: nativeInputFallback
+        }
+      };
+    }
     if (result.ok && result.result?.mainWorldActivation) {
       result = await completeMainWorldAnchorActivation(tab.id, routed.frameId, routed.action, result);
     }
@@ -349,11 +371,457 @@ async function executePageActionsInFrames(targetTabId, actions, executionBinding
       originalAction: action,
       index
     }));
+    const runtimeCollectionRemainingCount = Number(action?.runtimeCollectionRemainingCount);
+    if (
+      result.ok
+      && action?.type === "extract"
+      && Number.isInteger(runtimeCollectionRemainingCount)
+      && runtimeCollectionRemainingCount > 0
+      && Number(result.result?.collection?.returnedCount) >= runtimeCollectionRemainingCount
+    ) {
+      break;
+    }
     if (!result.ok || result.result?.mayNavigate || ["navigate", "submit"].includes(action?.type)) {
       break;
     }
   }
   return { results };
+}
+
+async function executeNativePageAction(tabId, routed, navigationBefore) {
+  let prepared;
+  try {
+    prepared = await sendTabMessage(tabId, {
+      type: "PREPARE_NATIVE_ACTION",
+      action: routed.action,
+      executionBinding: routed.executionBinding
+    }, { frameId: routed.frameId });
+  } catch (error) {
+    if (["native_action_unsupported", "native_fill_unsupported"].includes(String(error?.code || ""))) {
+      return {
+        response: null,
+        fallbackReason: compactNativeInputFailure(error)
+      };
+    }
+    return {
+      response: {
+        results: [createNativeActionFailureResult(routed.action, error)]
+      },
+      fallbackReason: ""
+    };
+  }
+
+  let point;
+  try {
+    point = prepared?.point
+      ? await resolveTopViewportNativePoint(tabId, routed.frameId, prepared.point)
+      : null;
+  } catch (error) {
+    await cancelPreparedNativeAction(tabId, routed.frameId, prepared?.preparationId);
+    return {
+      response: null,
+      fallbackReason: compactNativeInputFailure(error)
+    };
+  }
+
+  const debuggerTarget = { tabId };
+  let attached = false;
+  let inputStarted = false;
+  try {
+    const inputPlan = prepared?.nativeInput || {};
+    if (!(inputPlan.kind === "toggle" && inputPlan.alreadyMatched)) {
+      await attachChromeDebugger(debuggerTarget);
+      attached = true;
+      inputStarted = true;
+      await dispatchNativeInput(debuggerTarget, inputPlan, point);
+    }
+  } catch (error) {
+    if (attached) {
+      await detachChromeDebugger(debuggerTarget);
+      attached = false;
+    }
+    if (!inputStarted) {
+      await cancelPreparedNativeAction(tabId, routed.frameId, prepared?.preparationId);
+      return {
+        response: null,
+        fallbackReason: compactNativeInputFailure(error)
+      };
+    }
+    const recovered = await recoverNavigationInterruptedAction(
+      tabId,
+      routed.frameId,
+      routed.action,
+      navigationBefore,
+      error
+    );
+    if (recovered) {
+      recovered.result = {
+        ...(recovered.result || {}),
+        inputSequence: "browser-native",
+        inputMethod: "debugger-protocol"
+      };
+      return { response: { results: [recovered] }, fallbackReason: "" };
+    }
+    await cancelPreparedNativeAction(tabId, routed.frameId, prepared?.preparationId);
+    return {
+      response: {
+        results: [createNativeActionFailureResult(routed.action, error)]
+      },
+      fallbackReason: ""
+    };
+  } finally {
+    if (attached) {
+      await detachChromeDebugger(debuggerTarget);
+    }
+  }
+
+  try {
+    const verified = await sendTabMessage(tabId, {
+      type: "VERIFY_NATIVE_ACTION",
+      preparationId: prepared?.preparationId,
+      inputResult: {
+        inputMethod: "debugger-protocol"
+      }
+    }, { frameId: routed.frameId });
+    return {
+      response: { results: [verified] },
+      fallbackReason: ""
+    };
+  } catch (error) {
+    const recovered = await recoverNavigationInterruptedAction(
+      tabId,
+      routed.frameId,
+      routed.action,
+      navigationBefore,
+      error
+    );
+    if (recovered) {
+      recovered.result = {
+        ...(recovered.result || {}),
+        inputSequence: "browser-native",
+        inputMethod: "debugger-protocol"
+      };
+      return { response: { results: [recovered] }, fallbackReason: "" };
+    }
+    return {
+      response: {
+        results: [createNativeActionFailureResult(routed.action, error)]
+      },
+      fallbackReason: ""
+    };
+  }
+}
+
+async function resolveTopViewportNativePoint(tabId, frameId, point) {
+  const localPoint = {
+    x: Number(point?.x),
+    y: Number(point?.y)
+  };
+  if (!Number.isFinite(localPoint.x) || !Number.isFinite(localPoint.y)) {
+    throw createNativeInputError("native_point_invalid", "The prepared browser input point is invalid.");
+  }
+  if (Number(frameId) === 0) {
+    return localPoint;
+  }
+  const geometry = await collectFrameViewportGeometry(tabId);
+  const transform = geometry.get(Number(frameId));
+  if (!transform) {
+    throw createNativeInputError(
+      "native_frame_geometry_unavailable",
+      "The target frame could not be mapped into the top viewport."
+    );
+  }
+  return transformFramePoint(localPoint, transform);
+}
+
+async function collectFrameViewportGeometry(tabId) {
+  const tab = await getTargetTab(tabId);
+  const frames = await getFrameRecords(tab.id, tab.url || "");
+  const attempts = await Promise.all(frames.map(async (frame) => {
+    try {
+      await ensureContentScript(tab.id, frame.frameId);
+      const context = await sendTabMessage(tab.id, {
+        type: "COLLECT_FRAME_CONTEXT",
+        options: { redactSensitiveData: true }
+      }, { frameId: frame.frameId });
+      return { frame, context, error: null };
+    } catch (error) {
+      return { frame, context: null, error };
+    }
+  }));
+  const contextByFrameId = new Map(
+    attempts
+      .filter((attempt) => attempt.context)
+      .map((attempt) => [attempt.frame.frameId, attempt.context])
+  );
+  if (!contextByFrameId.has(0)) {
+    throw createNativeInputError(
+      "native_frame_geometry_unavailable",
+      "The top frame could not be inspected before native input."
+    );
+  }
+  const { visibleFrameIds, frameBindings } = resolveVisuallyVerifiedFrames(
+    attempts,
+    contextByFrameId
+  );
+  return buildFrameGeometry(visibleFrameIds, frameBindings, contextByFrameId, attempts);
+}
+
+async function dispatchNativeInput(debuggerTarget, inputPlan, point) {
+  const kind = String(inputPlan?.kind || "");
+  if (["click", "toggle"].includes(kind)) {
+    assertNativeInputPoint(point);
+    await dispatchNativeMouseClick(debuggerTarget, point);
+    return;
+  }
+  if (kind === "hover") {
+    assertNativeInputPoint(point);
+    await sendChromeDebuggerCommand(debuggerTarget, "Input.dispatchMouseEvent", {
+      type: "mouseMoved",
+      x: point.x,
+      y: point.y,
+      button: "none",
+      buttons: 0,
+      pointerType: "mouse"
+    });
+    return;
+  }
+  if (kind === "text") {
+    assertNativeInputPoint(point);
+    await dispatchNativeMouseClick(debuggerTarget, point);
+    await dispatchNativeSelectAll(debuggerTarget);
+    await sendChromeDebuggerCommand(debuggerTarget, "Input.insertText", {
+      text: String(inputPlan.value ?? "")
+    });
+    return;
+  }
+  if (kind === "key") {
+    await dispatchNativeKey(debuggerTarget, inputPlan);
+    return;
+  }
+  throw createNativeInputError(
+    "native_input_kind_unsupported",
+    `Unsupported native input kind: ${kind || "missing"}`
+  );
+}
+
+async function dispatchNativeMouseClick(debuggerTarget, point) {
+  const common = {
+    x: point.x,
+    y: point.y,
+    button: "left",
+    pointerType: "mouse"
+  };
+  await sendChromeDebuggerCommand(debuggerTarget, "Input.dispatchMouseEvent", {
+    ...common,
+    type: "mouseMoved",
+    button: "none",
+    buttons: 0
+  });
+  await sendChromeDebuggerCommand(debuggerTarget, "Input.dispatchMouseEvent", {
+    ...common,
+    type: "mousePressed",
+    buttons: 1,
+    clickCount: 1
+  });
+  await sendChromeDebuggerCommand(debuggerTarget, "Input.dispatchMouseEvent", {
+    ...common,
+    type: "mouseReleased",
+    buttons: 0,
+    clickCount: 1
+  });
+}
+
+async function dispatchNativeSelectAll(debuggerTarget) {
+  const platform = await chrome.runtime.getPlatformInfo().catch(() => ({ os: "" }));
+  const modifiers = platform?.os === "mac" ? 4 : 2;
+  const common = {
+    key: "a",
+    code: "KeyA",
+    windowsVirtualKeyCode: 65,
+    nativeVirtualKeyCode: 65,
+    modifiers
+  };
+  await sendChromeDebuggerCommand(debuggerTarget, "Input.dispatchKeyEvent", {
+    ...common,
+    type: "rawKeyDown",
+    commands: ["selectAll"]
+  });
+  await sendChromeDebuggerCommand(debuggerTarget, "Input.dispatchKeyEvent", {
+    ...common,
+    type: "keyUp"
+  });
+}
+
+async function dispatchNativeKey(debuggerTarget, inputPlan) {
+  const descriptor = describeNativeKey(inputPlan);
+  const common = {
+    key: descriptor.key,
+    code: descriptor.code,
+    windowsVirtualKeyCode: descriptor.virtualKeyCode,
+    nativeVirtualKeyCode: descriptor.virtualKeyCode,
+    modifiers: nativeKeyModifiers(inputPlan)
+  };
+  await sendChromeDebuggerCommand(debuggerTarget, "Input.dispatchKeyEvent", {
+    ...common,
+    type: descriptor.printable ? "keyDown" : "rawKeyDown",
+    ...(descriptor.printable
+      ? {
+          text: descriptor.text,
+          unmodifiedText: descriptor.text
+        }
+      : {})
+  });
+  await sendChromeDebuggerCommand(debuggerTarget, "Input.dispatchKeyEvent", {
+    ...common,
+    type: "keyUp"
+  });
+}
+
+function describeNativeKey(inputPlan) {
+  const key = String(inputPlan?.key || "");
+  const named = {
+    Enter: { code: "Enter", virtualKeyCode: 13 },
+    Tab: { code: "Tab", virtualKeyCode: 9 },
+    Escape: { code: "Escape", virtualKeyCode: 27 },
+    Backspace: { code: "Backspace", virtualKeyCode: 8 },
+    Delete: { code: "Delete", virtualKeyCode: 46 },
+    ArrowLeft: { code: "ArrowLeft", virtualKeyCode: 37 },
+    ArrowUp: { code: "ArrowUp", virtualKeyCode: 38 },
+    ArrowRight: { code: "ArrowRight", virtualKeyCode: 39 },
+    ArrowDown: { code: "ArrowDown", virtualKeyCode: 40 },
+    Home: { code: "Home", virtualKeyCode: 36 },
+    End: { code: "End", virtualKeyCode: 35 },
+    PageUp: { code: "PageUp", virtualKeyCode: 33 },
+    PageDown: { code: "PageDown", virtualKeyCode: 34 },
+    " ": { code: "Space", virtualKeyCode: 32 }
+  }[key];
+  if (named) {
+    return { key, printable: key === " ", text: key, ...named };
+  }
+  if (Array.from(key).length === 1) {
+    const text = key;
+    const upper = text.toUpperCase();
+    const inferredCode = /^[A-Z]$/u.test(upper)
+      ? `Key${upper}`
+      : /^[0-9]$/u.test(text)
+        ? `Digit${text}`
+        : String(inputPlan?.code || "");
+    return {
+      key,
+      code: String(inputPlan?.code || inferredCode),
+      virtualKeyCode: upper.codePointAt(0) || 0,
+      printable: true,
+      text
+    };
+  }
+  return {
+    key,
+    code: String(inputPlan?.code || ""),
+    virtualKeyCode: 0,
+    printable: false,
+    text: ""
+  };
+}
+
+function nativeKeyModifiers(inputPlan) {
+  return (
+    (inputPlan?.altKey ? 1 : 0)
+    | (inputPlan?.ctrlKey ? 2 : 0)
+    | (inputPlan?.metaKey ? 4 : 0)
+    | (inputPlan?.shiftKey ? 8 : 0)
+  );
+}
+
+function assertNativeInputPoint(point) {
+  if (!Number.isFinite(Number(point?.x)) || !Number.isFinite(Number(point?.y))) {
+    throw createNativeInputError("native_point_missing", "Native pointer input requires a viewport point.");
+  }
+}
+
+function attachChromeDebugger(debuggerTarget) {
+  if (!chrome.debugger?.attach || !chrome.debugger?.sendCommand) {
+    throw createNativeInputError(
+      "native_input_api_unavailable",
+      "This browser does not expose the native input API to the extension."
+    );
+  }
+  return callChromeDebugger("attach", debuggerTarget, DEBUGGER_PROTOCOL_VERSION);
+}
+
+async function detachChromeDebugger(debuggerTarget) {
+  if (!chrome.debugger?.detach) {
+    return;
+  }
+  try {
+    await callChromeDebugger("detach", debuggerTarget);
+  } catch {
+    // The target may already have detached during navigation.
+  }
+}
+
+function sendChromeDebuggerCommand(debuggerTarget, method, params) {
+  return callChromeDebugger("sendCommand", debuggerTarget, method, params);
+}
+
+function callChromeDebugger(method, ...args) {
+  const api = chrome.debugger?.[method];
+  if (typeof api !== "function") {
+    return Promise.reject(createNativeInputError(
+      "native_input_api_unavailable",
+      `The browser debugger method "${method}" is unavailable.`
+    ));
+  }
+  return new Promise((resolve, reject) => {
+    api.call(chrome.debugger, ...args, (result) => {
+      const runtimeError = chrome.runtime.lastError;
+      if (runtimeError) {
+        reject(createNativeInputError(
+          "native_input_connection_failed",
+          runtimeError.message || "The browser native input connection failed."
+        ));
+        return;
+      }
+      resolve(result);
+    });
+  });
+}
+
+async function cancelPreparedNativeAction(tabId, frameId, preparationId) {
+  if (!preparationId) {
+    return;
+  }
+  try {
+    await sendTabMessage(tabId, {
+      type: "CANCEL_NATIVE_ACTION",
+      preparationId
+    }, { frameId });
+  } catch {
+    // Navigation may have already discarded the preparation.
+  }
+}
+
+function createNativeActionFailureResult(action, error) {
+  return {
+    ok: false,
+    action,
+    error: error?.message || String(error),
+    code: error?.code || "native_input_failed",
+    details: error?.details && typeof error.details === "object" ? error.details : null
+  };
+}
+
+function createNativeInputError(code, message) {
+  const error = new Error(message);
+  error.name = "NativeInputError";
+  error.code = code;
+  return error;
+}
+
+function compactNativeInputFailure(error) {
+  const code = String(error?.code || "native_input_unavailable");
+  const message = truncate(String(error?.message || "Native browser input is unavailable."), 240);
+  return `${code}: ${message}`;
 }
 
 function indexExecutionBindings(actions, executionBindings) {
@@ -2149,6 +2617,7 @@ function mergeFrameContexts(attempts, options = {}) {
   return {
     ...publicTopContext,
     visibleText,
+    focusedTextMatches: mergeItems("focusedTextMatches", 72),
     documentTextExcerpt: visibleText,
     selection: visibleAttempts.map((attempt) => attempt.context.selection || "").find(Boolean) || "",
     pageState: {
@@ -2175,7 +2644,9 @@ function mergeFrameContexts(attempts, options = {}) {
       truncated: hasMoreElements
     },
     elementDiscovery: {
-      scope: "current-visual-viewport",
+      scope: options.targetSearchScope === "rendered-document"
+        ? "rendered-document-target-search"
+        : "current-visual-viewport",
       query: elementSearch.query,
       search: elementSearch,
       pageSize: maxElements,

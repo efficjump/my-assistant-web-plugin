@@ -28,6 +28,18 @@
   const VISUAL_ACTION_TYPES = new Set(["visual_click"]);
   const BROWSER_ACTION_TYPES = new Set(["tab_open", "tab_focus", "tab_adopt", "tab_close", "download", "download_wait"]);
   const DECISION_STATUSES = Object.freeze(["answer", "clarify", "discover", "continue", "completed", "blocked"]);
+  const ROUTE_STRATEGIES = Object.freeze(["direct", "answer", "collection", "agent"]);
+  const ROUTE_ACTION_TYPES = Object.freeze([
+    "click",
+    "fill",
+    "select",
+    "focus",
+    "hover",
+    "press",
+    "scroll",
+    "navigate",
+    "extract"
+  ]);
 
   const nullableString = { type: ["string", "null"] };
   const nullableNumber = { type: ["number", "null"] };
@@ -162,6 +174,142 @@
       "completionCriteria",
       "reason"
     ]
+  });
+  const ROUTE_ACTION_SCHEMA = Object.freeze({
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      type: {
+        type: "string",
+        enum: ROUTE_ACTION_TYPES,
+        description: "One semantic browser operation. It is resolved to a concrete DOM target by the local runtime."
+      },
+      target: ELEMENT_SEARCH_SCHEMA,
+      value: {
+        type: ["string", "number", "boolean", "null"],
+        description: "Value for fill or select; null for actions without a value."
+      },
+      checked: nullableBoolean,
+      key: nullableString,
+      code: nullableString,
+      direction: nullableString,
+      amount: nullableNumber,
+      url: nullableString,
+      reason: {
+        type: "string",
+        maxLength: 500,
+        description: "Why this operation directly advances the resolved objective."
+      }
+    },
+    required: [
+      "type",
+      "target",
+      "value",
+      "checked",
+      "key",
+      "code",
+      "direction",
+      "amount",
+      "url",
+      "reason"
+    ]
+  });
+  const EXECUTION_ROUTE_SCHEMA = Object.freeze({
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      version: {
+        type: "string",
+        description: "Execution-route contract version. Use 1.0."
+      },
+      strategy: {
+        type: "string",
+        enum: ROUTE_STRATEGIES,
+        description: "Use direct for concrete DOM actions, answer for current-page questions, collection for repeated rendered records, and agent only for genuinely ambiguous, visual, external-tool, or open-ended work."
+      },
+      actions: {
+        type: "array",
+        maxItems: 3,
+        items: ROUTE_ACTION_SCHEMA,
+        description: "Ordered semantic operations. Direct actions are resolved and executed locally without another planning call."
+      },
+      evidenceSearch: ELEMENT_SEARCH_SCHEMA,
+      confidence: {
+        type: "number",
+        minimum: 0,
+        maximum: 1,
+        description: "Confidence that the selected strategy and semantic targets preserve the user's exact request."
+      },
+      reason: {
+        type: "string",
+        maxLength: 500,
+        description: "Concise routing conclusion without chain-of-thought."
+      }
+    },
+    required: ["version", "strategy", "actions", "evidenceSearch", "confidence", "reason"]
+  });
+  const ROUTED_TURN_SCHEMA = Object.freeze({
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      turnIntent: TURN_INTENT_SCHEMA,
+      route: EXECUTION_ROUTE_SCHEMA
+    },
+    required: ["turnIntent", "route"]
+  });
+  const TARGET_SELECTION_SCHEMA = Object.freeze({
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      status: {
+        type: "string",
+        enum: ["selected", "ambiguous", "not_found"],
+        description: "Select only when exactly one supplied candidate matches the semantic target."
+      },
+      candidateIndex: {
+        type: ["integer", "null"],
+        minimum: 0,
+        maximum: 7,
+        description: "Zero-based index in the supplied candidate array, or null when no unique match exists."
+      },
+      confidence: {
+        type: "number",
+        minimum: 0,
+        maximum: 1
+      },
+      reason: {
+        type: "string",
+        maxLength: 500,
+        description: "Concise selection conclusion without chain-of-thought."
+      }
+    },
+    required: ["status", "candidateIndex", "confidence", "reason"]
+  });
+  const FAST_ANSWER_SCHEMA = Object.freeze({
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      status: {
+        type: "string",
+        enum: ["answer", "clarify", "blocked"]
+      },
+      message: {
+        type: "string",
+        maxLength: 16000,
+        description: "The complete user-facing response in the configured response language."
+      },
+      confidence: {
+        type: "number",
+        minimum: 0,
+        maximum: 1
+      },
+      reason: {
+        type: "string",
+        maxLength: 500,
+        description: "Concise grounding conclusion without chain-of-thought."
+      }
+    },
+    required: ["status", "message", "confidence", "reason"]
   });
 
   const DECISION_SCHEMA = Object.freeze({
@@ -650,6 +798,122 @@
       errors.push("Turn intent requires a concise classification reason.");
     }
     return { valid: errors.length === 0, errors: uniqueStrings(errors), intent: normalized };
+  }
+
+  function normalizeExecutionRoute(input) {
+    const source = input && typeof input === "object" && !Array.isArray(input) ? input : {};
+    const strategy = ROUTE_STRATEGIES.includes(source.strategy) ? source.strategy : "agent";
+    const actions = (Array.isArray(source.actions) ? source.actions : [])
+      .filter((action) => action && typeof action === "object" && !Array.isArray(action))
+      .slice(0, 3)
+      .map((action) => {
+        const type = ROUTE_ACTION_TYPES.includes(String(action.type || "").trim().toLowerCase())
+          ? String(action.type || "").trim().toLowerCase()
+          : "";
+        const target = normalizeElementSearch(action.target);
+        const normalized = {
+          type,
+          target,
+          value: action.value === undefined ? null : action.value,
+          checked: action.checked === undefined || action.checked === null
+            ? null
+            : Boolean(action.checked),
+          key: stringValue(action.key).trim().slice(0, 120) || null,
+          code: stringValue(action.code).trim().slice(0, 120) || null,
+          direction: stringValue(action.direction).trim().slice(0, 80) || null,
+          amount: Number.isFinite(Number(action.amount)) ? Number(action.amount) : null,
+          url: stringValue(action.url).trim().slice(0, 4000) || null,
+          reason: stringValue(action.reason).trim().slice(0, 500)
+        };
+        if (!["fill", "select"].includes(type)) {
+          normalized.value = null;
+          normalized.checked = null;
+        }
+        if (type !== "press") {
+          normalized.key = null;
+          normalized.code = null;
+        }
+        if (type !== "scroll") {
+          normalized.direction = null;
+          normalized.amount = null;
+        }
+        if (type !== "navigate") {
+          normalized.url = null;
+        }
+        return normalized;
+      })
+      .filter((action) => action.type);
+    return {
+      version: stringValue(source.version || "1.0"),
+      strategy,
+      actions,
+      evidenceSearch: normalizeElementSearch(source.evidenceSearch),
+      confidence: clampNumber(source.confidence, 0, 1, 0),
+      reason: stringValue(source.reason).trim().slice(0, 500)
+    };
+  }
+
+  function validateExecutionRoute(route, options = {}) {
+    const normalized = normalizeExecutionRoute(route);
+    const errors = [];
+    if (!normalized.reason) {
+      errors.push("Execution routing requires a concise reason.");
+    }
+    if (normalized.strategy === "direct" && !normalized.actions.length) {
+      errors.push("A direct execution route requires at least one semantic action.");
+    }
+    if (normalized.strategy === "collection") {
+      if (options.deliverableKind && options.deliverableKind !== "collection") {
+        errors.push("A collection route requires a collection deliverable.");
+      }
+      if (
+        normalized.actions.length !== 1
+        || normalized.actions[0]?.type !== "extract"
+      ) {
+        errors.push("A collection route requires exactly one extract action that identifies a representative record.");
+      }
+    }
+    if (normalized.strategy === "answer" && normalized.actions.length) {
+      errors.push("An answer route cannot contain page actions.");
+    }
+    if (normalized.strategy === "agent" && normalized.actions.length) {
+      errors.push("An agent fallback route cannot pre-authorize page actions.");
+    }
+    for (const action of normalized.actions) {
+      const targeted = ["click", "fill", "select", "focus", "hover", "extract"].includes(action.type);
+      if (targeted) {
+        const validation = validateElementSearch(action.target);
+        if (!validation.valid) {
+          errors.push(...validation.errors.map((error) => `${action.type}: ${error}`));
+        }
+      }
+      if (["fill", "select"].includes(action.type) && action.value === null && action.checked === null) {
+        errors.push(`${action.type} requires value or checked.`);
+      }
+      if (action.type === "press" && !action.key) {
+        errors.push("press requires a key.");
+      }
+      if (action.type === "scroll" && !action.direction) {
+        errors.push("scroll requires a direction.");
+      }
+      if (action.type === "navigate" && !action.url) {
+        errors.push("navigate requires a URL.");
+      }
+      if (!action.reason) {
+        errors.push(`${action.type} requires a concise reason.`);
+      }
+    }
+    if (
+      ["answer", "collection"].includes(normalized.strategy)
+      && !isElementSearchActive(normalized.evidenceSearch)
+    ) {
+      errors.push(`${normalized.strategy} routing requires a focused evidence search.`);
+    }
+    return {
+      valid: errors.length === 0,
+      errors: uniqueStrings(errors),
+      route: normalized
+    };
   }
 
   function normalizeDecision(input, options = {}) {
@@ -1368,7 +1632,7 @@ If the required visible control is absent, prefer status discover with a concise
 For an unlabeled icon or button identified relative to a nearby field, put the control kind in roles and the adjacent visible label in nearText. Leave query empty when the control itself has no visible or accessible name.
 Use visual_click only when the latest context contains visualObservation and a visual surface ref, no normal DOM ref can represent the visible target, and the target is unambiguous in the attached screenshot. Bind it to visualObservation.id, describe the exact visible target, and provide one point relative to that surface on a 0–1000 scale. Never use visual coordinates to guess hidden content or bypass a permission boundary.
 Use the runtime-resolved immutable turn intent. Do not re-expand it from raw conversation history or retry a failed prior effect unless that intent explicitly carries the prior deliverable.
-Treat deliverable.targetCount as output cardinality, never as permission to repeat the same state-changing effect. For a collection deliverable, use a bound extract action with one representative record ref, a stable collectionId reused across pages, collectionName, and the exact targetCount. The runtime expands repeated rendered records, deduplicates them across pages, and reports the remaining count. Extract the current result page before navigating again. Stop page traversal as soon as the ledger reaches the target or reports a repeated/no-new-record page. When deliverable.formats requests a local file, call the runtime collection-export capability only after the ledger reaches its target and do not finish until every requested format has runtime evidence.
+Treat deliverable.targetCount as output cardinality, never as permission to repeat the same state-changing effect. For a collection deliverable, use a bound extract action with one representative record ref, a stable collectionId reused across pages, collectionName, and the exact targetCount. The runtime expands repeated rendered records, deduplicates them across pages, and reports the remaining count. Extract the current result page before navigating again. When the current page needs extraction and one runtime-identified pagination control is available, the decision may contain exactly two ordered actions: the structured extract first and one verified pagination click second. Never use a record or detail link as pagination. Stop page traversal as soon as the ledger reaches the target or reports a repeated/no-new-record page. Requested local collection formats are generated by the runtime immediately after the exact target is reached and must have runtime evidence before completion.
 A terminal message is the exact response shown to the user. For answer or completed, include the requested result itself. Never end with a promise to inspect, summarize, compare, or report later, and never say that information was summarized without presenting that information.
 Keep each turn small. Prefer one effect class per turn. If the previous attempt made no progress, choose a materially different action, gather missing evidence, ask one focused clarification, or stop with a precise blocker.
 An executed request is not proof of progress. Use the reported observable change and do not repeat the same failed, unchanged, indeterminate, or disclosure-toggle attempt from the same evidence state.
@@ -1462,7 +1726,13 @@ Return a corrected decision object only. Preserve the user's objective, use only
     DECISION_SCHEMA,
     DECISION_STATUSES,
     ELEMENT_SEARCH_SCHEMA,
+    EXECUTION_ROUTE_SCHEMA,
+    FAST_ANSWER_SCHEMA,
     INITIAL_DECISION_SCHEMA,
+    ROUTE_ACTION_TYPES,
+    ROUTED_TURN_SCHEMA,
+    ROUTE_STRATEGIES,
+    TARGET_SELECTION_SCHEMA,
     TURN_INTENT_SCHEMA,
     VISUAL_ACTION_TYPES,
     VISUAL_TARGET_SCHEMA,
@@ -1478,6 +1748,7 @@ Return a corrected decision object only. Preserve the user's objective, use only
     hashString,
     normalizeDecision,
     normalizeElementSearch,
+    normalizeExecutionRoute,
     normalizePolicy,
     normalizeStatus,
     normalizeTurnIntent,
@@ -1488,6 +1759,7 @@ Return a corrected decision object only. Preserve the user's objective, use only
     updateProgressGuard,
     validateDecision,
     validateElementSearch,
+    validateExecutionRoute,
     validateJsonAgainstSchema,
     validatePolicy,
     validateTurnIntent,

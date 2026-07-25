@@ -24,7 +24,8 @@ const assistantPageState = {
   collectionCache: null,
   observationProbe: null,
   visualRevision: 0,
-  visualListenersInstalled: false
+  visualListenersInstalled: false,
+  nativeActionPreparations: new Map()
 };
 
 const INTERACTIVE_ROLES = new Set([
@@ -60,6 +61,28 @@ const NATIVE_INTERACTIVE_TAGS = new Set([
   "textarea",
   "video"
 ]);
+const STRONG_INTERACTIVE_SELECTOR = [
+  "a[href]",
+  "area[href]",
+  "audio[controls]",
+  "button",
+  "input:not([type='hidden'])",
+  "label[for]",
+  "label:has(input,textarea,select,button)",
+  "select",
+  "summary",
+  "textarea",
+  "video[controls]",
+  "[contenteditable]:not([contenteditable='false'])",
+  "[draggable='true']",
+  "[onclick]",
+  "[tabindex]:not([tabindex='-1'])",
+  "[aria-haspopup]",
+  "[aria-expanded]",
+  "[aria-pressed]",
+  "[aria-checked]",
+  ...Array.from(INTERACTIVE_ROLES, (role) => `[role='${role}']`)
+].join(",");
 const MAX_COLLECTION_LINK_SCAN = 12000;
 
 observePageMutations();
@@ -85,6 +108,12 @@ async function handleContentMessage(message) {
       return waitForPageSettle(message.options || {});
     case "EXECUTE_PAGE_ACTIONS":
       return executePageActions(message.actions || [], message.executionBindings || []);
+    case "PREPARE_NATIVE_ACTION":
+      return prepareNativeAction(message.action || {}, message.executionBinding || null);
+    case "VERIFY_NATIVE_ACTION":
+      return verifyNativeAction(message.preparationId, message.inputResult || {});
+    case "CANCEL_NATIVE_ACTION":
+      return cancelNativeAction(message.preparationId);
     case "VERIFY_PAGE_ACTION_EFFECT":
       return verifyPageActionEffect(message.action || {}, message.beforeFingerprint || "");
     case "UNDO_PAGE_ACTIONS":
@@ -117,6 +146,9 @@ function collectPageContext(options) {
     roles: options.elementRoles,
     nearText: options.elementNearText
   });
+  const targetSearchScope = options.targetSearchScope === "rendered-document"
+    ? "rendered-document"
+    : "visual-viewport";
   const redactSensitiveData = options.redactSensitiveData !== false;
   assistantPageState.redactSensitiveData = redactSensitiveData;
   const interactiveElementCollection = measureCollectionPhase(
@@ -125,6 +157,7 @@ function collectPageContext(options) {
       limit: maxElements,
       offset: elementOffset,
       search: elementSearch,
+      targetSearchScope,
       redactSensitiveData
     })
   );
@@ -155,6 +188,12 @@ function collectPageContext(options) {
   const visibleText = redactSensitiveData
     ? redactSensitiveText(collectedVisibleText)
     : collectedVisibleText;
+  const focusedTextMatches = targetSearchScope === "rendered-document"
+    ? measureCollectionPhase(
+        "focusedTextMatches",
+        () => collectFocusedRenderedTextMatches(elementSearch, 36, redactSensitiveData)
+      )
+    : [];
   const semanticContext = measureCollectionPhase("semanticContext", () => ({
     headings: collectHeadings(24, redactSensitiveData),
     landmarks: collectLandmarks(24, redactSensitiveData),
@@ -192,13 +231,27 @@ function collectPageContext(options) {
     },
     selection: redactSensitiveData ? redactSensitiveText(getSelectionText()) : getSelectionText(),
     visibleText,
+    focusedTextMatches,
     // Kept as a compatibility alias, but deliberately scoped to the visual viewport.
     documentTextExcerpt: visibleText,
-    observationScope: {
-      kind: "visual-viewport",
-      includes: ["painted text", "visually exposed controls", "visible scroll regions", "visible visual surfaces"],
-      excludes: ["offscreen content", "clipped content", "occluded content", "hidden DOM"]
-    },
+    observationScope: targetSearchScope === "rendered-document"
+      ? {
+          kind: "rendered-document-target-search",
+          includes: [
+            "painted viewport text",
+            "rendered semantic controls across the document",
+            "text-anchored custom controls",
+            "visible scroll regions",
+            "visible visual surfaces"
+          ],
+          excludes: ["hidden DOM", "closed shadow roots", "unavailable frame documents"],
+          policy: "Offscreen targets are executable only after scrolling and exposed-point verification."
+        }
+      : {
+          kind: "visual-viewport",
+          includes: ["painted text", "visually exposed controls", "visible scroll regions", "visible visual surfaces"],
+          excludes: ["offscreen content", "clipped content", "occluded content", "hidden DOM"]
+        },
     headings: semanticContext.headings,
     landmarks: semanticContext.landmarks,
     forms: semanticContext.forms,
@@ -493,6 +546,8 @@ function createCollectionCache() {
     exposedPoints: new WeakMap(),
     textExposure: new WeakMap(),
     imageMapGeometries: new WeakMap(),
+    paginationMetadata: new WeakMap(),
+    paginationContainers: new WeakMap(),
     phaseDurations: new Map(),
     scannedElementCount: 0,
     queryCount: 0,
@@ -739,6 +794,7 @@ function collectInteractiveElements(options) {
   const offset = Math.floor(clampNumber(options?.offset, 0, Number.MAX_SAFE_INTEGER, 0));
   const search = normalizeLocalElementSearch(options?.search || { query: options?.query });
   const searchActive = isLocalElementSearchActive(search);
+  const includeOffscreenTargets = options?.targetSearchScope === "rendered-document";
   const redactSensitiveData = options?.redactSensitiveData !== false;
   const seen = new Set();
   const candidates = [];
@@ -751,8 +807,11 @@ function collectInteractiveElements(options) {
     )
   );
   let potentialCandidateCount = 0;
-  for (const [discoveryIndex, rawElement] of queryAllDom("*").entries()) {
-    if (!isPotentiallyInteractive(rawElement)) {
+  const discoveryElements = includeOffscreenTargets
+    ? collectTargetSearchElements(search)
+    : queryAllDom("*");
+  for (const [discoveryIndex, rawElement] of discoveryElements.entries()) {
+    if (!isPotentiallyInteractive(rawElement, { includeOffscreen: includeOffscreenTargets })) {
       continue;
     }
     const element = canonicalInteractiveCandidate(rawElement);
@@ -764,16 +823,21 @@ function collectInteractiveElements(options) {
       continue;
     }
     const rawHitPoint = findExposedPoint(rawElement);
-    if (!rawHitPoint) {
-      continue;
-    }
     const hitPoint = element === rawElement ? rawHitPoint : findExposedPoint(element);
-    if (!hitPoint) {
+    if (
+      !hitPoint
+      && (
+        !includeOffscreenTargets
+        || !isElementBoxRendered(element)
+      )
+    ) {
       continue;
     }
     seen.add(element);
     const searchRecord = searchActive
-      ? buildInteractiveSearchRecord(element, contextCache)
+      ? buildInteractiveSearchRecord(element, contextCache, {
+          includeNavigation: search.roles.includes("pagination")
+        })
       : null;
     const searchMatch = searchActive
       ? scoreInteractiveCandidateForSearch(searchRecord, search)
@@ -781,6 +845,7 @@ function collectInteractiveElements(options) {
     candidates.push({
       element,
       hitPoint,
+      exposure: hitPoint ? "visible" : "offscreen-rendered",
       scope: findScopeForElement(element),
       rect: getGlobalRect(element),
       discoveryIndex,
@@ -805,7 +870,8 @@ function collectInteractiveElements(options) {
       redactSensitiveData,
       scope: candidate.scope,
       hitPoint: candidate.hitPoint,
-      rect: candidate.rect
+      rect: candidate.rect,
+      exposure: candidate.exposure
     });
     info.binding = createElementBinding(element);
     info.stateBinding = createElementStateBinding(element);
@@ -834,17 +900,73 @@ function collectInteractiveElements(options) {
       query: search.query,
       search,
       orderDigest: digestInteractiveCandidateOrder(matchingCandidates),
-      truncated: offset + elements.length < matchingCandidates.length
+      truncated: offset + elements.length < matchingCandidates.length,
+      scope: includeOffscreenTargets ? "rendered-document" : "visual-viewport"
     }
   };
 }
 
+function collectTargetSearchElements(search) {
+  const candidates = [];
+  const seen = new Set();
+  const append = (element) => {
+    if (!element || seen.has(element)) {
+      return;
+    }
+    seen.add(element);
+    candidates.push(element);
+  };
+  queryAllDom(STRONG_INTERACTIVE_SELECTOR).forEach(append);
+
+  const anchorTerms = tokenizeSearchText(
+    [search.query, search.nearText].filter(Boolean).join(" ")
+  );
+  if (!anchorTerms.length) {
+    return candidates;
+  }
+  for (const scope of getDomScopes()) {
+    const ownerDocument = scope.root.nodeType === 9 ? scope.root : scope.root.ownerDocument;
+    const ownerWindow = ownerDocument?.defaultView || window;
+    const root = scope.root.nodeType === 9 ? scope.root.body : scope.root;
+    if (!root) {
+      continue;
+    }
+    const walker = ownerDocument.createTreeWalker(root, ownerWindow.NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        const text = normalizeSearchText(node.nodeValue || "");
+        if (!text || !anchorTerms.some((term) => text.includes(term))) {
+          return ownerWindow.NodeFilter.FILTER_REJECT;
+        }
+        const parent = node.parentElement;
+        return parent && !shouldSkipElement(parent)
+          ? ownerWindow.NodeFilter.FILTER_ACCEPT
+          : ownerWindow.NodeFilter.FILTER_REJECT;
+      }
+    });
+    let anchoredCount = 0;
+    while (walker.nextNode() && anchoredCount < 600) {
+      let current = walker.currentNode.parentElement;
+      for (let depth = 0; current && depth < 6; depth += 1) {
+        if (isPotentiallyInteractive(current, { includeOffscreen: true })) {
+          append(current);
+          anchoredCount += 1;
+          break;
+        }
+        current = getLocalComposedParentElement(current);
+      }
+    }
+  }
+  return candidates;
+}
+
 function matchesInteractiveSearchIdentity(element, search) {
   const record = buildInteractiveSearchRecord(element, new WeakMap(), {
-    includeContext: false
+    includeContext: false,
+    includeNavigation: search.roles.includes("pagination")
   });
   const roleValues = new Set([
     record.normalizedFields.role,
+    record.normalizedFields.semanticRole,
     record.normalizedFields.tag,
     record.normalizedFields.type
   ].filter(Boolean));
@@ -860,6 +982,7 @@ function matchesInteractiveSearchIdentity(element, search) {
   return scoreSearchTerms(search.query, record, {
     label: 360,
     role: 180,
+    semanticRole: 240,
     tag: 120,
     type: 150,
     name: 170,
@@ -915,9 +1038,13 @@ function buildInteractiveSearchRecord(element, contextCache, options = {}) {
     ? String(element.getAttribute("type") || element.type || "").toLowerCase()
     : "";
   const role = normalizeSearchText(element.getAttribute("role") || inferredRole(element, inputType));
+  const pagination = options.includeNavigation
+    ? describePaginationMetadata(findConcreteCompositeControl(element) || element)
+    : null;
   const fields = {
     label: getAccessibleName(element),
     role,
+    semanticRole: pagination?.navigationKind || "",
     tag,
     type: inputType || controlType,
     name: element.getAttribute("name") || "",
@@ -1048,6 +1175,7 @@ function scoreInteractiveCandidateForSearch(record, search) {
   }
   const roleValues = new Set([
     record.normalizedFields.role,
+    record.normalizedFields.semanticRole,
     record.normalizedFields.tag,
     record.normalizedFields.type
   ].filter(Boolean));
@@ -1059,6 +1187,7 @@ function scoreInteractiveCandidateForSearch(record, search) {
   const queryMatch = scoreSearchTerms(search.query, record, {
     label: 360,
     role: 180,
+    semanticRole: 240,
     tag: 120,
     type: 150,
     name: 170,
@@ -1076,6 +1205,7 @@ function scoreInteractiveCandidateForSearch(record, search) {
   const nearMatch = scoreSearchTerms(search.nearText, record, {
     label: 35,
     role: 15,
+    semanticRole: 25,
     tag: 10,
     type: 10,
     name: 15,
@@ -1253,7 +1383,7 @@ function compareInteractiveCandidatesByVisualPosition(left, right) {
   return left.discoveryIndex - right.discoveryIndex;
 }
 
-function isPotentiallyInteractive(element) {
+function isPotentiallyInteractive(element, options = {}) {
   const tag = element.tagName?.toLowerCase() || "";
   if (!tag || ["html", "body"].includes(tag) || shouldSkipElement(element) || isVisualSurfaceElement(element)) {
     return false;
@@ -1263,17 +1393,19 @@ function isPotentiallyInteractive(element) {
     return true;
   }
 
-  const ownerWindow = element.ownerDocument?.defaultView || window;
-  const rect = getElementRect(element);
-  if (
-    rect.width <= 0 ||
-    rect.height <= 0 ||
-    rect.bottom <= 0 ||
-    rect.right <= 0 ||
-    rect.top >= ownerWindow.innerHeight ||
-    rect.left >= ownerWindow.innerWidth
-  ) {
-    return false;
+  if (!options.includeOffscreen) {
+    const ownerWindow = element.ownerDocument?.defaultView || window;
+    const rect = getElementRect(element);
+    if (
+      rect.width <= 0 ||
+      rect.height <= 0 ||
+      rect.bottom <= 0 ||
+      rect.right <= 0 ||
+      rect.top >= ownerWindow.innerHeight ||
+      rect.left >= ownerWindow.innerWidth
+    ) {
+      return false;
+    }
   }
   return getElementStyle(element).cursor === "pointer" && hasActionDescriptor(element);
 }
@@ -1338,7 +1470,11 @@ function readElementHref(element) {
 }
 
 function canonicalInteractiveCandidate(element) {
-  if (element.tagName?.toLowerCase() === "label" && element.control && isElementVisuallyExposed(element.control)) {
+  if (
+    element.tagName?.toLowerCase() === "label"
+    && element.control
+    && isElementBoxRendered(element.control)
+  ) {
     return element.control;
   }
   if (hasStrongInteractionSignal(element)) {
@@ -1434,6 +1570,7 @@ function describeInteractiveElement(element, ref, options = {}) {
   const autocomplete = element.getAttribute("autocomplete") || "";
   const accessibleName = getAccessibleName(element);
   const label = options.redactSensitiveData ? redactSensitiveText(accessibleName) : accessibleName;
+  const pagination = describePaginationMetadata(actionControl);
 
   return removeEmptyValues({
     ref,
@@ -1457,9 +1594,11 @@ function describeInteractiveElement(element, ref, options = {}) {
     ariaExpanded: element.hasAttribute("aria-expanded")
       ? element.getAttribute("aria-expanded")
       : undefined,
+    ...pagination,
     actionability: ("disabled" in element && element.disabled) || element.getAttribute("aria-disabled") === "true"
       ? "disabled"
       : "interactive",
+    exposure: options.exposure || (options.hitPoint ? "visible" : undefined),
     href: href ? truncate(sanitizeUrlForContext(href, options.redactSensitiveData), 220) : undefined,
     formAction: formAction ? truncate(sanitizeUrlForContext(formAction, options.redactSensitiveData), 220) : undefined,
     formMethod: form ? String(form.method || "get").toLowerCase() : undefined,
@@ -1485,6 +1624,139 @@ function describeInteractiveElement(element, ref, options = {}) {
       ? { x: Math.round(options.hitPoint.globalX), y: Math.round(options.hitPoint.globalY) }
       : undefined
   });
+}
+
+function describePaginationMetadata(control) {
+  if (!control?.ownerDocument) {
+    return null;
+  }
+  const cache = assistantPageState.collectionCache?.paginationMetadata;
+  if (cache?.has(control)) {
+    return cache.get(control);
+  }
+  const relTokens = new Set(
+    String(control.getAttribute?.("rel") || "")
+      .toLowerCase()
+      .split(/\s+/)
+      .filter(Boolean)
+  );
+  const ariaCurrent = String(control.getAttribute?.("aria-current") || "").toLowerCase();
+  const container = findPaginationContainer(control);
+  const navigationRel = relTokens.has("next")
+    ? "next"
+    : relTokens.has("prev") || relTokens.has("previous")
+      ? "previous"
+      : "";
+  const label = normalizeWhitespace(getAccessibleName(control));
+  const ordinal = /^\d{1,7}$/u.test(label) ? Number(label) : null;
+  const metadata = container || navigationRel || ariaCurrent === "page"
+    ? removeEmptyValues({
+        navigationKind: "pagination",
+        navigationRel,
+        navigationCurrent: ariaCurrent === "page" || undefined,
+        navigationOrdinal: Number.isInteger(ordinal) ? ordinal : undefined,
+        navigationGroup: truncate(getSemanticContainerName(container), 160) || undefined
+      })
+    : null;
+  cache?.set(control, metadata);
+  return metadata;
+}
+
+function findPaginationContainer(control) {
+  let current = control;
+  for (let depth = 0; current?.parentElement && depth < 6; depth += 1) {
+    current = current.parentElement;
+    const tag = current.tagName?.toLowerCase() || "";
+    if (["html", "body"].includes(tag)) {
+      break;
+    }
+    if (analyzePaginationContainer(current).isPagination) {
+      return current;
+    }
+  }
+  return null;
+}
+
+function analyzePaginationContainer(container) {
+  const cache = assistantPageState.collectionCache?.paginationContainers;
+  if (cache?.has(container)) {
+    return cache.get(container);
+  }
+  const controls = Array.from(container.querySelectorAll?.(
+    "a[href],area[href],button,[role='link'],[role='button']"
+  ) || [])
+    .filter((candidate) => candidate.isConnected && isElementTreeRendered(candidate))
+    .slice(0, 41);
+  if (controls.length < 2 || controls.length > 40) {
+    const result = { isPagination: false };
+    cache?.set(container, result);
+    return result;
+  }
+  const labels = controls.map((candidate) => normalizeWhitespace(getAccessibleName(candidate)));
+  const numericOrdinals = new Set(
+    labels.filter((label) => /^\d{1,7}$/u.test(label)).map(Number)
+  );
+  const compactControlCount = labels.filter((label) => (
+    /^\d{1,7}$/u.test(label)
+    || /^(?:[<>«»‹›]|[←→])$/u.test(label)
+  )).length;
+  const currentMarker = controls.some((candidate) => (
+    String(candidate.getAttribute?.("aria-current") || "").toLowerCase() === "page"
+  ));
+  const relationalSignal = controls.some((candidate) => {
+    const rel = String(candidate.getAttribute?.("rel") || "").toLowerCase().split(/\s+/);
+    return rel.includes("next") || rel.includes("prev") || rel.includes("previous");
+  });
+  const sameViewVariantCount = controls.filter((candidate) => (
+    isSameViewNumericVariant(readElementHref(candidate))
+  )).length;
+  const compactRatio = compactControlCount / controls.length;
+  const semanticNavigation = container.matches?.("nav,[role='navigation']") === true;
+  const isPagination = Boolean(
+    relationalSignal
+    || (currentMarker && controls.length >= 2)
+    || (
+      numericOrdinals.size >= 2
+      && compactRatio >= 0.6
+      && (
+        semanticNavigation
+        || controls.length <= 20
+        || sameViewVariantCount >= 2
+      )
+    )
+    || (
+      sameViewVariantCount >= 2
+      && compactRatio >= 0.5
+    )
+  );
+  const result = { isPagination };
+  cache?.set(container, result);
+  return result;
+}
+
+function isSameViewNumericVariant(value) {
+  if (!value) {
+    return false;
+  }
+  try {
+    const current = new URL(location.href);
+    const candidate = new URL(String(value), location.href);
+    if (candidate.origin !== current.origin || candidate.pathname !== current.pathname) {
+      return false;
+    }
+    const keys = new Set([
+      ...current.searchParams.keys(),
+      ...candidate.searchParams.keys()
+    ]);
+    const differences = Array.from(keys).filter((key) => (
+      current.searchParams.getAll(key).join("\u0000")
+      !== candidate.searchParams.getAll(key).join("\u0000")
+    ));
+    return differences.length === 1
+      && candidate.searchParams.getAll(differences[0]).some((entry) => /^\d+$/u.test(entry));
+  } catch {
+    return false;
+  }
 }
 
 function createElementBinding(element) {
@@ -2078,6 +2350,135 @@ function collectVisibleTextWithin(element, maxChars) {
   return normalizeWhitespace(parts.join("\n"));
 }
 
+function collectFocusedRenderedTextMatches(search, limit, redactSensitiveData) {
+  const terms = tokenizeSearchText(
+    [search?.query, search?.nearText].filter(Boolean).join(" ")
+  );
+  if (!terms.length) {
+    return [];
+  }
+  const matches = [];
+  const seen = new Set();
+  for (const scope of getDomScopes()) {
+    if (matches.length >= limit) {
+      break;
+    }
+    const ownerDocument = scope.root.nodeType === 9 ? scope.root : scope.root.ownerDocument;
+    const ownerWindow = ownerDocument?.defaultView || window;
+    const root = scope.root.nodeType === 9 ? scope.root.body : scope.root;
+    if (!root) {
+      continue;
+    }
+    const walker = ownerDocument.createTreeWalker(root, ownerWindow.NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        const text = normalizeSearchText(node.nodeValue || "");
+        if (!text || !terms.some((term) => text.includes(term))) {
+          return ownerWindow.NodeFilter.FILTER_REJECT;
+        }
+        const parent = node.parentElement;
+        return parent && !shouldSkipElement(parent) && isElementTreeRendered(parent)
+          ? ownerWindow.NodeFilter.FILTER_ACCEPT
+          : ownerWindow.NodeFilter.FILTER_REJECT;
+      }
+    });
+    while (walker.nextNode() && matches.length < limit) {
+      const parent = walker.currentNode.parentElement;
+      const container = findFocusedTextContainer(parent);
+      const text = collectRenderedTextWithin(container, 1200);
+      const normalized = normalizeSearchText(text);
+      if (!text || seen.has(normalized)) {
+        continue;
+      }
+      seen.add(normalized);
+      const heading = findRenderedContextHeading(container);
+      matches.push(removeEmptyValues({
+        scope: scope.id || "top",
+        tag: container.tagName?.toLowerCase() || "",
+        heading: redactContextText(
+          heading ? collectRenderedTextWithin(heading, 240) : "",
+          240,
+          redactSensitiveData
+        ),
+        text: redactContextText(text, 1200, redactSensitiveData)
+      }));
+    }
+  }
+  return matches;
+}
+
+function findFocusedTextContainer(element) {
+  let current = element;
+  let fallback = element;
+  for (let depth = 0; current && depth < 6; depth += 1) {
+    const tag = current.tagName?.toLowerCase() || "";
+    const role = String(current.getAttribute?.("role") || "").toLowerCase();
+    if (
+      ["p", "li", "tr", "article", "section", "dd", "dt", "pre", "blockquote", "figcaption"].includes(tag)
+      || ["row", "article", "listitem"].includes(role)
+    ) {
+      return current;
+    }
+    if (["div", "main", "aside"].includes(tag)) {
+      const textLength = normalizeWhitespace(current.textContent || "").length;
+      if (textLength > 0 && textLength <= 1600) {
+        fallback = current;
+      }
+    }
+    current = getLocalComposedParentElement(current);
+  }
+  return fallback || element;
+}
+
+function findRenderedContextHeading(element) {
+  let current = element;
+  for (let depth = 0; current && depth < 5; depth += 1) {
+    const headings = Array.from(current.querySelectorAll?.(
+      ":scope > h1,:scope > h2,:scope > h3,:scope > h4,:scope > h5,:scope > h6,:scope > [role='heading']"
+    ) || []).filter(isElementTreeRendered);
+    if (headings.length) {
+      return headings[0];
+    }
+    current = getLocalComposedParentElement(current);
+  }
+  return null;
+}
+
+function collectRenderedTextWithin(element, maxChars) {
+  const ownerDocument = element?.ownerDocument;
+  const ownerWindow = ownerDocument?.defaultView || window;
+  if (!ownerDocument || !element || maxChars <= 0) {
+    return "";
+  }
+  const parts = [];
+  let length = 0;
+  const walker = ownerDocument.createTreeWalker(
+    element,
+    ownerWindow.NodeFilter.SHOW_ELEMENT | ownerWindow.NodeFilter.SHOW_TEXT,
+    {
+      acceptNode(node) {
+        if (node.nodeType === ownerWindow.Node.ELEMENT_NODE) {
+          return shouldSkipElement(node) || isElementSubtreeDefinitelyHidden(node)
+            ? ownerWindow.NodeFilter.FILTER_REJECT
+            : ownerWindow.NodeFilter.FILTER_SKIP;
+        }
+        const text = normalizeWhitespace(node.nodeValue || "");
+        const parent = node.parentElement;
+        if (!text || !parent || !isElementTreeRendered(parent)) {
+          return ownerWindow.NodeFilter.FILTER_REJECT;
+        }
+        return ownerWindow.NodeFilter.FILTER_ACCEPT;
+      }
+    }
+  );
+  while (walker.nextNode() && length < maxChars) {
+    const text = normalizeWhitespace(walker.currentNode.nodeValue || "");
+    const remaining = maxChars - length;
+    parts.push(text.slice(0, remaining));
+    length += text.length + 1;
+  }
+  return normalizeWhitespace(parts.join(" "));
+}
+
 function isElementSubtreeDefinitelyHidden(element) {
   const style = getElementStyle(element);
   return (
@@ -2135,6 +2536,255 @@ async function executePageActions(actions, executionBindings = []) {
   }
 
   return { results };
+}
+
+function prepareNativeAction(action, executionBinding = null) {
+  purgeExpiredNativeActionPreparations();
+  const normalized = normalizeAction(action);
+  if (!["click", "visual_click", "fill", "hover", "press"].includes(normalized.type)) {
+    throw createContentControlError(
+      "native_action_unsupported",
+      `Native browser input does not support action type: ${normalized.type || "missing"}`
+    );
+  }
+  if (executionBinding) {
+    Object.defineProperty(normalized, "_runtimeBinding", {
+      value: executionBinding,
+      enumerable: false,
+      configurable: false,
+      writable: false
+    });
+  }
+  assertRuntimeDocumentBinding(normalized);
+  bindResolvedActionTarget(normalized);
+
+  const target = normalized._resolvedTarget?.element
+    || (
+      normalized.ref || normalized.selector || normalized.text
+        ? resolveElement(normalized)
+        : document.activeElement || document.body
+    );
+  if (normalized.type === "click" && isVisualSurfaceElement(target)) {
+    throw createContentControlError(
+      "visual_action_required",
+      "A canvas or application surface requires a screenshot-bound visual action."
+    );
+  }
+  let point = null;
+  let nativeInput = null;
+  let mayNavigate = false;
+
+  if (normalized.type === "visual_click") {
+    prepareElementForAction(target);
+    resolveElement(normalized);
+    point = resolveVisualActionPoint(normalized, target);
+    nativeInput = { kind: "click" };
+  } else if (normalized.type === "press") {
+    prepareElementForAction(target);
+    if (normalized.ref || normalized.selector || normalized.text) {
+      resolveElement(normalized);
+    }
+    const key = String(normalized.key || "").trim();
+    if (!key) {
+      throw createContentControlError("native_key_missing", "Key is required for a press action.");
+    }
+    nativeInput = {
+      kind: "key",
+      key,
+      code: String(normalized.code || ""),
+      altKey: Boolean(normalized.altKey),
+      ctrlKey: Boolean(normalized.ctrlKey),
+      metaKey: Boolean(normalized.metaKey),
+      shiftKey: Boolean(normalized.shiftKey)
+    };
+    mayNavigate = key === "Enter" && actionMayUnloadPage(target);
+  } else {
+    prepareElementForAction(target);
+    resolveElement(normalized);
+    assistantPageState.visualOccluderCache = new WeakMap();
+    const compositeControl = normalized.type === "click"
+      ? findConcreteCompositeControl(target)
+      : null;
+    const nativePointerTarget = compositeControl || target;
+    point = findExposedPoint(nativePointerTarget);
+    if (!point && compositeControl && actionMayUnloadPage(compositeControl)) {
+      compositeControl.focus?.({ preventScroll: true });
+      nativeInput = {
+        kind: "key",
+        key: "Enter",
+        code: "Enter",
+        altKey: false,
+        ctrlKey: false,
+        metaKey: false,
+        shiftKey: false,
+        activation: "composite-control"
+      };
+      mayNavigate = true;
+    } else if (!point) {
+      throw createContentControlError(
+        "target_not_exposed",
+        "The resolved target is not exposed after scrolling or is covered by another element."
+      );
+    }
+    if (normalized.type === "fill") {
+      nativeInput = describeNativeFillInput(normalized, target);
+    } else if (!nativeInput) {
+      nativeInput = { kind: normalized.type === "hover" ? "hover" : "click" };
+      mayNavigate = normalized.type === "click" && actionMayUnloadPage(nativePointerTarget);
+    }
+  }
+
+  const before = captureActionState(normalized);
+  const undo = buildUndoForAction(normalized);
+  const preparationId = createNativeActionPreparationId();
+  assistantPageState.nativeActionPreparations.set(preparationId, {
+    action: normalized,
+    before,
+    undo,
+    createdAt: Date.now(),
+    documentId: assistantPageState.documentId,
+    mayNavigate,
+    nativeInput
+  });
+
+  return {
+    preparationId,
+    documentId: assistantPageState.documentId,
+    actionType: normalized.type,
+    point: point
+      ? {
+          x: Math.round(point.globalX),
+          y: Math.round(point.globalY)
+        }
+      : null,
+    nativeInput,
+    mayNavigate,
+    target: {
+      label: getAccessibleName(target) || target.tagName?.toLowerCase() || "",
+      tag: target.tagName?.toLowerCase() || ""
+    }
+  };
+}
+
+function describeNativeFillInput(action, element) {
+  if ("readOnly" in element && element.readOnly) {
+    throw createContentControlError("target_read_only", "The resolved element is read-only.");
+  }
+  const value = action.value === undefined || action.value === null ? "" : String(action.value);
+  if (isDomInstance(element, "HTMLInputElement")) {
+    const type = String(element.type || "text").toLowerCase();
+    if (["checkbox", "radio"].includes(type)) {
+      const checked = parseBoolean(action.checked ?? action.value);
+      if (type === "radio" && !checked) {
+        throw createContentControlError(
+          "native_fill_unsupported",
+          "A radio control cannot be cleared with native pointer input."
+        );
+      }
+      return {
+        kind: "toggle",
+        checked,
+        alreadyMatched: Boolean(element.checked) === checked
+      };
+    }
+    if (["file", "hidden", "button", "submit", "reset", "image"].includes(type)) {
+      throw createContentControlError(
+        "native_fill_unsupported",
+        `The input type "${type}" cannot be filled with native text input.`
+      );
+    }
+    return { kind: "text", value };
+  }
+  if (isDomInstance(element, "HTMLTextAreaElement") || element.isContentEditable) {
+    return { kind: "text", value };
+  }
+  throw createContentControlError(
+    "native_fill_unsupported",
+    "The resolved element cannot be filled with native browser input."
+  );
+}
+
+async function verifyNativeAction(preparationId, inputResult = {}) {
+  const key = String(preparationId || "");
+  const prepared = assistantPageState.nativeActionPreparations.get(key);
+  if (!prepared) {
+    throw createContentControlError(
+      "native_preparation_missing",
+      "The native input preparation expired or belongs to a different document."
+    );
+  }
+  assistantPageState.nativeActionPreparations.delete(key);
+  if (prepared.documentId !== assistantPageState.documentId) {
+    throw createContentControlError(
+      "stale_target",
+      "The document changed while native input was being dispatched."
+    );
+  }
+
+  const after = await observeInitialActionState(prepared.before, prepared.action, {
+    allowObservedMutation: true
+  });
+  const result = describeNativeActionResult(prepared, after, inputResult);
+  return {
+    ok: true,
+    action: prepared.action,
+    result,
+    undo: prepared.undo,
+    verification: compareActionStates(prepared.before, after, result)
+  };
+}
+
+function describeNativeActionResult(prepared, after, inputResult) {
+  const action = prepared.action;
+  const target = after?.target || prepared.before?.target || null;
+  const result = {
+    inputSequence: "browser-native",
+    inputMethod: String(inputResult?.inputMethod || "debugger-protocol"),
+    mayNavigate: Boolean(prepared.mayNavigate),
+    navigationExpected: Boolean(prepared.mayNavigate)
+  };
+  if (action.type === "fill") {
+    if (prepared.nativeInput?.kind === "toggle") {
+      result.checked = target?.checked;
+      result.skipped = Boolean(prepared.nativeInput.alreadyMatched);
+    } else {
+      result.value = target?.value;
+    }
+  } else if (action.type === "hover") {
+    result.hovered = target?.label || prepared.before?.target?.label || "target";
+  } else if (action.type === "press") {
+    result.pressed = prepared.nativeInput?.key || "";
+  } else {
+    result.clicked = String(
+      action.targetDescription
+      || target?.label
+      || prepared.before?.target?.label
+      || "target"
+    );
+  }
+  return result;
+}
+
+function cancelNativeAction(preparationId) {
+  const key = String(preparationId || "");
+  const cancelled = assistantPageState.nativeActionPreparations.delete(key);
+  return { cancelled };
+}
+
+function purgeExpiredNativeActionPreparations() {
+  const cutoff = Date.now() - 30000;
+  for (const [preparationId, prepared] of assistantPageState.nativeActionPreparations.entries()) {
+    if (Number(prepared?.createdAt || 0) < cutoff) {
+      assistantPageState.nativeActionPreparations.delete(preparationId);
+    }
+  }
+}
+
+function createNativeActionPreparationId() {
+  if (globalThis.crypto?.randomUUID) {
+    return globalThis.crypto.randomUUID();
+  }
+  return `native-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
 function indexContentExecutionBindings(actions, executionBindings) {
@@ -3733,6 +4383,33 @@ function scrollPage(action) {
 function visualClickSurface(action) {
   const surface = resolveElement(action);
   const tag = surface.tagName?.toLowerCase() || "";
+  const point = resolveVisualActionPoint(action, surface);
+  const { x, y, hitTarget, xNormalized, yNormalized } = point;
+  dispatchPointerSequence(surface, point, { activate: true });
+  resolveElement(action);
+  const ownerWindow = hitTarget.ownerDocument?.defaultView || window;
+  hitTarget.dispatchEvent(new ownerWindow.MouseEvent("click", {
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+    clientX: x,
+    clientY: y,
+    screenX: x,
+    screenY: y,
+    button: 0,
+    buttons: 0,
+    view: ownerWindow
+  }));
+  return {
+    clicked: String(action.targetDescription || getAccessibleName(surface) || tag),
+    surface: getAccessibleName(surface) || tag,
+    point: { x: Math.round(x), y: Math.round(y) },
+    normalizedPoint: { x: xNormalized, y: yNormalized },
+    inputSequence: "visual-pointer-mouse-click"
+  };
+}
+
+function resolveVisualActionPoint(action, surface) {
   if (!isVisualSurfaceElement(surface)) {
     throw createContentControlError(
       "visual_surface_changed",
@@ -3803,30 +4480,11 @@ function visualClickSurface(action) {
     y,
     globalX: x,
     globalY: y,
-    hitTarget
+    hitTarget,
+    xNormalized,
+    yNormalized
   };
-  dispatchPointerSequence(surface, point, { activate: true });
-  resolveElement(action);
-  const ownerWindow = hitTarget.ownerDocument?.defaultView || window;
-  hitTarget.dispatchEvent(new ownerWindow.MouseEvent("click", {
-    bubbles: true,
-    cancelable: true,
-    composed: true,
-    clientX: x,
-    clientY: y,
-    screenX: x,
-    screenY: y,
-    button: 0,
-    buttons: 0,
-    view: ownerWindow
-  }));
-  return {
-    clicked: String(action.targetDescription || getAccessibleName(surface) || tag),
-    surface: getAccessibleName(surface) || tag,
-    point: { x: Math.round(x), y: Math.round(y) },
-    normalizedPoint: { x: xNormalized, y: yNormalized },
-    inputSequence: "visual-pointer-mouse-click"
-  };
+  return point;
 }
 
 function isVisualSurfaceElement(element) {
@@ -4607,9 +5265,12 @@ function isElementTreeRendered(element) {
   while (current?.ownerDocument) {
     const style = getElementStyle(current);
     if (
-      style.display === "none" ||
-      style.contentVisibility === "hidden" ||
-      (current === element && ["hidden", "collapse"].includes(style.visibility))
+      current.hidden
+      || current.hasAttribute?.("inert")
+      || current.getAttribute?.("aria-hidden") === "true"
+      || style.display === "none"
+      || style.contentVisibility === "hidden"
+      || (current === element && ["hidden", "collapse"].includes(style.visibility))
     ) {
       return remember(false);
     }
