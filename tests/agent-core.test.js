@@ -154,6 +154,7 @@ test("initial decision contract resolves turn intent and planning in one structu
         kind: "answer",
         itemDescription: "",
         targetCount: null,
+        pageRange: null,
         fields: [],
         includeCriteria: [],
         formats: []
@@ -330,6 +331,7 @@ test("turn intent defaults to a standalone single-effect boundary and validates 
       kind: "effect",
       itemDescription: "",
       targetCount: null,
+      pageRange: null,
       fields: [],
       includeCriteria: [],
       formats: []
@@ -349,6 +351,7 @@ test("turn intent defaults to a standalone single-effect boundary and validates 
       kind: "effect",
       itemDescription: "",
       targetCount: null,
+      pageRange: null,
       fields: [],
       includeCriteria: [],
       formats: []
@@ -380,6 +383,7 @@ test("collection cardinality stays separate from semantic effect repetition", ()
       kind: "collection",
       itemDescription: "board post",
       targetCount: 40,
+      pageRange: null,
       fields: ["title"],
       includeCriteria: ["Exclude pinned notices."],
       formats: ["XLSX", "xlsx"]
@@ -394,6 +398,42 @@ test("collection cardinality stays separate from semantic effect repetition", ()
   assert.equal(intent.deliverable.targetCount, 40);
   assert.deepEqual(intent.deliverable.fields, ["title"]);
   assert.deepEqual(intent.deliverable.formats, ["xlsx"]);
+});
+
+test("page-bounded collection is valid without inventing a record count", () => {
+  const intent = Core.normalizeTurnIntent({
+    version: "1.0",
+    mode: "standalone",
+    objective: "Collect board contents from pages 1 through 3 and export XLSX.",
+    contextSummary: "",
+    repeatPolicy: "once",
+    repeatLimit: 1,
+    deliverable: {
+      kind: "collection",
+      itemDescription: "board post",
+      targetCount: null,
+      pageRange: { start: 1, end: 3 },
+      fields: ["title", "url"],
+      includeCriteria: [],
+      formats: ["xlsx"]
+    },
+    completionCriteria: ["Every unique post rendered on pages 1 through 3 is collected."],
+    reason: "The user bounded the collection by result pages, not row count."
+  });
+
+  assert.equal(Core.validateTurnIntent(intent).valid, true);
+  assert.equal(intent.repeatPolicy, "once");
+  assert.equal(intent.deliverable.targetCount, null);
+  assert.deepEqual(intent.deliverable.pageRange, { start: 1, end: 3 });
+
+  const invalid = Core.normalizeTurnIntent({
+    ...intent,
+    deliverable: {
+      ...intent.deliverable,
+      pageRange: { start: 3, end: 1 }
+    }
+  });
+  assert.equal(Core.validateTurnIntent(invalid).valid, false);
 });
 
 test("element search relaxations remove one semantic constraint at a time without jumping to an unfiltered search", () => {
@@ -683,27 +723,45 @@ test("routes concrete DOM work through a semantic direct-action contract", () =>
   assert.equal(validation.route.actions[0].target.roles[0], "button");
 });
 
-test("collection routing binds one semantic exemplar and rejects generic agent actions", () => {
+test("collection routing allows deterministic setup before one final semantic exemplar", () => {
+  const setupAction = {
+    type: "click",
+    target: {
+      query: "Free board",
+      roles: ["link"],
+      nearText: "Community",
+      reason: "Resolve the user-named collection entry point."
+    },
+    value: null,
+    checked: null,
+    key: null,
+    code: null,
+    direction: null,
+    amount: null,
+    url: null,
+    reason: "Open the requested board."
+  };
+  const extractAction = {
+    type: "extract",
+    target: {
+      query: "post title",
+      roles: ["link"],
+      nearText: "Free board",
+      reason: "Find one representative rendered record."
+    },
+    value: null,
+    checked: null,
+    key: null,
+    code: null,
+    direction: null,
+    amount: null,
+    url: null,
+    reason: "Expand the repeated rendered record structure."
+  };
   const valid = Core.validateExecutionRoute({
     version: "1.0",
     strategy: "collection",
-    actions: [{
-      type: "extract",
-      target: {
-        query: "post title",
-        roles: ["link"],
-        nearText: "Free board",
-        reason: "Find one representative rendered record."
-      },
-      value: null,
-      checked: null,
-      key: null,
-      code: null,
-      direction: null,
-      amount: null,
-      url: null,
-      reason: "Expand the repeated rendered record structure."
-    }],
+    actions: [setupAction, extractAction],
     evidenceSearch: {
       query: "post title",
       roles: ["link"],
@@ -714,6 +772,7 @@ test("collection routing binds one semantic exemplar and rejects generic agent a
     reason: "The user requested a bounded rendered collection."
   }, { deliverableKind: "collection" });
   assert.equal(valid.valid, true);
+  assert.deepEqual(valid.route.actions.map((action) => action.type), ["click", "extract"]);
 
   const invalid = Core.validateExecutionRoute({
     ...valid.route,
@@ -722,6 +781,13 @@ test("collection routing binds one semantic exemplar and rejects generic agent a
   }, { deliverableKind: "collection" });
   assert.equal(invalid.valid, false);
   assert.match(invalid.errors.join(" "), /cannot pre-authorize/i);
+
+  const extractBeforeTraversal = Core.validateExecutionRoute({
+    ...valid.route,
+    actions: [extractAction, setupAction]
+  }, { deliverableKind: "collection" });
+  assert.equal(extractBeforeTraversal.valid, false);
+  assert.match(extractBeforeTraversal.errors.join(" "), /final action/i);
 });
 
 test("compact answer and candidate-selection contracts stay strict", () => {

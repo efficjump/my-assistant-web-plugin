@@ -129,6 +129,7 @@
                       kind: "answer",
                       itemDescription: "",
                       targetCount: null,
+                      pageRange: null,
                       fields: [],
                       includeCriteria: [],
                       formats: []

@@ -5,8 +5,9 @@
   "license": "UNLICENSED",
   "description": "A verifiable AI browser agent for Chrome and Edge.",
   "scripts": {
-    "check": "node --check agent-core.js && node --check execution-contract.js && node --check ui-locales.js && node --check markdown-renderer.js && node --check workflow-artifacts.js && node --check bridge-protocol.js && node --check external-control-runtime.js && node --check background.js && node --check content.js && node --check panel.js && node --check bridge/server.mjs && node --check bridge/state.mjs && node --check tests/live-bridge-host.mjs",
+    "check": "node --check agent-core.js && node --check agent-v2/runtime.js && node --check agent-v2/provider-driver.js && node --check agent-v2/latency-strategy.js && node --check agent-v2/tool-registry.js && node --check agent-v2/run-store.js && node --check execution-contract.js && node --check ui-locales.js && node --check markdown-renderer.js && node --check workflow-artifacts.js && node --check bridge-protocol.js && node --check external-control-runtime.js && node --check background.js && node --check content.js && node --check panel.js && node --check bridge/server.mjs && node --check bridge/state.mjs && node --check tests/live-bridge-host.mjs",
     "test": "node --test tests/*.test.js",
+    "test:latency": "node --test tests/agent-latency.test.js tests/provider-contract.test.js",
     "test:bridge": "node --test tests/bridge-companion.test.mjs",
     "test:e2e": "node tests/extension-e2e.mjs",
     "test:e2e:local-harness": "node tests/extension-e2e.mjs --local-harness",

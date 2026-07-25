@@ -350,6 +350,36 @@
               </label>
 
               <label class="field">
+                <span>빠른 실행 모델</span>
+                <input id="fastModelInput" type="text" autocomplete="off" placeholder="비우면 기본 모델 사용">
+                <small class="field-help">빠른 모드의 일반 화면 판단·정책·검증에 먼저 사용하고, 시각 작업·교정·불확실한 결과는 기본 모델로 넘깁니다.</small>
+              </label>
+
+              <label class="field">
+                <span>응답 속도</span>
+                <select id="latencyModeInput">
+                  <option value="fast">빠르게</option>
+                  <option value="balanced">균형</option>
+                  <option value="thorough">정밀하게</option>
+                </select>
+                <small class="field-help">빠른 모드는 낮은 추론량과 짧은 응답을 우선하며 안전 검증에 실패하면 자동으로 정밀 경로로 전환합니다.</small>
+              </label>
+
+              <label class="field">
+                <span>API 처리 우선순위</span>
+                <select id="serviceTierInput">
+                  <option value="auto">기본 처리</option>
+                  <option value="priority">우선 처리</option>
+                </select>
+                <small class="field-help">OpenAI Responses의 우선 처리는 지연을 줄일 수 있지만 추가 비용이 발생할 수 있습니다.</small>
+              </label>
+
+              <label class="toggle-field">
+                <input id="rememberSuccessfulRoutesInput" type="checkbox">
+                <span>성공한 단순 작업의 빠른 경로를 이 브라우저에서 재사용</span>
+              </label>
+
+              <label class="field">
                 <span>Auth header name</span>
                 <input id="authHeaderNameInput" type="text" autocomplete="off" placeholder="Authorization">
               </label>
@@ -381,12 +411,17 @@
 
               <label class="field">
                 <span>Max output tokens</span>
-                <input id="maxOutputTokensInput" type="number" min="128" max="8192" step="64">
+                <input id="maxOutputTokensInput" type="number" min="128" max="32768" step="64">
               </label>
 
               <label class="toggle-field">
                 <input id="structuredOutputInput" type="checkbox">
                 <span>구조화 출력 사용</span>
+              </label>
+
+              <label class="toggle-field">
+                <input id="streamAiResponsesInput" type="checkbox">
+                <span>AI 응답을 실시간으로 수신</span>
               </label>
 
               <div class="settings-group-heading full">
@@ -845,6 +880,10 @@
     <script src="vendor/marked.umd.js"></script>
     <script src="markdown-renderer.js"></script>
     <script src="agent-core.js"></script>
+    <script src="agent-v2/runtime.js"></script>
+    <script src="agent-v2/provider-driver.js"></script>
+    <script src="agent-v2/latency-strategy.js"></script>
+    <script src="agent-v2/tool-registry.js"></script>
     <script src="execution-contract.js"></script>
     <script src="ui-locales.js"></script>
     <script src="workflow-artifacts.js"></script>

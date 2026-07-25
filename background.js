@@ -1,6 +1,10 @@
 if (typeof importScripts === "function") {
   importScripts(
     "agent-core.js",
+    "agent-v2/runtime.js",
+    "agent-v2/provider-driver.js",
+    "agent-v2/latency-strategy.js",
+    "agent-v2/run-store.js",
     "execution-contract.js",
     "bridge-protocol.js",
     "external-control-runtime.js"
@@ -16,10 +20,16 @@ const DEBUGGER_PROTOCOL_VERSION = "1.3";
 const NATIVE_INPUT_ACTION_TYPES = new Set(["click", "visual_click", "fill", "hover", "press"]);
 const BRIDGE_CREDENTIAL_STORAGE_KEY = "bridgeCredentialsV1";
 const SETTINGS_SECRET_STORAGE_KEY = "settingsSecrets";
+const AgentRuntimeV2 = globalThis.WebAgentRuntimeV2;
+const AgentProviderDriverV2 = globalThis.WebAgentProviderDriverV2;
+const AgentLatencyStrategyV2 = globalThis.WebAgentLatencyStrategyV2;
+const AgentRunStoreV2 = globalThis.WebAgentRunStoreV2;
 const mcpSessions = new Map();
 const mcpInitializations = new Map();
 const aiRequests = new Map();
+const aiCompatibilityCache = new Map();
 let mcpRequestId = 1;
+let agentRunStoreV2 = null;
 let externalControlRuntime = null;
 let externalControlReady = Promise.resolve(null);
 let bridgeSocket = null;
@@ -117,6 +127,25 @@ async function handleMessage(message, sender) {
       return executeBrowserActions(message.targetTabId, message.actions || []);
     case "CALL_AI":
       return callAiApi(message.settings || {}, message.request || {});
+    case "AGENT_RUN_PUT":
+      assertTrustedExtensionSender(sender);
+      return getAgentRunStoreV2().put(message.run || {});
+    case "AGENT_RUN_EVENT":
+      assertTrustedExtensionSender(sender);
+      return getAgentRunStoreV2().applyEvent(
+        String(message.runId || ""),
+        message.event || {},
+        message.initialRun || null
+      );
+    case "GET_AGENT_RUN":
+      assertTrustedExtensionSender(sender);
+      return getAgentRunStoreV2().get(String(message.runId || ""));
+    case "GET_ACTIVE_AGENT_RUN":
+      assertTrustedExtensionSender(sender);
+      return getAgentRunStoreV2().getActiveForTab(message.targetTabId);
+    case "DELETE_AGENT_RUN":
+      assertTrustedExtensionSender(sender);
+      return getAgentRunStoreV2().remove(String(message.runId || ""));
     case "CALL_PROVIDER_TOOL":
       return callProviderTool(message.settings || {}, message.toolCall || {});
     case "CANCEL_AI":
@@ -179,6 +208,22 @@ async function handleMessage(message, sender) {
     default:
       throw new Error(`Unknown message type: ${message?.type || "missing"}`);
   }
+}
+
+function getAgentRunStoreV2() {
+  if (agentRunStoreV2) {
+    return agentRunStoreV2;
+  }
+  if (!AgentRuntimeV2 || !AgentRunStoreV2) {
+    throw new Error("Agent Runtime v2 failed to load.");
+  }
+  if (!chrome.storage?.local) {
+    throw new Error("Agent Runtime v2 requires extension-local storage.");
+  }
+  agentRunStoreV2 = AgentRunStoreV2.createRunStore({
+    storage: chrome.storage.local
+  });
+  return agentRunStoreV2;
 }
 
 function assertTrustedExtensionSender(sender) {
@@ -246,6 +291,12 @@ async function collectPageContextFromFrames(targetTabId, options = {}) {
           targetSearchScope: options.targetSearchScope === "rendered-document"
             ? "rendered-document"
             : "visual-viewport",
+          collectionContinuation: (
+            Number(options.collectionContinuation?.frameId) === frame.frameId
+              ? options.collectionContinuation.contract || null
+              : null
+          ),
+          collectionContinuationOnly: Boolean(options.collectionContinuation),
           redactSensitiveData: options.redactSensitiveData,
           includeChildFrames: frameRecords.length === 1
         }
@@ -3354,7 +3405,15 @@ async function callAiApi(settings, request) {
   assertHttpEndpoint(endpoint, "AI API endpoint");
 
   const headers = buildHeaders(settings);
-  const initialBody = buildRequestBody(settings, request);
+  const profile = settings.apiProfile || "openai-responses";
+  const requestedModel = String(request.model || settings.model || "").trim();
+  const compatibility = getAiCompatibilityState(endpoint, profile, requestedModel);
+  const compatibilityBody = applyKnownAiCompatibility(
+    buildRequestBody(settings, request),
+    request,
+    compatibility
+  );
+  const initialBody = compatibilityBody.body;
   const requestId = String(request.requestId || crypto.randomUUID?.() || `ai-${Date.now()}-${Math.random()}`);
   const requestState = {
     controller: new AbortController(),
@@ -3363,7 +3422,15 @@ async function callAiApi(settings, request) {
   };
   aiRequests.set(requestId, requestState);
 
-  const timeoutMs = clampNumber(settings.requestTimeoutMs, 10000, 180000, 45000);
+  const configuredTimeoutMs = clampNumber(
+    settings.requestTimeoutMs,
+    10000,
+    180000,
+    45000
+  );
+  const timeoutMs = Number.isFinite(Number(request.timeoutMs))
+    ? clampNumber(request.timeoutMs, 5000, configuredTimeoutMs, configuredTimeoutMs)
+    : configuredTimeoutMs;
   const timeoutId = setTimeout(() => {
     requestState.reason = "timeout";
     requestState.controller.abort();
@@ -3374,12 +3441,16 @@ async function callAiApi(settings, request) {
       endpoint,
       headers,
       body: initialBody,
-      profile: settings.apiProfile || "openai-responses",
+      profile,
       settings,
+      request,
       taskType: request.taskType || "ai-request",
       requestId,
       requestState,
-      startedAt: requestState.startedAt
+      startedAt: requestState.startedAt,
+      compatibility,
+      compatibilityCacheHit: compatibilityBody.cacheHit,
+      onStreamEvent: (event) => emitAiStreamEvent(requestId, event)
     });
   } catch (error) {
     if (error?.name === "AbortError") {
@@ -3389,8 +3460,8 @@ async function callAiApi(settings, request) {
         cancelled.audit = finalizeAiRequestAudit(error.audit, {
           requestId,
           taskType: request.taskType || "ai-request",
-          profile: settings.apiProfile || "openai-responses",
-          model: settings.model || "",
+          profile,
+          model: requestedModel,
           outcome: "cancelled",
           durationMs: Date.now() - requestState.startedAt
         });
@@ -3401,8 +3472,8 @@ async function callAiApi(settings, request) {
       timedOut.audit = finalizeAiRequestAudit(error.audit, {
         requestId,
         taskType: request.taskType || "ai-request",
-        profile: settings.apiProfile || "openai-responses",
-        model: settings.model || "",
+        profile,
+        model: requestedModel,
         outcome: "timeout",
         durationMs: Date.now() - requestState.startedAt
       });
@@ -3411,8 +3482,8 @@ async function callAiApi(settings, request) {
     error.audit = finalizeAiRequestAudit(error.audit, {
       requestId,
       taskType: request.taskType || "ai-request",
-      profile: settings.apiProfile || "openai-responses",
-      model: settings.model || "",
+      profile,
+      model: requestedModel,
       outcome: error.audit?.outcome || "error",
       durationMs: Date.now() - requestState.startedAt
     });
@@ -3485,12 +3556,209 @@ function cancelAiRequest(requestId) {
   return { cancelled: true };
 }
 
+function getAiCompatibilityState(endpoint, profile, model) {
+  const key = JSON.stringify([
+    String(endpoint || ""),
+    String(profile || ""),
+    String(model || "")
+  ]);
+  if (!aiCompatibilityCache.has(key)) {
+    aiCompatibilityCache.set(key, {
+      key,
+      profile: String(profile || ""),
+      streaming: null,
+      nativeDecisionTool: null,
+      reasoningEffort: null,
+      textVerbosity: null,
+      promptCaching: null,
+      priorityProcessing: null,
+      reasoningContinuation: null,
+      structuredOutput: null,
+      updatedAt: Date.now()
+    });
+  }
+  return aiCompatibilityCache.get(key);
+}
+
+function applyKnownAiCompatibility(body, request, compatibility) {
+  let next = body;
+  const applied = [];
+  if (compatibility?.streaming === false && next?.stream === true) {
+    next = { ...next, stream: false };
+    applied.push("streaming");
+  }
+  if (
+    compatibility?.nativeDecisionTool === false
+    && hasNativeDecisionTool(next)
+  ) {
+    next = withoutNativeDecisionTool(next, request?.fallbackResponseSchema);
+    applied.push("nativeDecisionTool");
+  }
+  if (compatibility?.reasoningEffort === false && hasReasoningEffort(next)) {
+    next = withoutReasoningEffort(next);
+    applied.push("reasoningEffort");
+  }
+  if (compatibility?.textVerbosity === false && hasTextVerbosity(next)) {
+    next = withoutTextVerbosity(next);
+    applied.push("textVerbosity");
+  }
+  if (compatibility?.promptCaching === false && hasPromptCaching(next)) {
+    next = withoutPromptCaching(next);
+    applied.push("promptCaching");
+  }
+  if (
+    compatibility?.priorityProcessing === false
+    && hasPriorityProcessing(next)
+  ) {
+    next = withoutPriorityProcessing(next);
+    applied.push("priorityProcessing");
+  }
+  if (
+    compatibility?.reasoningContinuation === false
+    && hasReasoningContinuationInclude(next, compatibility.profile)
+  ) {
+    next = withoutReasoningContinuationInclude(next);
+    applied.push("reasoningContinuation");
+  }
+  if (
+    compatibility?.structuredOutput === false
+    && hasStructuredOutput(next, compatibility.profile)
+  ) {
+    next = withoutStructuredOutput(next, compatibility.profile);
+    applied.push("structuredOutput");
+  }
+  return {
+    body: next,
+    cacheHit: applied.length > 0,
+    applied
+  };
+}
+
+function updateAiCompatibilityFromResult(compatibility, body) {
+  if (!compatibility || !body || typeof body !== "object") {
+    return;
+  }
+  if (body.stream === true && compatibility.streaming === null) {
+    compatibility.streaming = true;
+  }
+  if (hasNativeDecisionTool(body) && compatibility.nativeDecisionTool === null) {
+    compatibility.nativeDecisionTool = true;
+  }
+  if (hasReasoningEffort(body) && compatibility.reasoningEffort === null) {
+    compatibility.reasoningEffort = true;
+  }
+  if (hasTextVerbosity(body) && compatibility.textVerbosity === null) {
+    compatibility.textVerbosity = true;
+  }
+  if (hasPromptCaching(body) && compatibility.promptCaching === null) {
+    compatibility.promptCaching = true;
+  }
+  if (
+    hasPriorityProcessing(body)
+    && compatibility.priorityProcessing === null
+  ) {
+    compatibility.priorityProcessing = true;
+  }
+  if (
+    hasReasoningContinuationInclude(body, compatibility.profile)
+    && compatibility.reasoningContinuation === null
+  ) {
+    compatibility.reasoningContinuation = true;
+  }
+  if (
+    hasStructuredOutput(body, compatibility.profile)
+    && compatibility.structuredOutput === null
+  ) {
+    compatibility.structuredOutput = true;
+  }
+  compatibility.updatedAt = Date.now();
+}
+
+function updateAiCompatibilityFromError(compatibility, feature, detail) {
+  if (!compatibility || !compatibilityErrorNamesFeature(feature, detail)) {
+    return;
+  }
+  compatibility[feature] = false;
+  compatibility.updatedAt = Date.now();
+}
+
+function compatibilityErrorNamesFeature(feature, detail) {
+  const value = String(detail || "").toLocaleLowerCase();
+  const terms = {
+    streaming: ["stream", "text/event-stream", "sse"],
+    nativeDecisionTool: [
+      "browser_agent_step",
+      "function",
+      "tool_choice",
+      "parallel_tool_calls",
+      "tools"
+    ],
+    reasoningEffort: [
+      "reasoning.effort",
+      "reasoning_effort",
+      "\"effort\"",
+      "'effort'"
+    ],
+    textVerbosity: [
+      "text.verbosity",
+      "text verbosity",
+      "\"verbosity\"",
+      "'verbosity'"
+    ],
+    promptCaching: [
+      "prompt_cache_key",
+      "prompt cache key",
+      "prompt caching"
+    ],
+    priorityProcessing: [
+      "service_tier",
+      "service tier",
+      "priority processing"
+    ],
+    reasoningContinuation: [
+      "reasoning.encrypted_content",
+      "encrypted_content",
+      "include"
+    ],
+    structuredOutput: [
+      "json_schema",
+      "response_format",
+      "structured output",
+      "text.format"
+    ]
+  }[feature] || [];
+  return terms.some((term) => value.includes(term));
+}
+
+function detectCompatibilityErrorFeature(detail, body, profile) {
+  const candidates = [
+    body?.stream === true ? "streaming" : "",
+    hasNativeDecisionTool(body) ? "nativeDecisionTool" : "",
+    hasReasoningEffort(body) ? "reasoningEffort" : "",
+    hasTextVerbosity(body) ? "textVerbosity" : "",
+    hasPromptCaching(body) ? "promptCaching" : "",
+    hasPriorityProcessing(body) ? "priorityProcessing" : "",
+    hasReasoningContinuationInclude(body, profile) ? "reasoningContinuation" : "",
+    hasStructuredOutput(body, profile) ? "structuredOutput" : ""
+  ].filter(Boolean);
+  return candidates.find((feature) => compatibilityErrorNamesFeature(feature, detail)) || "";
+}
+
 async function fetchAiWithRetry(options) {
   const maxRetries = clampNumber(options.settings.maxApiRetries, 0, 5, 2);
   const startedAt = Number(options.startedAt) || Date.now();
   let attemptsAllowed = maxRetries + 1;
   let body = options.body;
   let structuredFallbackUsed = false;
+  let streamingFallbackUsed = false;
+  let nativeToolFallbackUsed = false;
+  let reasoningEffortFallbackUsed = false;
+  let textVerbosityFallbackUsed = false;
+  let promptCachingFallbackUsed = false;
+  let priorityProcessingFallbackUsed = false;
+  let lowLatencyBundleFallbackUsed = false;
+  let reasoningContinuationFallbackUsed = false;
+  let incompleteRecoveryUsed = false;
   let lastError;
 
   for (let attempt = 0; attempt < attemptsAllowed; attempt += 1) {
@@ -3501,53 +3769,287 @@ async function fetchAiWithRetry(options) {
         body: JSON.stringify(body),
         signal: options.requestState.controller.signal
       });
-      const responseText = await response.text();
-      const parsed = parseJsonOrNull(responseText);
+      const payload = await readAiResponsePayload(response, {
+        profile: options.profile,
+        body,
+        startedAt,
+        responseReceivedAt: Date.now(),
+        onStreamEvent: options.onStreamEvent
+      });
+      const responseText = payload.responseText;
+      const parsed = payload.parsed;
       const resolvedText = resolveAiResponseText(parsed, responseText, options.settings.responsePath, options.profile);
+      const functionCalls = extractProviderFunctionCalls(parsed, options.profile);
       const audit = createAiRequestAudit({
         requestId: options.requestId,
         taskType: options.taskType,
         profile: options.profile,
-        model: parsed?.model || options.settings.model || "",
+        model: parsed?.model || options.request?.model || options.settings.model || "",
         status: response.status,
         responseId: parsed?.id || "",
         providerStatus: typeof parsed?.status === "string" ? parsed.status : "",
-        responseBytes: utf8ByteLength(responseText),
+        responseBytes: payload.responseBytes,
         outputChars: resolvedText.length,
         attempts: attempt + 1,
         durationMs: Date.now() - startedAt,
+        firstByteMs: payload.firstByteMs,
+        streamed: payload.streamed,
+        outputBudget: Number(body?.max_output_tokens ?? body?.max_tokens) || 0,
+        modelRole: options.request?.modelRole || "",
+        compatibilityCacheHit: Boolean(options.compatibilityCacheHit),
+        nativeToolFallbackUsed,
+        reasoningEffortFallbackUsed,
+        textVerbosityFallbackUsed,
+        promptCachingFallbackUsed,
+        priorityProcessingFallbackUsed,
         structuredOutputUsed: hasStructuredOutput(body, options.profile),
         structuredFallbackUsed,
+        streamingFallbackUsed,
+        requestedServiceTier: options.request?.serviceTier || "",
+        serviceTier: parsed?.service_tier || "",
         usage: normalizeAiUsage(parsed?.usage)
       });
 
       if (response.ok) {
-        if (!resolvedText.trim()) {
+        const providerState = AgentProviderDriverV2
+          ? AgentProviderDriverV2.getProviderTerminalState(options.profile, parsed)
+          : { terminal: true, complete: true, status: "" };
+        if (!providerState.complete) {
+          const recoveryBody = (
+            !incompleteRecoveryUsed
+            && AgentProviderDriverV2
+            && AgentProviderDriverV2.buildIncompleteRecoveryBody(body, parsed, options.settings)
+          );
+          if (recoveryBody) {
+            body = recoveryBody;
+            incompleteRecoveryUsed = true;
+            attemptsAllowed += 1;
+            continue;
+          }
+          const incompleteError = new Error(
+            providerState.status === "incomplete"
+              ? `AI 응답이 완료되지 않았습니다: ${providerState.reason || "unknown reason"}`
+              : `AI 응답이 최종 상태에 도달하지 않았습니다: ${providerState.status || "unknown status"}`
+          );
+          incompleteError.name = providerState.status === "incomplete"
+            ? "IncompleteAiResponseError"
+            : "NonTerminalAiResponseError";
+          incompleteError.audit = finalizeAiRequestAudit(audit, {
+            outcome: providerState.status === "incomplete" ? "incomplete_response" : "non_terminal_response",
+            emptyOutput: !resolvedText.trim() && !functionCalls.length
+          });
+          throw incompleteError;
+        }
+        if (!resolvedText.trim() && !functionCalls.length) {
           const emptyError = new Error(`AI API가 HTTP ${response.status}를 반환했지만 사용할 수 있는 응답 본문이 없습니다.`);
           emptyError.name = "EmptyAiResponseError";
           emptyError.audit = finalizeAiRequestAudit(audit, { outcome: "empty_response", emptyOutput: true });
           throw emptyError;
         }
+        updateAiCompatibilityFromResult(options.compatibility, body);
         return {
           requestId: options.requestId,
           responseId: parsed?.id || "",
           status: response.status,
           text: resolvedText,
+          functionCalls,
           json: parsed,
           rawText: responseText,
           attempts: attempt + 1,
           structuredOutputUsed: hasStructuredOutput(body, options.profile),
           structuredFallbackUsed,
-          audit: finalizeAiRequestAudit(audit, { outcome: "success", emptyOutput: false })
+          continuation: AgentProviderDriverV2
+            ? AgentProviderDriverV2.buildContinuation({
+                profile: options.profile,
+                request: options.request || {},
+                response: parsed,
+                body,
+                maxChars: options.request?.providerContinuationMaxChars
+              })
+            : null,
+          audit: finalizeAiRequestAudit(audit, {
+            outcome: "success",
+            emptyOutput: false
+          })
         };
       }
 
       const detail = resolvedText || responseText;
+      const rejectedFeature = detectCompatibilityErrorFeature(
+        detail,
+        body,
+        options.profile
+      );
+      if (
+        !streamingFallbackUsed
+        && body?.stream === true
+        && (!rejectedFeature || rejectedFeature === "streaming")
+        && [400, 404, 415, 422].includes(response.status)
+      ) {
+        updateAiCompatibilityFromError(
+          options.compatibility,
+          "streaming",
+          detail
+        );
+        body = { ...body, stream: false };
+        streamingFallbackUsed = true;
+        attemptsAllowed += 1;
+        continue;
+      }
+      if (
+        !nativeToolFallbackUsed
+        && hasNativeDecisionTool(body)
+        && (!rejectedFeature || rejectedFeature === "nativeDecisionTool")
+        && [400, 404, 415, 422].includes(response.status)
+      ) {
+        updateAiCompatibilityFromError(
+          options.compatibility,
+          "nativeDecisionTool",
+          detail
+        );
+        body = withoutNativeDecisionTool(
+          body,
+          options.request?.fallbackResponseSchema
+        );
+        nativeToolFallbackUsed = true;
+        attemptsAllowed += 1;
+        continue;
+      }
+      if (
+        !lowLatencyBundleFallbackUsed
+        && !rejectedFeature
+        && [400, 404, 415, 422].includes(response.status)
+        && (
+          hasReasoningEffort(body)
+          || hasTextVerbosity(body)
+          || hasPromptCaching(body)
+          || hasPriorityProcessing(body)
+        )
+      ) {
+        const removedFeatures = [];
+        if (hasReasoningEffort(body)) {
+          body = withoutReasoningEffort(body);
+          reasoningEffortFallbackUsed = true;
+          removedFeatures.push("reasoningEffort");
+        }
+        if (hasTextVerbosity(body)) {
+          body = withoutTextVerbosity(body);
+          textVerbosityFallbackUsed = true;
+          removedFeatures.push("textVerbosity");
+        }
+        if (hasPromptCaching(body)) {
+          body = withoutPromptCaching(body);
+          promptCachingFallbackUsed = true;
+          removedFeatures.push("promptCaching");
+        }
+        if (hasPriorityProcessing(body)) {
+          body = withoutPriorityProcessing(body);
+          priorityProcessingFallbackUsed = true;
+          removedFeatures.push("priorityProcessing");
+        }
+        for (const feature of removedFeatures) {
+          if (options.compatibility) {
+            options.compatibility[feature] = false;
+          }
+        }
+        if (removedFeatures.length && options.compatibility) {
+          options.compatibility.updatedAt = Date.now();
+        }
+        lowLatencyBundleFallbackUsed = true;
+        attemptsAllowed += 1;
+        continue;
+      }
+      if (
+        !reasoningEffortFallbackUsed
+        && hasReasoningEffort(body)
+        && (!rejectedFeature || rejectedFeature === "reasoningEffort")
+        && [400, 404, 415, 422].includes(response.status)
+      ) {
+        updateAiCompatibilityFromError(
+          options.compatibility,
+          "reasoningEffort",
+          detail
+        );
+        body = withoutReasoningEffort(body);
+        reasoningEffortFallbackUsed = true;
+        attemptsAllowed += 1;
+        continue;
+      }
+      if (
+        !textVerbosityFallbackUsed
+        && hasTextVerbosity(body)
+        && (!rejectedFeature || rejectedFeature === "textVerbosity")
+        && [400, 404, 415, 422].includes(response.status)
+      ) {
+        updateAiCompatibilityFromError(
+          options.compatibility,
+          "textVerbosity",
+          detail
+        );
+        body = withoutTextVerbosity(body);
+        textVerbosityFallbackUsed = true;
+        attemptsAllowed += 1;
+        continue;
+      }
+      if (
+        !promptCachingFallbackUsed
+        && hasPromptCaching(body)
+        && (!rejectedFeature || rejectedFeature === "promptCaching")
+        && [400, 404, 415, 422].includes(response.status)
+      ) {
+        updateAiCompatibilityFromError(
+          options.compatibility,
+          "promptCaching",
+          detail
+        );
+        body = withoutPromptCaching(body);
+        promptCachingFallbackUsed = true;
+        attemptsAllowed += 1;
+        continue;
+      }
+      if (
+        !priorityProcessingFallbackUsed
+        && hasPriorityProcessing(body)
+        && (!rejectedFeature || rejectedFeature === "priorityProcessing")
+        && [400, 404, 415, 422].includes(response.status)
+      ) {
+        updateAiCompatibilityFromError(
+          options.compatibility,
+          "priorityProcessing",
+          detail
+        );
+        body = withoutPriorityProcessing(body);
+        priorityProcessingFallbackUsed = true;
+        attemptsAllowed += 1;
+        continue;
+      }
+      if (
+        !reasoningContinuationFallbackUsed
+        && hasReasoningContinuationInclude(body, options.profile)
+        && (!rejectedFeature || rejectedFeature === "reasoningContinuation")
+        && [400, 404, 415, 422].includes(response.status)
+      ) {
+        updateAiCompatibilityFromError(
+          options.compatibility,
+          "reasoningContinuation",
+          detail
+        );
+        body = withoutReasoningContinuationInclude(body);
+        reasoningContinuationFallbackUsed = true;
+        attemptsAllowed += 1;
+        continue;
+      }
       if (
         !structuredFallbackUsed &&
         hasStructuredOutput(body, options.profile) &&
+        (!rejectedFeature || rejectedFeature === "structuredOutput") &&
         [400, 404, 415, 422].includes(response.status)
       ) {
+        updateAiCompatibilityFromError(
+          options.compatibility,
+          "structuredOutput",
+          detail
+        );
         body = withoutStructuredOutput(body, options.profile);
         structuredFallbackUsed = true;
         attemptsAllowed += 1;
@@ -3564,14 +4066,18 @@ async function fetchAiWithRetry(options) {
       lastError = apiError;
       await abortableDelay(retryDelayMs(attempt, response.headers.get("retry-after")), options.requestState.controller.signal);
     } catch (error) {
-      if (error?.name === "AbortError" || (error?.name === "AiApiError" && !isRetryableStatus(error.status))) {
+      if (
+        error?.name === "AbortError"
+        || ["IncompleteAiResponseError", "NonTerminalAiResponseError"].includes(error?.name)
+        || (error?.name === "AiApiError" && !isRetryableStatus(error.status))
+      ) {
         throw error;
       }
       error.audit = finalizeAiRequestAudit(error.audit, {
         requestId: options.requestId,
         taskType: options.taskType,
         profile: options.profile,
-        model: options.settings.model || "",
+        model: options.request?.model || options.settings.model || "",
         attempts: attempt + 1,
         durationMs: Date.now() - startedAt,
         outcome: error.audit?.outcome || "network_error"
@@ -3585,6 +4091,220 @@ async function fetchAiWithRetry(options) {
   }
 
   throw lastError || new Error("AI API 요청에 실패했습니다.");
+}
+
+async function readAiResponsePayload(response, options = {}) {
+  const startedAt = Number(options.startedAt) || Date.now();
+  const responseReceivedAt = Number(options.responseReceivedAt) || Date.now();
+  const contentType = String(response.headers?.get?.("content-type") || "").toLocaleLowerCase();
+  if (
+    options.body?.stream === true
+    && options.profile === "openai-responses"
+    && contentType.includes("text/event-stream")
+    && response.body?.getReader
+  ) {
+    return readOpenAiResponsesEventStream(response.body, {
+      startedAt,
+      onStreamEvent: options.onStreamEvent
+    });
+  }
+  const responseText = await response.text();
+  return {
+    responseText,
+    parsed: parseJsonOrNull(responseText),
+    firstByteMs: Math.max(0, responseReceivedAt - startedAt),
+    streamed: false,
+    responseBytes: utf8ByteLength(responseText)
+  };
+}
+
+async function readOpenAiResponsesEventStream(stream, options = {}) {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  const startedAt = Number(options.startedAt) || Date.now();
+  let buffer = "";
+  let rawBytes = 0;
+  let firstByteMs = null;
+  let finalResponse = null;
+  let terminalError = null;
+
+  const consumeBuffer = (flush = false) => {
+    const blocks = buffer.split(/\r?\n\r?\n/u);
+    if (!flush) {
+      buffer = blocks.pop() || "";
+    } else {
+      buffer = "";
+    }
+    for (const block of blocks) {
+      const event = parseAiSseEvent(block);
+      if (!event) {
+        continue;
+      }
+      const eventType = String(event.type || "");
+      if (
+        ["response.completed", "response.incomplete", "response.failed"].includes(eventType)
+        && event.response
+      ) {
+        finalResponse = event.response;
+      } else if (eventType === "error") {
+        terminalError = event.error || event;
+      }
+      options.onStreamEvent?.(sanitizeAiStreamEvent(event));
+    }
+  };
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      if (firstByteMs === null) {
+        firstByteMs = Date.now() - startedAt;
+      }
+      rawBytes += value?.byteLength || 0;
+      buffer += decoder.decode(value, { stream: true });
+      consumeBuffer(false);
+    }
+    buffer += decoder.decode();
+    if (buffer.trim()) {
+      buffer += "\n\n";
+      consumeBuffer(true);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  if (!finalResponse) {
+    if (terminalError) {
+      finalResponse = {
+        status: "failed",
+        error: terminalError,
+        output: []
+      };
+    } else {
+      throw new Error("Streaming AI response ended without a terminal response event.");
+    }
+  }
+  const responseText = JSON.stringify(finalResponse);
+  return {
+    responseText,
+    parsed: finalResponse,
+    firstByteMs: firstByteMs ?? (Date.now() - startedAt),
+    streamed: true,
+    responseBytes: rawBytes || utf8ByteLength(responseText)
+  };
+}
+
+function parseAiSseEvent(block) {
+  const data = String(block || "")
+    .split(/\r?\n/u)
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice(5).trimStart())
+    .join("\n")
+    .trim();
+  if (!data || data === "[DONE]") {
+    return null;
+  }
+  return parseJsonOrNull(data);
+}
+
+function sanitizeAiStreamEvent(event) {
+  const type = String(event?.type || "");
+  return {
+    type,
+    sequenceNumber: Number(event?.sequence_number) || 0,
+    outputIndex: Number(event?.output_index) || 0,
+    deltaChars: typeof event?.delta === "string" ? event.delta.length : 0,
+    hasTerminalResponse: Boolean(
+      event?.response
+      && ["response.completed", "response.incomplete", "response.failed"].includes(type)
+    )
+  };
+}
+
+function emitAiStreamEvent(requestId, event) {
+  try {
+    const pending = chrome.runtime?.sendMessage?.({
+      type: "AI_STREAM_EVENT",
+      requestId: String(requestId || ""),
+      event
+    });
+    pending?.catch?.(() => {});
+  } catch {
+    // Streaming progress is advisory and must never fail the model request.
+  }
+}
+
+function extractProviderFunctionCalls(parsed, profile) {
+  if (!parsed || typeof parsed !== "object") {
+    return [];
+  }
+  if (profile === "openai-responses") {
+    return (Array.isArray(parsed.output) ? parsed.output : [])
+      .filter((item) => item?.type === "function_call" && item.call_id && item.name)
+      .map((item) => normalizeProviderFunctionCall({
+        callId: item.call_id,
+        itemId: item.id,
+        name: item.name,
+        argumentsText: item.arguments
+      }));
+  }
+  if (profile === "openai-chat") {
+    return (parsed.choices?.[0]?.message?.tool_calls || [])
+      .filter((item) => item?.id && item?.function?.name)
+      .map((item) => normalizeProviderFunctionCall({
+        callId: item.id,
+        itemId: item.id,
+        name: item.function.name,
+        argumentsText: item.function.arguments
+      }));
+  }
+  return [];
+}
+
+function normalizeProviderFunctionCall(value = {}) {
+  const argumentsText = String(value.argumentsText || "{}");
+  const parsedArguments = parseJsonOrNull(argumentsText);
+  return {
+    callId: String(value.callId || ""),
+    itemId: String(value.itemId || ""),
+    name: String(value.name || ""),
+    arguments: parsedArguments && typeof parsedArguments === "object" && !Array.isArray(parsedArguments)
+      ? parsedArguments
+      : {},
+    argumentsText,
+    parseError: parsedArguments && typeof parsedArguments === "object" && !Array.isArray(parsedArguments)
+      ? ""
+      : "Function arguments are not a JSON object."
+  };
+}
+
+function hasNativeDecisionTool(body) {
+  return Array.isArray(body?.tools)
+    && body.tools.some((tool) => (
+      tool?.type === "function"
+      && tool?.name === "browser_agent_step"
+    ));
+}
+
+function withoutNativeDecisionTool(body, fallbackResponseSchema) {
+  const next = { ...body };
+  delete next.tools;
+  delete next.tool_choice;
+  delete next.parallel_tool_calls;
+  if (fallbackResponseSchema && typeof fallbackResponseSchema === "object") {
+    next.text = {
+      ...(next.text || {}),
+      format: {
+        type: "json_schema",
+        name: "browser_agent_decision",
+        strict: true,
+        schema: fallbackResponseSchema
+      }
+    };
+  }
+  return next;
 }
 
 async function listMcpTools(settings) {
@@ -4513,21 +5233,22 @@ function hasHeader(headers, name) {
 
 function buildRequestBody(settings, request) {
   const profile = settings.apiProfile || "openai-responses";
-  const model = String(settings.model || "").trim();
+  const model = String(request.model || settings.model || "").trim();
   const temperature = Number.isFinite(Number(settings.temperature))
     ? Number(settings.temperature)
     : 0.2;
+  const maxOutputTokens = resolveRequestMaxOutputTokens(settings, request, 2000);
 
   if (profile === "anthropic-messages") {
     const body = {
-      max_tokens: Number(settings.maxOutputTokens) || 1200,
+      max_tokens: maxOutputTokens,
       system: request.system || "",
-      messages: [
-        {
-          role: "user",
-          content: buildAnthropicUserContent(request)
-        }
-      ]
+      messages: AgentProviderDriverV2
+        ? AgentProviderDriverV2.buildAnthropicMessages(request)
+        : [{
+            role: "user",
+            content: buildAnthropicUserContent(request)
+          }]
     };
     if (model) {
       body.model = model;
@@ -4547,13 +5268,33 @@ function buildRequestBody(settings, request) {
       store: false,
       instructions: request.system || "",
       input: buildOpenAiResponsesInput(request),
-      max_output_tokens: Number(settings.maxOutputTokens) || 2000
+      max_output_tokens: maxOutputTokens,
+      include: Array.from(new Set([
+        "reasoning.encrypted_content",
+        ...(Array.isArray(request.include) ? request.include : [])
+      ]))
     };
     if (model) {
       body.model = model;
     }
+    const reasoningEffort = String(request.reasoningEffort || "").trim();
+    if (reasoningEffort) {
+      body.reasoning = { effort: reasoningEffort };
+    }
+    const textVerbosity = String(request.textVerbosity || "").trim();
+    if (textVerbosity) {
+      body.text = { verbosity: textVerbosity };
+    }
+    if (request.serviceTier === "priority") {
+      body.service_tier = "priority";
+    }
+    const promptCacheKey = buildPromptCacheKey(settings, request, model);
+    if (promptCacheKey) {
+      body.prompt_cache_key = promptCacheKey;
+    }
     if (settings.structuredOutput !== false && request.responseSchema) {
       body.text = {
+        ...(body.text || {}),
         format: {
           type: "json_schema",
           name: "browser_agent_decision",
@@ -4565,16 +5306,19 @@ function buildRequestBody(settings, request) {
     if (Array.isArray(request.providerTools) && request.providerTools.length) {
       body.tools = request.providerTools;
       body.tool_choice = request.providerToolChoice || "auto";
-      if (Array.isArray(request.include) && request.include.length) {
-        body.include = request.include;
+      if (hasNativeDecisionTool(body)) {
+        body.parallel_tool_calls = false;
       }
+    }
+    if (request.stream === true) {
+      body.stream = true;
     }
     return body;
   }
 
   const body = {
     messages: buildOpenAiMessages(request),
-    max_tokens: Number(settings.maxOutputTokens) || 2000
+    max_tokens: maxOutputTokens
   };
   if (model) {
     body.model = model;
@@ -4595,7 +5339,48 @@ function buildRequestBody(settings, request) {
   return body;
 }
 
+function buildPromptCacheKey(settings, request, model) {
+  if (
+    request?.promptCache !== true
+    || (settings?.apiProfile || "openai-responses") !== "openai-responses"
+  ) {
+    return "";
+  }
+  const core = globalThis.WebAgentCore;
+  const scope = String(request.promptCacheScope || "").trim();
+  if (!scope || !core?.stableStringify || !core?.hashString) {
+    return "";
+  }
+  const runtimeIdentity = String(
+    chrome.runtime?.id
+    || chrome.runtime?.getManifest?.()?.version
+    || "local-extension"
+  );
+  const canonical = core.stableStringify({
+    runtimeIdentity,
+    profile: settings.apiProfile || "openai-responses",
+    model: String(model || ""),
+    scope
+  });
+  return `pc-${core.hashString(canonical)}`.slice(0, 64);
+}
+
+function resolveRequestMaxOutputTokens(settings, request, fallback) {
+  const requested = Number(request?.maxOutputTokens);
+  if (Number.isFinite(requested) && requested > 0) {
+    return Math.floor(requested);
+  }
+  const configured = Number(settings?.maxOutputTokens);
+  if (Number.isFinite(configured) && configured > 0) {
+    return Math.floor(configured);
+  }
+  return fallback;
+}
+
 function buildOpenAiResponsesInput(request) {
+  if (AgentProviderDriverV2) {
+    return AgentProviderDriverV2.buildOpenAiResponsesInput(request);
+  }
   const content = [{ type: "input_text", text: request.user || "" }];
   if (request.screenshotDataUrl) {
     content.push({ type: "input_image", image_url: request.screenshotDataUrl });
@@ -4604,6 +5389,9 @@ function buildOpenAiResponsesInput(request) {
 }
 
 function buildOpenAiMessages(request) {
+  if (AgentProviderDriverV2) {
+    return AgentProviderDriverV2.buildOpenAiMessages(request);
+  }
   const messages = [];
   if (request.system) {
     messages.push({ role: "system", content: request.system });
@@ -4655,7 +5443,7 @@ function buildCustomBody(settings, request) {
 
   const template = JSON.parse(templateSource);
   const values = {
-    model: String(settings.model || ""),
+    model: String(request.model || settings.model || ""),
     system: request.system || "",
     prompt: request.user || "",
     screenshotDataUrl: request.screenshotDataUrl || "",
@@ -4811,6 +5599,12 @@ function normalizeAiUsage(usage) {
     source.prompt_tokens_details?.cached_tokens,
     source.cache_read_input_tokens
   );
+  const cacheWriteTokens = firstFiniteNumber(
+    source.cacheWriteTokens,
+    source.input_tokens_details?.cache_write_tokens,
+    source.prompt_tokens_details?.cache_write_tokens,
+    source.cache_creation_input_tokens
+  );
   const reasoningTokens = firstFiniteNumber(
     source.reasoningTokens,
     source.output_tokens_details?.reasoning_tokens,
@@ -4821,12 +5615,16 @@ function normalizeAiUsage(usage) {
     outputTokens,
     totalTokens,
     cachedTokens,
+    cacheWriteTokens,
     reasoningTokens
   };
 }
 
 function firstFiniteNumber(...values) {
   for (const value of values) {
+    if (value === null || value === undefined || value === "") {
+      continue;
+    }
     const number = Number(value);
     if (Number.isFinite(number) && number >= 0) {
       return number;
@@ -4855,6 +5653,19 @@ function finalizeAiRequestAudit(base = {}, overrides = {}) {
     outputChars: firstFiniteNumber(source.outputChars) || 0,
     attempts: firstFiniteNumber(source.attempts) || 0,
     durationMs: Math.round(firstFiniteNumber(source.durationMs) || 0),
+    firstByteMs: firstFiniteNumber(source.firstByteMs),
+    streamed: Boolean(source.streamed),
+    compatibilityCacheHit: Boolean(source.compatibilityCacheHit),
+    streamingFallbackUsed: Boolean(source.streamingFallbackUsed),
+    nativeToolFallbackUsed: Boolean(source.nativeToolFallbackUsed),
+    reasoningEffortFallbackUsed: Boolean(source.reasoningEffortFallbackUsed),
+    textVerbosityFallbackUsed: Boolean(source.textVerbosityFallbackUsed),
+    promptCachingFallbackUsed: Boolean(source.promptCachingFallbackUsed),
+    priorityProcessingFallbackUsed: Boolean(source.priorityProcessingFallbackUsed),
+    requestedServiceTier: String(source.requestedServiceTier || ""),
+    serviceTier: String(source.serviceTier || ""),
+    outputBudget: firstFiniteNumber(source.outputBudget) || 0,
+    modelRole: String(source.modelRole || ""),
     structuredOutputUsed: Boolean(source.structuredOutputUsed),
     structuredFallbackUsed: Boolean(source.structuredFallbackUsed),
     emptyOutput: Boolean(source.emptyOutput),
@@ -4945,9 +5756,90 @@ function hasStructuredOutput(body, profile) {
 function withoutStructuredOutput(body, profile) {
   const clone = structuredClone(body);
   if (profile === "openai-responses") {
-    delete clone.text;
+    if (clone.text && typeof clone.text === "object") {
+      delete clone.text.format;
+      if (!Object.keys(clone.text).length) {
+        delete clone.text;
+      }
+    }
   } else {
     delete clone.response_format;
+  }
+  return clone;
+}
+
+function hasReasoningEffort(body) {
+  return Boolean(
+    body?.reasoning
+    && typeof body.reasoning === "object"
+    && String(body.reasoning.effort || "").trim()
+  );
+}
+
+function withoutReasoningEffort(body) {
+  const clone = structuredClone(body);
+  if (clone.reasoning && typeof clone.reasoning === "object") {
+    delete clone.reasoning.effort;
+    if (!Object.keys(clone.reasoning).length) {
+      delete clone.reasoning;
+    }
+  }
+  return clone;
+}
+
+function hasTextVerbosity(body) {
+  return Boolean(
+    body?.text
+    && typeof body.text === "object"
+    && String(body.text.verbosity || "").trim()
+  );
+}
+
+function withoutTextVerbosity(body) {
+  const clone = structuredClone(body);
+  if (clone.text && typeof clone.text === "object") {
+    delete clone.text.verbosity;
+    if (!Object.keys(clone.text).length) {
+      delete clone.text;
+    }
+  }
+  return clone;
+}
+
+function hasPromptCaching(body) {
+  return Boolean(String(body?.prompt_cache_key || "").trim());
+}
+
+function withoutPromptCaching(body) {
+  const clone = structuredClone(body);
+  delete clone.prompt_cache_key;
+  delete clone.prompt_cache_options;
+  return clone;
+}
+
+function hasPriorityProcessing(body) {
+  return body?.service_tier === "priority";
+}
+
+function withoutPriorityProcessing(body) {
+  const clone = structuredClone(body);
+  delete clone.service_tier;
+  return clone;
+}
+
+function hasReasoningContinuationInclude(body, profile) {
+  return profile === "openai-responses"
+    && Array.isArray(body?.include)
+    && body.include.includes("reasoning.encrypted_content");
+}
+
+function withoutReasoningContinuationInclude(body) {
+  const clone = structuredClone(body);
+  clone.include = (clone.include || []).filter(
+    (item) => item !== "reasoning.encrypted_content"
+  );
+  if (!clone.include.length) {
+    delete clone.include;
   }
   return clone;
 }

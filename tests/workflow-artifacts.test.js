@@ -149,6 +149,40 @@ test("two 20-row content batches reach an exact 40-row target", () => {
   assert.equal(second.addedCount, 20);
 });
 
+test("page-bounded ledger reaches an inclusive range without a fabricated row target", () => {
+  let result = null;
+  for (let page = 1; page <= 3; page += 1) {
+    result = Artifacts.mergeCollectionBatch(result?.dataset || null, {
+      collectionId: "three-pages",
+      collectionName: "Three board pages",
+      targetCount: null,
+      pageRange: { start: 1, end: 3 },
+      pageIdentity: {
+        url: `https://example.test/board?page=${page}`,
+        ordinal: page,
+        sourceSliceDigest: `slice-${page}`
+      },
+      records: [
+        {
+          key: `post-${page}`,
+          title: `Post ${page}`,
+          url: `https://example.test/post/${page}`
+        }
+      ]
+    });
+    assert.equal(
+      result.dataset.status,
+      page === 3 ? "reached" : "collecting"
+    );
+  }
+
+  assert.equal(result.dataset.targetCount, null);
+  assert.deepEqual(result.dataset.pageRange, { start: 1, end: 3 });
+  assert.deepEqual(result.dataset.pages.map((page) => page.ordinal), [1, 2, 3]);
+  assert.equal(result.dataset.rows.length, 3);
+  assert.equal(Artifacts.datasetBoundaryReached(result.dataset), true);
+});
+
 test("CSV derives dynamic columns, uses CRLF and neutralizes spreadsheet formulas", () => {
   const csv = Artifacts.datasetToCsv({
     version: "1.0",

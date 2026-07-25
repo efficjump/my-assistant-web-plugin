@@ -187,6 +187,36 @@
     return count;
   }
 
+  function normalizePageRange(value, label = "pageRange") {
+    if (value === null || typeof value === "undefined") {
+      return null;
+    }
+    assertPlainObject(value, label);
+    const start = Number(value.start);
+    const end = Number(value.end);
+    if (
+      !Number.isSafeInteger(start)
+      || !Number.isSafeInteger(end)
+      || start < 1
+      || end < start
+      || end - start + 1 > 250
+    ) {
+      throw new RangeError(`${label} must be an inclusive positive range spanning at most 250 pages.`);
+    }
+    return { start, end };
+  }
+
+  function normalizePageOrdinal(value, label = "pageIdentity.ordinal") {
+    if (value === null || typeof value === "undefined" || value === "") {
+      return null;
+    }
+    const ordinal = Number(value);
+    if (!Number.isSafeInteger(ordinal) || ordinal < 1) {
+      throw new RangeError(`${label} must be a positive integer.`);
+    }
+    return ordinal;
+  }
+
   function normalizeRequiredString(value, label, maxLength = 1000) {
     if (typeof value !== "string" || !value.trim()) {
       throw new TypeError(`${label} must be a non-empty string.`);
@@ -249,7 +279,8 @@
         identity: url || identity,
         url: url || "",
         documentId: "",
-        sourceSliceDigest: ""
+        sourceSliceDigest: "",
+        ordinal: null
       };
     }
     const source = isPlainObject(value) ? value : {};
@@ -267,13 +298,46 @@
     );
     const documentId = normalizeOptionalString(source.documentId, "pageIdentity.documentId", 1000);
     const suppliedIdentity = normalizeOptionalString(source.identity, "pageIdentity.identity", 8000);
+    const ordinal = normalizePageOrdinal(
+      source.ordinal ?? provenanceSource.pageOrdinal,
+      "pageIdentity.ordinal"
+    );
     const identity = url
       ? `${url}${sourceSliceDigest ? `|slice:${sourceSliceDigest}` : ""}`
       : suppliedIdentity || (sourceSliceDigest ? `slice:${sourceSliceDigest}` : "");
     if (!identity) {
       throw new TypeError("pageIdentity requires a URL, sourceSliceDigest, or identity.");
     }
-    return { identity, url, documentId, sourceSliceDigest };
+    return { identity, url, documentId, sourceSliceDigest, ordinal };
+  }
+
+  function pageRangeCovered(pages, pageRange) {
+    if (!pageRange) {
+      return true;
+    }
+    const ordinals = new Set(
+      (Array.isArray(pages) ? pages : [])
+        .filter((page) => !page?.repeated)
+        .map((page) => Number(page?.ordinal))
+        .filter((ordinal) => Number.isSafeInteger(ordinal))
+    );
+    for (let ordinal = pageRange.start; ordinal <= pageRange.end; ordinal += 1) {
+      if (!ordinals.has(ordinal)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function datasetBoundaryReached(dataset) {
+    const hasTargetCount = dataset.targetCount !== null;
+    const hasPageRange = Boolean(dataset.pageRange);
+    if (!hasTargetCount && !hasPageRange) {
+      return false;
+    }
+    const targetReached = !hasTargetCount || dataset.rows.length >= dataset.targetCount;
+    const rangeReached = !hasPageRange || pageRangeCovered(dataset.pages, dataset.pageRange);
+    return targetReached && rangeReached;
   }
 
   function normalizeColumns(columns) {
@@ -366,12 +430,13 @@
         repeated: Boolean(entry.repeated)
       };
     });
+    const pageRange = normalizePageRange(input.pageRange);
     let status = DATASET_STATUSES.has(input.status) ? input.status : "collecting";
     let stallReason = input.stallReason === STALL_REASONS.REPEATED_PAGE
       || input.stallReason === STALL_REASONS.ZERO_NEW_RECORDS
       ? input.stallReason
       : null;
-    if (targetCount !== null && rows.length >= targetCount) {
+    if (datasetBoundaryReached({ targetCount, pageRange, rows, pages })) {
       status = "reached";
       stallReason = null;
     } else if (status !== "stalled") {
@@ -407,6 +472,7 @@
         })}`,
       name: normalizeOptionalString(input.name ?? input.collectionName, "name", 500),
       targetCount,
+      pageRange,
       keyField,
       scope: typeof input.scope === "undefined" ? null : cloneJson(input.scope, "scope"),
       columns,
@@ -435,6 +501,7 @@
     }
     const batchCollectionId = normalizeOptionalString(batch.id ?? batch.collectionId, "batch.collectionId", 500);
     const batchTargetCount = normalizeTargetCount(batch.targetCount, "batch.targetCount");
+    const batchPageRange = normalizePageRange(batch.pageRange, "batch.pageRange");
     const batchKeyField = normalizeOptionalString(batch.keyField, "batch.keyField", 200);
     const dataset = existing
       ? normalizeDataset(existing)
@@ -443,6 +510,7 @@
           id: batchCollectionId,
           name: batch.collectionName,
           targetCount: batchTargetCount,
+          pageRange: batchPageRange,
           keyField: batchKeyField,
           scope: batch.scope,
           columns: batch.columns,
@@ -457,6 +525,19 @@
     }
     if (dataset.targetCount === null && batchTargetCount !== null) {
       dataset.targetCount = batchTargetCount;
+    }
+    if (
+      dataset.pageRange
+      && batchPageRange
+      && (
+        dataset.pageRange.start !== batchPageRange.start
+        || dataset.pageRange.end !== batchPageRange.end
+      )
+    ) {
+      throw new TypeError("batch.pageRange cannot change an existing dataset page range.");
+    }
+    if (!dataset.pageRange && batchPageRange) {
+      dataset.pageRange = batchPageRange;
     }
     if (!dataset.name && batch.collectionName) {
       dataset.name = normalizeOptionalString(batch.collectionName, "batch.collectionName", 500);
@@ -526,7 +607,7 @@
     }
     dataset.lastAddedCount = addedCount;
 
-    if (dataset.targetCount !== null && dataset.rows.length >= dataset.targetCount) {
+    if (datasetBoundaryReached(dataset)) {
       dataset.status = "reached";
       dataset.stallReason = null;
     } else if (repeatedPage) {
@@ -910,6 +991,7 @@
         "kind",
         "itemDescription",
         "targetCount",
+        "pageRange",
         "fields",
         "includeCriteria",
         "description",
@@ -939,6 +1021,7 @@
       kind: normalizeOptionalString(value.kind, `${path}.kind`, 100),
       itemDescription: normalizeOptionalString(value.itemDescription, `${path}.itemDescription`, 1000),
       targetCount: normalizeTargetCount(value.targetCount, `${path}.targetCount`),
+      pageRange: normalizePageRange(value.pageRange, `${path}.pageRange`),
       fields,
       includeCriteria: normalizeStringList(value.includeCriteria, `${path}.includeCriteria`, 50, 1000),
       description: normalizeOptionalString(value.description, `${path}.description`, 2000),
@@ -1162,7 +1245,10 @@
     WORKFLOW_SET_VERSION,
     MAX_WORKFLOW_STEPS,
     STALL_REASONS,
+    datasetBoundaryReached,
     normalizeDataset,
+    normalizePageRange,
+    pageRangeCovered,
     mergeCollectionBatch,
     datasetToCsv,
     datasetToXlsx,

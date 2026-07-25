@@ -84,6 +84,7 @@ const STRONG_INTERACTIVE_SELECTOR = [
   ...Array.from(INTERACTIVE_ROLES, (role) => `[role='${role}']`)
 ].join(",");
 const MAX_COLLECTION_LINK_SCAN = 12000;
+const MAX_COLLECTION_RECORDS_PER_PAGE = 5000;
 
 observePageMutations();
 
@@ -158,6 +159,8 @@ function collectPageContext(options) {
       offset: elementOffset,
       search: elementSearch,
       targetSearchScope,
+      collectionContinuation: options.collectionContinuation || null,
+      collectionContinuationOnly: options.collectionContinuationOnly === true,
       redactSensitiveData
     })
   );
@@ -807,9 +810,16 @@ function collectInteractiveElements(options) {
     )
   );
   let potentialCandidateCount = 0;
-  const discoveryElements = includeOffscreenTargets
-    ? collectTargetSearchElements(search)
-    : queryAllDom("*");
+  const continuationContract = normalizeCollectionContinuationContract(
+    options?.collectionContinuation
+  );
+  const discoveryElements = continuationContract
+    ? collectCollectionContinuationElements(continuationContract)
+    : options?.collectionContinuationOnly === true
+      ? []
+    : includeOffscreenTargets
+      ? collectTargetSearchElements(search)
+      : queryAllDom("*");
   for (const [discoveryIndex, rawElement] of discoveryElements.entries()) {
     if (!isPotentiallyInteractive(rawElement, { includeOffscreen: includeOffscreenTargets })) {
       continue;
@@ -957,6 +967,178 @@ function collectTargetSearchElements(search) {
     }
   }
   return candidates;
+}
+
+function normalizeCollectionContinuationContract(value) {
+  const source = value && typeof value === "object" && !Array.isArray(value)
+    ? value
+    : null;
+  if (
+    !source
+    || source.version !== "1.0"
+    || source.kind !== "record-url-shape"
+    || typeof source.origin !== "string"
+    || !Array.isArray(source.pathTemplate)
+    || !Array.isArray(source.queryKeys)
+    || !Array.isArray(source.staticQuery)
+  ) {
+    return null;
+  }
+  let origin;
+  try {
+    origin = new URL(source.origin).origin;
+  } catch {
+    return null;
+  }
+  const pathTemplate = source.pathTemplate
+    .slice(0, 80)
+    .map((segment) => segment === null ? null : String(segment).slice(0, 500));
+  const queryKeys = Array.from(new Set(
+    source.queryKeys.slice(0, 80).map((key) => String(key).slice(0, 300))
+  )).sort();
+  const staticQuery = source.staticQuery
+    .slice(0, 80)
+    .flatMap((entry) => {
+      if (
+        !Array.isArray(entry)
+        || entry.length !== 2
+        || typeof entry[0] !== "string"
+        || !Array.isArray(entry[1])
+      ) {
+        return [];
+      }
+      return [[
+        entry[0].slice(0, 300),
+        entry[1].slice(0, 20).map((item) => String(item).slice(0, 1000))
+      ]];
+    });
+  if (!pathTemplate.length || !queryKeys.length && pathTemplate.every((segment) => segment !== null)) {
+    return null;
+  }
+  return {
+    version: "1.0",
+    kind: "record-url-shape",
+    origin,
+    pathTemplate,
+    queryKeys,
+    staticQuery,
+    requiresNumericTitlePair: source.requiresNumericTitlePair === true,
+    minimumDistinctRecords: Math.max(
+      2,
+      Math.min(20, Math.floor(Number(source.minimumDistinctRecords) || 2))
+    )
+  };
+}
+
+function collectCollectionContinuationElements(contract) {
+  const descriptors = queryAllDom("a[href],area[href]")
+    .filter((link) => (
+      link.isConnected
+      && isElementTreeRendered(link)
+      && collectionLinkMatchesContinuationContract(link, contract)
+    ))
+    .map((link) => describeCollectionLink(link))
+    .filter((descriptor) => descriptor.url);
+  const groups = groupCollectionLinksByUrl(descriptors)
+    .filter((group) => (
+      !contract.requiresNumericTitlePair
+      || collectionLinkGroupHasNumericTitlePair(group)
+    ));
+  if (groups.length < contract.minimumDistinctRecords) {
+    return [];
+  }
+  const representative = selectCollectionContinuationRepresentative(groups, descriptors);
+  return representative ? [representative] : [];
+}
+
+function selectCollectionContinuationRepresentative(groups, descriptors) {
+  const ranked = (groups || []).flatMap((group, index) => {
+    const representative = selectCollectionRepresentativeLink(group);
+    const exemplarDescriptor = (group.links || []).find(
+      (descriptor) => descriptor.element === representative
+    ) || group.links?.[0];
+    if (!representative || !exemplarDescriptor) {
+      return [];
+    }
+    const boundary = inferRepeatedCollectionBoundary(
+      representative,
+      exemplarDescriptor,
+      descriptors
+    );
+    const boundaryDescriptors = boundary?.root
+      ? descriptors.filter((descriptor) => (
+          composedElementContains(boundary.root, descriptor.element)
+        ))
+      : [];
+    return [{
+      representative,
+      index,
+      distinctRecordCount: new Set(
+        boundaryDescriptors.map((descriptor) => descriptor.url)
+      ).size,
+      repeatedContainerCount: boundary?.containers?.length || 0
+    }];
+  });
+  return ranked
+    .sort((left, right) => (
+      right.distinctRecordCount - left.distinctRecordCount
+      || right.repeatedContainerCount - left.repeatedContainerCount
+      || left.index - right.index
+    ))[0]?.representative || null;
+}
+
+function collectionLinkMatchesContinuationContract(link, contract) {
+  let candidate;
+  try {
+    candidate = new URL(readElementHref(link), link.ownerDocument?.baseURI || location.href);
+  } catch {
+    return false;
+  }
+  if (
+    !["http:", "https:"].includes(candidate.protocol)
+    || candidate.origin !== contract.origin
+  ) {
+    return false;
+  }
+  const segments = candidate.pathname.split("/");
+  if (
+    segments.length !== contract.pathTemplate.length
+    || contract.pathTemplate.some((expected, index) => (
+      expected !== null && expected !== digestCollectionContinuationValue(segments[index])
+    ))
+  ) {
+    return false;
+  }
+  const candidateKeys = Array.from(new Set(candidate.searchParams.keys())).sort();
+  if (
+    candidateKeys.length !== contract.queryKeys.length
+    || candidateKeys.some((key, index) => key !== contract.queryKeys[index])
+  ) {
+    return false;
+  }
+  return contract.staticQuery.every(([key, values]) => {
+    const candidateValues = candidate.searchParams
+      .getAll(key)
+      .map(digestCollectionContinuationValue);
+    return (
+      candidateValues.length === values.length
+      && candidateValues.every((value, index) => value === values[index])
+    );
+  });
+}
+
+function digestCollectionContinuationValue(value) {
+  return `digest:${hashObservationProbe(String(value || ""))}`;
+}
+
+function selectCollectionRepresentativeLink(group) {
+  const title = selectCollectionTitle(group);
+  const exact = (group?.links || []).find((descriptor) => (
+    (descriptor.labels || []).some((label) => (
+      label.value === title.value && !isNumericCollectionLabel(label.value)
+    ))
+  ));
+  return exact?.element || group?.links?.[0]?.element || null;
 }
 
 function matchesInteractiveSearchIdentity(element, search) {
@@ -1469,6 +1651,40 @@ function readElementHref(element) {
   }
 }
 
+function readElementNavigationDestination(element) {
+  const href = readElementHref(element);
+  if (href) {
+    return href;
+  }
+  const handler = String(element?.getAttribute?.("onclick") || "").trim();
+  if (!handler) {
+    return "";
+  }
+  const patterns = [
+    /(?:^|[;\s])(?:(?:window|document)\s*\.\s*)?location(?:\s*\.\s*href)?\s*=\s*(["'])(.*?)\1/iu,
+    /(?:^|[;\s])(?:(?:window|document)\s*\.\s*)?location\s*\.\s*(?:assign|replace)\s*\(\s*(["'])(.*?)\1\s*\)/iu
+  ];
+  for (const pattern of patterns) {
+    const match = handler.match(pattern);
+    const rawDestination = String(match?.[2] || "").trim();
+    if (!rawDestination || /\\(?:x|u|[0-7])/iu.test(rawDestination)) {
+      continue;
+    }
+    try {
+      const destination = new URL(
+        rawDestination,
+        element.ownerDocument?.baseURI || location.href
+      );
+      if (["http:", "https:"].includes(destination.protocol)) {
+        return destination.href;
+      }
+    } catch {
+      // Ignore malformed inline navigation strings.
+    }
+  }
+  return "";
+}
+
 function canonicalInteractiveCandidate(element) {
   if (
     element.tagName?.toLowerCase() === "label"
@@ -1562,7 +1778,7 @@ function describeInteractiveElement(element, ref, options = {}) {
   const controlType = "type" in element ? String(element.getAttribute("type") || element.type || "").toLowerCase() : "";
   const rawValue = readElementValue(element, inputType);
   const value = options.redactSensitiveData ? redactSensitiveValue(rawValue, element, inputType) : rawValue;
-  const href = ["a", "area"].includes(actionTag) ? readElementHref(actionControl) : "";
+  const href = readElementNavigationDestination(actionControl);
   const formAction = readFormAction(actionControl);
   const form = isDomInstance(actionControl, "HTMLFormElement")
     ? actionControl
@@ -1642,12 +1858,19 @@ function describePaginationMetadata(control) {
   );
   const ariaCurrent = String(control.getAttribute?.("aria-current") || "").toLowerCase();
   const container = findPaginationContainer(control);
+  const containerAnalysis = container
+    ? analyzePaginationContainer(container)
+    : null;
   const navigationRel = relTokens.has("next")
     ? "next"
     : relTokens.has("prev") || relTokens.has("previous")
       ? "previous"
       : "";
-  const label = normalizeWhitespace(getAccessibleName(control));
+  const label = normalizeWhitespace(
+    getAccessibleName(control)
+    || control.innerText
+    || control.textContent
+  );
   const ordinal = /^\d{1,7}$/u.test(label) ? Number(label) : null;
   const metadata = container || navigationRel || ariaCurrent === "page"
     ? removeEmptyValues({
@@ -1655,6 +1878,9 @@ function describePaginationMetadata(control) {
         navigationRel,
         navigationCurrent: ariaCurrent === "page" || undefined,
         navigationOrdinal: Number.isInteger(ordinal) ? ordinal : undefined,
+        navigationGroupCurrentOrdinal: Number.isInteger(containerAnalysis?.currentOrdinal)
+          ? containerAnalysis.currentOrdinal
+          : undefined,
         navigationGroup: truncate(getSemanticContainerName(container), 160) || undefined
       })
     : null;
@@ -1683,16 +1909,24 @@ function analyzePaginationContainer(container) {
     return cache.get(container);
   }
   const controls = Array.from(container.querySelectorAll?.(
-    "a[href],area[href],button,[role='link'],[role='button']"
+    "a[href],area[href],button,[role='link'],[role='button'],[onclick]"
   ) || [])
-    .filter((candidate) => candidate.isConnected && isElementTreeRendered(candidate))
+    .filter((candidate) => (
+      candidate.isConnected
+      && isElementTreeRendered(candidate)
+      && hasStrongInteractionSignal(candidate)
+    ))
     .slice(0, 41);
-  if (controls.length < 2 || controls.length > 40) {
+  if (!controls.length || controls.length > 40) {
     const result = { isPagination: false };
     cache?.set(container, result);
     return result;
   }
-  const labels = controls.map((candidate) => normalizeWhitespace(getAccessibleName(candidate)));
+  const labels = controls.map((candidate) => normalizeWhitespace(
+    getAccessibleName(candidate)
+    || candidate.innerText
+    || candidate.textContent
+  ));
   const numericOrdinals = new Set(
     labels.filter((label) => /^\d{1,7}$/u.test(label)).map(Number)
   );
@@ -1703,18 +1937,61 @@ function analyzePaginationContainer(container) {
   const currentMarker = controls.some((candidate) => (
     String(candidate.getAttribute?.("aria-current") || "").toLowerCase() === "page"
   ));
+  const currentOrdinals = new Set([
+    ...controls.flatMap((candidate, index) => (
+      String(candidate.getAttribute?.("aria-current") || "").toLowerCase() === "page"
+      && /^\d{1,7}$/u.test(labels[index])
+        ? [Number(labels[index])]
+        : []
+    )),
+    ...Array.from(container.querySelectorAll?.("*") || []).flatMap((candidate) => {
+      if (
+        !candidate.isConnected
+        || candidate.children?.length
+        || !isElementTreeRendered(candidate)
+        || controls.some((control) => (
+          control === candidate
+          || control.contains?.(candidate)
+          || candidate.contains?.(control)
+        ))
+      ) {
+        return [];
+      }
+      const markerLabel = normalizeWhitespace(
+        getAccessibleName(candidate)
+        || candidate.innerText
+        || candidate.textContent
+      );
+      return /^\d{1,7}$/u.test(markerLabel) ? [Number(markerLabel)] : [];
+    })
+  ]);
+  const currentOrdinalCandidate = currentOrdinals.size === 1
+    ? Array.from(currentOrdinals)[0]
+    : null;
+  const currentOrdinal = Number.isInteger(currentOrdinalCandidate)
+    && Array.from(numericOrdinals).some((ordinal) => (
+      ordinal === currentOrdinalCandidate
+      || Math.abs(ordinal - currentOrdinalCandidate) === 1
+    ))
+    ? currentOrdinalCandidate
+    : null;
   const relationalSignal = controls.some((candidate) => {
     const rel = String(candidate.getAttribute?.("rel") || "").toLowerCase().split(/\s+/);
     return rel.includes("next") || rel.includes("prev") || rel.includes("previous");
   });
   const sameViewVariantCount = controls.filter((candidate) => (
-    isSameViewNumericVariant(readElementHref(candidate))
+    isSameViewNumericVariant(readElementNavigationDestination(candidate))
   )).length;
   const compactRatio = compactControlCount / controls.length;
   const semanticNavigation = container.matches?.("nav,[role='navigation']") === true;
   const isPagination = Boolean(
     relationalSignal
-    || (currentMarker && controls.length >= 2)
+    || (currentMarker && controls.length >= 1)
+    || (
+      Number.isInteger(currentOrdinal)
+      && numericOrdinals.size >= 1
+      && compactRatio >= 0.5
+    )
     || (
       numericOrdinals.size >= 2
       && compactRatio >= 0.6
@@ -1729,7 +2006,10 @@ function analyzePaginationContainer(container) {
       && compactRatio >= 0.5
     )
   );
-  const result = { isPagination };
+  const result = {
+    isPagination,
+    currentOrdinal: Number.isInteger(currentOrdinal) ? currentOrdinal : null
+  };
   cache?.set(container, result);
   return result;
 }
@@ -1792,9 +2072,7 @@ function createElementStateBinding(element) {
     name: element.getAttribute("name") || "",
     accessibleName: getAccessibleName(element),
     activationTag: compositeControl?.tagName?.toLowerCase() || "",
-    href: ["a", "area"].includes(actionControl.tagName?.toLowerCase())
-      ? readElementHref(actionControl)
-      : "",
+    href: readElementNavigationDestination(actionControl),
     formAction: readFormAction(actionControl),
     formMethod: form ? String(form.method || "get").toLowerCase() : "",
     disabled: "disabled" in element ? Boolean(element.disabled) : false,
@@ -3089,8 +3367,6 @@ function isStructuredCollectionAction(action) {
     && action.ref
     && normalizeWhitespace(action.collectionId)
     && normalizeWhitespace(action.collectionName)
-    && Number.isFinite(Number(action.targetCount))
-    && Number(action.targetCount) > 0
   );
 }
 
@@ -3099,14 +3375,18 @@ function collectStructuredRecords(action) {
   const ownerDocument = exemplar.ownerDocument;
   const collectionId = normalizeWhitespace(action.collectionId);
   const collectionName = normalizeWhitespace(action.collectionName);
-  const targetCount = Math.max(1, Math.floor(Number(action.targetCount)));
+  const requestedTargetCount = Number(action.targetCount);
+  const targetCount = Number.isInteger(requestedTargetCount) && requestedTargetCount > 0
+    ? Math.min(MAX_COLLECTION_RECORDS_PER_PAGE, requestedTargetCount)
+    : null;
+  const recordLimit = targetCount || MAX_COLLECTION_RECORDS_PER_PAGE;
   const exemplarLink = findCollectionLink(exemplar);
-  const linkSource = collectCollectionLinkSource(exemplar, ownerDocument, targetCount);
+  const linkSource = collectCollectionLinkSource(exemplar, ownerDocument, recordLimit);
   const documentLinks = linkSource.links;
   const scanWindow = selectCollectionLinkScanWindow(
     documentLinks,
     exemplarLink,
-    targetCount
+    recordLimit
   );
   const renderedLinks = scanWindow.links
     .map((link) => describeCollectionLink(link))
@@ -3147,6 +3427,11 @@ function collectStructuredRecords(action) {
     : exemplarDescriptor?.url
       ? "url-shape"
       : "repeated-container";
+  const continuation = buildCollectionContinuationContract({
+    exemplarDescriptor,
+    descriptors: scopedLinks,
+    requiresNumericTitlePair
+  });
 
   let recordCandidates = groupedLinks
     .filter((group) => (
@@ -3167,7 +3452,7 @@ function collectStructuredRecords(action) {
       action,
       exemplar,
       ownerDocument,
-      targetCount
+      targetCount: recordLimit
     });
   }
 
@@ -3180,7 +3465,7 @@ function collectStructuredRecords(action) {
       seenKeys.add(record.key);
       return true;
     })
-    .slice(0, targetCount);
+    .slice(0, recordLimit);
   const sourceSliceDigest = hashObservationProbe(records.map((record) => record.key));
   const pageIdentity = {
     url: sanitizeUrlForContext(
@@ -3211,7 +3496,8 @@ function collectStructuredRecords(action) {
       scanTruncated: scanWindow.truncated,
       matchedLinkCount: scopedLinks.length,
       inferredRecordCount: recordCandidates.length,
-      excludedSingleLinkRecords: requiresNumericTitlePair
+      excludedSingleLinkRecords: requiresNumericTitlePair,
+      continuation
     }
   };
 }
@@ -3362,6 +3648,80 @@ function collectionUrlsShareShape(exemplarValue, candidateValue) {
       && isCollectionIdentifierSegment(candidateSegments[differingIndex])
     )
   );
+}
+
+function buildCollectionContinuationContract({
+  exemplarDescriptor,
+  descriptors,
+  requiresNumericTitlePair
+}) {
+  if (!exemplarDescriptor?.url) {
+    return null;
+  }
+  const urls = Array.from(new Set(
+    (descriptors || []).map((descriptor) => descriptor?.url).filter(Boolean)
+  ));
+  if (urls.length < 2) {
+    return null;
+  }
+  let exemplar;
+  let parsedUrls;
+  try {
+    exemplar = new URL(exemplarDescriptor.url);
+    parsedUrls = urls.map((url) => new URL(url));
+  } catch {
+    return null;
+  }
+  if (
+    !["http:", "https:"].includes(exemplar.protocol)
+    || parsedUrls.some((url) => url.origin !== exemplar.origin)
+  ) {
+    return null;
+  }
+  const exemplarSegments = exemplar.pathname.split("/");
+  if (parsedUrls.some((url) => url.pathname.split("/").length !== exemplarSegments.length)) {
+    return null;
+  }
+  const pathTemplate = exemplarSegments.map((segment, index) => (
+    parsedUrls.every((url) => url.pathname.split("/")[index] === segment)
+      ? digestCollectionContinuationValue(segment)
+      : null
+  ));
+  const queryKeys = Array.from(new Set(exemplar.searchParams.keys())).sort();
+  if (parsedUrls.some((url) => {
+    const candidateKeys = Array.from(new Set(url.searchParams.keys())).sort();
+    return (
+      candidateKeys.length !== queryKeys.length
+      || candidateKeys.some((key, index) => key !== queryKeys[index])
+    );
+  })) {
+    return null;
+  }
+  const staticQuery = queryKeys.flatMap((key) => {
+    const values = exemplar.searchParams.getAll(key);
+    return parsedUrls.every((url) => {
+      const candidateValues = url.searchParams.getAll(key);
+      return (
+        candidateValues.length === values.length
+        && candidateValues.every((value, index) => value === values[index])
+      );
+    })
+      ? [[key, values.map(digestCollectionContinuationValue)]]
+      : [];
+  });
+  if (!queryKeys.length && pathTemplate.every((segment) => segment !== null)) {
+    return null;
+  }
+  return {
+    version: "1.0",
+    kind: "record-url-shape",
+    origin: exemplar.origin,
+    pathTemplate,
+    queryKeys,
+    staticQuery,
+    requiresNumericTitlePair: Boolean(requiresNumericTitlePair),
+    minimumDistinctRecords: 2
+  };
 }
 
 function isCollectionIdentifierSegment(value) {
@@ -4744,14 +5104,19 @@ function activateDeepestHitTarget(element, point) {
 }
 
 function actionMayUnloadPage(element) {
+  const navigationDestination = readElementNavigationDestination(element);
   if (
     (isDomInstance(element, "HTMLAnchorElement") || isDomInstance(element, "HTMLAreaElement"))
-    && readElementHref(element)
+    && navigationDestination
   ) {
     const declaredHref = String(element.getAttribute("href") || "").trim();
     if (/^javascript:/i.test(declaredHref) || declaredHref.startsWith("#")) {
       return false;
     }
+    return true;
+  }
+
+  if (navigationDestination) {
     return true;
   }
 

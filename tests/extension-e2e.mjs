@@ -305,6 +305,9 @@ try {
     assert.ok(paginationContext.data.interactiveElements.every((element) => (
       element.navigationKind === "pagination"
       && Number.isInteger(element.navigationOrdinal)
+      && element.navigationGroupCurrentOrdinal === 1
+      && element.tag === "td"
+      && new URL(element.href).searchParams.has("legacyPage")
     )));
     assert.equal(
       paginationContext.data.interactiveElements.some((element) => (
@@ -313,6 +316,69 @@ try {
       false,
       "pagination discovery must exclude record and detail links"
     );
+    const runtimePaginationResolution = await evaluate(cdp, panelSessionId, `(async () => {
+      const originalRequestAiDecision = requestAiDecision;
+      const originalCollectContextWithRetry = collectContextWithRetry;
+      const originalTargetTabId = state.targetTabId;
+      const originalActiveTab = state.activeTab ? structuredClone(state.activeTab) : null;
+      const originalAgentSession = state.agentSession;
+      let aiCallCount = 0;
+      requestAiDecision = async () => {
+        aiCallCount += 1;
+        throw new Error("Pagination resolution must not call the model.");
+      };
+      try {
+        state.agentSession = null;
+        state.targetTabId = ${JSON.stringify(firstTabId)};
+        state.activeTab = {
+          id: ${JSON.stringify(firstTabId)},
+          title: ${JSON.stringify(firstContext.data.title)},
+          url: ${JSON.stringify(firstContext.data.url)}
+        };
+        const resolution = await resolveNextCollectionPage(state.agentSession || {});
+        collectContextWithRetry = async () => ({
+          url: "https://example.test/board",
+          interactiveElements: [{
+            ref: "numeric-detail-2",
+            navigationKind: "pagination",
+            navigationOrdinal: 2,
+            href: "https://example.test/board?record=2"
+          }, {
+            ref: "numeric-detail-3",
+            navigationKind: "pagination",
+            navigationOrdinal: 3,
+            href: "https://example.test/board?record=3"
+          }]
+        });
+        const unsafeNumericDetails = await resolveNextCollectionPage(
+          state.agentSession || {}
+        );
+        return {
+          ok: resolution.ok,
+          label: resolution.target?.label || "",
+          tag: resolution.target?.tag || "",
+          ordinal: resolution.target?.navigationOrdinal || null,
+          source: resolution.source || "",
+          aiCallCount,
+          unsafeNumericDetailRejected: unsafeNumericDetails.ok === false
+        };
+      } finally {
+        requestAiDecision = originalRequestAiDecision;
+        collectContextWithRetry = originalCollectContextWithRetry;
+        state.targetTabId = originalTargetTabId;
+        state.activeTab = originalActiveTab;
+        state.agentSession = originalAgentSession;
+      }
+    })()`);
+    assert.deepEqual(runtimePaginationResolution, {
+      ok: true,
+      label: "2",
+      tag: "td",
+      ordinal: 2,
+      source: "group-current-ordinal",
+      aiCallCount: 0,
+      unsafeNumericDetailRejected: true
+    });
     const observationProbe = await extensionMessage(cdp, panelSessionId, {
       type: "VERIFY_PAGE_OBSERVATION",
       targetTabId: firstTabId
@@ -915,7 +981,7 @@ try {
     assert.deepEqual(collectionLedgerContracts, {
       firstPageCollected: true,
       requestedColumnsOnly: true,
-      packedExtractAndPaginationAllowed: true,
+      packedExtractAndPaginationAllowed: false,
       runtimeRemainingCountBound: true,
       wrongRecordLinkRejectedAsPagination: true,
       multipleTraversalBlocked: true,
@@ -936,7 +1002,11 @@ try {
       runtimeFinalizationCompleted: true,
       unrequestedFormatRejected: true,
       repeatedPageStalled: true,
-      zeroNewPageStalled: true
+      zeroNewPageStalled: true,
+      pageRangeRouteAccepted: true,
+      pageRangeReached: true,
+      pageRangeTerminalRequiresExport: true,
+      pageRangeFinalized: true
     });
 
     const workflowSetContracts = await exerciseWorkflowSetContracts({
@@ -966,7 +1036,40 @@ try {
       disabledScreenshotSkipped: true,
       disclosurePolicyAllowed: true,
       readOnlyPolicyAllowed: true,
-      unresolvedClickNeedsPolicy: true
+      unresolvedClickNeedsPolicy: true,
+      fastRouterEnabled: true,
+      fastRouteMemoryRecalled: true,
+      fastRouteMemoryStayedSemantic: true,
+      prefetchedObservationReused: true,
+      milestoneFirstWriteWins: true,
+      routingTimeoutBounded: true,
+      routingTimeoutBelowConfigured: true,
+      generalTimeoutPreserved: true,
+      explicitTimeoutHonored: true
+    });
+
+    const runtimeV2Dispatch = await exerciseAgentRuntimeV2Dispatch({
+      cdp,
+      panelSessionId,
+      tabId: firstTabId
+    });
+    assert.deepEqual(runtimeV2Dispatch, {
+      selectedVersion: "v2",
+      routeCalls: 0,
+      prefetchCalls: 1,
+      loopCalls: 1,
+      turnIntentResolvedBeforeObservation: false,
+      runtimeSnapshotCreated: true,
+      providerChannels: {
+        decision: "planner",
+        groundingRepair: "planner",
+        verifier: "verifier",
+        policy: "policy",
+        visual: "visual",
+        legacyRepair: "legacy-router"
+      },
+      toolSearchLoaded: true,
+      toolSearchSchemaVisible: true
     });
 
     const routedFastPaths = await exerciseRoutedFastPathContracts({
@@ -983,6 +1086,17 @@ try {
       pageEvidenceOmitted: true,
       compactInput: true,
       runtimeNarrativeLocalized: true
+    });
+
+    const directActionRouteIsolation = await exerciseDirectActionRouteIsolation({
+      cdp,
+      panelSessionId
+    });
+    assert.deepEqual(directActionRouteIsolation, {
+      completed: true,
+      nextActionIndex: 1,
+      collectionStateAbsent: true,
+      fallbackCalls: 0
     });
 
     const loopRuntimeContracts = await exerciseLoopRuntimeContracts({
@@ -1422,6 +1536,33 @@ try {
     assert.match(structuredBatch.pageIdentity.documentId, /^[0-9a-z-]{8,}$/i);
     assert.equal(structuredBatch.pageIdentity.domRevision, structuredCollectionContext.data.pageState.domRevision);
     assert.equal(structuredBatch.pageIdentity.sourceSliceDigest, structuredBatch.sourceSliceDigest);
+    assert.equal(structuredBatch.provenance.continuation.kind, "record-url-shape");
+    assert.ok(
+      structuredBatch.provenance.continuation.staticQuery
+        .flatMap((entry) => entry[1])
+        .every((value) => /^digest:[0-9a-f]+$/i.test(value)),
+      "collection continuation must retain only digests for stable URL values"
+    );
+    const continuedCollectionContext = await extensionMessage(cdp, panelSessionId, {
+      type: "COLLECT_PAGE_CONTEXT",
+      targetTabId: firstTabId,
+      options: {
+        maxTextChars: 4000,
+        maxElements: 4,
+        targetSearchScope: "rendered-document",
+        collectionContinuation: {
+          frameId: structuredExemplar.frameId || 0,
+          contract: structuredBatch.provenance.continuation
+        },
+        redactSensitiveData: true
+      }
+    });
+    assert.equal(continuedCollectionContext.ok, true);
+    assert.equal(continuedCollectionContext.data.interactiveElements.length, 1);
+    assert.equal(
+      continuedCollectionContext.data.interactiveElements[0].label,
+      "A complete first record title"
+    );
 
     const packedPaginationContext = await extensionMessage(cdp, panelSessionId, {
       type: "COLLECT_PAGE_CONTEXT",
@@ -1789,7 +1930,7 @@ try {
         maxTextChars: 8000,
         maxElements: 20,
         elementQuery: "2",
-        elementRoles: ["link"],
+        elementRoles: ["pagination"],
         elementNearText: "[1/5] [총 478건]",
         redactSensitiveData: true
       }
@@ -1804,7 +1945,7 @@ try {
     );
     assert.ok(
       legacyPageTwo?.ref,
-      "numeric legacy paginator links should be found from bounded nearby context instead of date-like table rows"
+      "numeric legacy paginator controls should be found from bounded nearby context instead of date-like table rows"
     );
     assert.match(legacyPageTwo.searchMatch.contextSnippet, /\[1\/5\].*478건/);
     const legacyPageResult = await extensionMessage(cdp, panelSessionId, {
@@ -1814,12 +1955,16 @@ try {
         id: "legacy-page-two",
         type: "click",
         ref: legacyPageTwo.ref,
-        reason: "exercise a legacy javascript paginator without treating it as a document navigation"
+        reason: "exercise a legacy inline-handler paginator through its observed control binding"
       }]
     });
     assert.equal(legacyPageResult.ok, true);
     assert.equal(legacyPageResult.data.results[0].ok, true);
-    assert.equal(legacyPageResult.data.results[0].result.mayNavigate, false);
+    assert.equal(
+      legacyPageResult.data.results[0].result.mayNavigate,
+      true,
+      "a literal location assignment should be treated as a document navigation"
+    );
     assert.equal(legacyPageResult.data.results[0].verification.changed, true);
     const legacyPageContext = await extensionMessage(cdp, panelSessionId, {
       type: "COLLECT_PAGE_CONTEXT",
@@ -2994,6 +3139,7 @@ async function startFixtureServer() {
             kind: "effect",
             itemDescription: "",
             targetCount: null,
+            pageRange: null,
             fields: [],
             includeCriteria: [],
             formats: []
@@ -3107,6 +3253,15 @@ async function startFixtureServer() {
       return;
     }
     const second = request.url?.startsWith("/page-b");
+    const legacyPage = Math.max(
+      1,
+      Number(new URL(request.url || "/", "http://fixture.test").searchParams.get("legacyPage")) || 1
+    );
+    const legacyPaginationCells = [1, 2, 3].map((page) => (
+      page === legacyPage
+        ? `<td><strong>${page}</strong></td>`
+        : `<td onclick="location.href='?legacyPage=${page}'"><span>${page}</span></td>`
+    )).join("");
     const candidateProbes = Array.from({ length: 24 }, (_, index) => (
       `<button type="button" aria-label="Candidate probe ${index + 1}">${index + 1}</button>`
     )).join("");
@@ -3137,7 +3292,9 @@ async function startFixtureServer() {
       #visual-canvas { display: block; width: 240px; height: 80px; margin-top: 8px; }
       #advanced-structure-lab { position: fixed; right: 8px; bottom: 8px; z-index: 4; width: 270px; padding: 4px; background: white; }
       #legacy-pagination { position: fixed; left: 300px; top: 82px; z-index: 5; width: 220px; padding: 4px; background: white; font: 12px sans-serif; }
-      #legacy-pagination ul { display: flex; gap: 8px; margin: 2px 0; padding: 0; list-style: none; }
+      #legacy-pagination table { border-spacing: 4px 0; }
+      #legacy-pagination td { min-width: 18px; text-align: center; }
+      #legacy-pagination td[onclick] { cursor: pointer; }
       #relational-controls { position: fixed; left: 300px; top: 330px; z-index: 6; width: 250px; padding: 6px; background: white; border: 1px solid #cbd5e1; font: 12px sans-serif; }
       #relational-controls .relation-field { display: grid; grid-template-columns: 1fr 28px; align-items: center; gap: 6px; margin: 4px 0; }
       #relational-controls button { width: 28px; height: 24px; padding: 0; }
@@ -3170,14 +3327,10 @@ async function startFixtureServer() {
       <div id="pointer-status" role="status">Pointer idle</div>
       <div id="legacy-pagination">
         <div>[1/5] [총 478건]</div>
-        <div class="pageSkip">
-          <ul>
-            <li><span>1</span></li>
-            <li><a href="javascript:legacySearch(2);">2</a></li>
-            <li><a href="javascript:legacySearch(3);">3</a></li>
-          </ul>
-        </div>
-        <div id="legacy-page-status" role="status">Legacy page 1 loaded</div>
+        <table aria-label="Legacy result pages"><tbody><tr>
+          ${legacyPaginationCells}
+        </tr></tbody></table>
+        <div id="legacy-page-status" role="status">Legacy page ${legacyPage} loaded</div>
       </div>
       <div id="relational-controls" role="group" aria-label="Workflow filters">
         <div class="relation-field">
@@ -3235,6 +3388,18 @@ async function startFixtureServer() {
       <input id="upload" type="file" accept="text/plain">
       <button id="async" type="button">Start async</button>
       <div id="async-status" role="status">Idle</div>
+      <aside id="record-shape-decoy" aria-label="Recent records">
+        <table><tbody>
+          <tr>
+            <td><a href="/records?board=general&amp;record=decoy-1&amp;session_token=fixture-private-token">901</a></td>
+            <td><a href="/records?board=general&amp;record=decoy-1&amp;session_token=fixture-private-token">Recent decoy one</a></td>
+          </tr>
+          <tr>
+            <td><a href="/records?board=general&amp;record=decoy-2&amp;session_token=fixture-private-token">902</a></td>
+            <td><a href="/records?board=general&amp;record=decoy-2&amp;session_token=fixture-private-token">Recent decoy two</a></td>
+          </tr>
+        </tbody></table>
+      </aside>
       <section id="structured-collection" aria-label="Structured result fixture">
         <table aria-label="Layout table"><tbody><tr><td>
           <table aria-label="Nested result table"><tbody>
@@ -4630,7 +4795,7 @@ async function exerciseInternalElementDiscoveryContract({ cdp, panelSessionId, t
       };
       requestAiDecision = async (_session, request) => {
         staleRefPurposes.push(request.purpose);
-        staleRefRecoveryPromptSeen ||= request.user.includes('"active": true')
+        staleRefRecoveryPromptSeen ||= request.user.includes('"active":true')
           && request.user.includes("expired-result-ref");
         const ref = staleRefPurposes.length < 3
           ? "expired-result-ref"
@@ -5163,6 +5328,7 @@ async function exerciseTurnBoundaryContracts({ cdp, panelSessionId, tabId, conte
                 kind: "effect",
                 itemDescription: "",
                 targetCount: null,
+                pageRange: null,
                 fields: [],
                 includeCriteria: [],
                 formats: []
@@ -5247,6 +5413,7 @@ async function exerciseTurnBoundaryContracts({ cdp, panelSessionId, tabId, conte
                 kind: "effect",
                 itemDescription: "",
                 targetCount: null,
+                pageRange: null,
                 fields: [],
                 includeCriteria: [],
                 formats: []
@@ -5647,6 +5814,7 @@ async function exerciseTurnBoundaryContracts({ cdp, panelSessionId, tabId, conte
                 kind: "effect",
                 itemDescription: "",
                 targetCount: null,
+                pageRange: null,
                 fields: [],
                 includeCriteria: [],
                 formats: []
@@ -5843,6 +6011,7 @@ async function exerciseCollectionLedgerContracts({ cdp, panelSessionId, tabId, c
           kind: "collection",
           itemDescription: "normal free-board post",
           targetCount: 40,
+          pageRange: null,
           fields: ["title"],
           includeCriteria: ["Exclude pinned notices."],
           formats
@@ -6267,6 +6436,159 @@ async function exerciseCollectionLedgerContracts({ cdp, panelSessionId, tabId, c
           state.lastContext
         ).valid === false;
 
+      createAgentSession("자유게시판에 들어가서 1페이지부터 3페이지까지의 내용을 정리해서 엑셀로 내려받게");
+      const pageRangeRoutingSession = state.agentSession;
+      const routeAction = (type, query, roles, reason) => ({
+        type,
+        target: {
+          query,
+          roles,
+          nearText: "",
+          reason
+        },
+        value: null,
+        checked: null,
+        key: null,
+        code: null,
+        direction: null,
+        amount: null,
+        url: null,
+        reason
+      });
+      const pageRangeRoutedTurn = {
+        turnIntent: {
+          version: "1.0",
+          mode: "standalone",
+          objective: pageRangeRoutingSession.latestUserMessage,
+          contextSummary: "",
+          repeatPolicy: "once",
+          repeatLimit: 1,
+          deliverable: {
+            kind: "collection",
+            itemDescription: "자유게시판 게시글",
+            targetCount: null,
+            pageRange: { start: 1, end: 3 },
+            fields: ["title", "url"],
+            includeCriteria: [],
+            formats: ["xlsx"]
+          },
+          completionCriteria: [
+            "자유게시판 1페이지부터 3페이지까지의 고유 게시글이 XLSX 파일에 포함됩니다."
+          ],
+          reason: "The request has an explicit page range and local workbook format."
+        },
+        route: {
+          version: "1.0",
+          strategy: "collection",
+          actions: [
+            routeAction("click", "자유게시판", ["link"], "Open the named board."),
+            routeAction("extract", "자유게시판 게시글", ["link"], "Bind one representative board record.")
+          ],
+          evidenceSearch: {
+            query: "자유게시판 게시글",
+            roles: ["link"],
+            nearText: "",
+            reason: "Find one representative board record."
+          },
+          confidence: 0.96,
+          reason: "A deterministic board setup action precedes a page-bounded collection."
+        }
+      };
+      const pageRangeRouteAccepted = validateResolvedRoutedTurnResponse(
+        JSON.stringify(pageRangeRoutedTurn),
+        pageRangeRoutingSession
+      ).valid === true;
+
+      const pageRangeSession = pageRangeRoutingSession;
+      pageRangeSession.turnIntent = AgentCore.normalizeTurnIntent(pageRangeRoutedTurn.turnIntent);
+      pageRangeSession.turnIntentResolved = true;
+      const pageRangeDecision = (page) => ({
+        step: page,
+        status: "continue",
+        toolCalls: [],
+        actions: [{
+          id: "range-page-" + page,
+          type: "extract",
+          ref: "record-title",
+          collectionId: "free-board-pages",
+          collectionName: "자유게시판 1-3페이지",
+          reason: "Collect the current requested result page."
+        }],
+        verification: {
+          required: true,
+          expectedChange: "collection ledger grows",
+          successCriteria: ["the current page ordinal is recorded"]
+        }
+      });
+      for (let page = 1; page <= 3; page += 1) {
+        state.lastContext = {
+          ...structuredClone(${JSON.stringify(context)}),
+          url: "https://example.test/board?page=" + page,
+          interactiveElements: [{
+            ref: "current-page-" + page,
+            tag: "a",
+            role: "link",
+            label: String(page),
+            href: "https://example.test/board?page=" + page,
+            navigationKind: "pagination",
+            navigationCurrent: true,
+            navigationOrdinal: page,
+            disabled: false,
+            actionability: "interactive"
+          }]
+        };
+        const decision = pageRangeDecision(page);
+        ingestStructuredCollectionResults(pageRangeSession, decision, [{
+          ok: true,
+          action: decision.actions[0],
+          result: {
+            collection: {
+              collectionId: "free-board-pages",
+              collectionName: "자유게시판 1-3페이지",
+              targetCount: null,
+              returnedCount: 1,
+              records: [{
+                key: "page-" + page,
+                title: "Page " + page + " post",
+                url: "https://example.test/post/page-" + page
+              }],
+              pageIdentity: {
+                url: "https://example.test/board?page=" + page,
+                documentId: "range-document-" + page,
+                sourceSliceDigest: "range-slice-" + page
+              },
+              scope: "rendered-document",
+              provenance: {
+                source: "bound-exemplar",
+                continuation: {
+                  version: "1.0",
+                  urlShape: { path: [], query: [] },
+                  record: { requiresNumericTitlePair: false }
+                }
+              }
+            }
+          },
+          verification: {}
+        }]);
+      }
+      state.agentSession = pageRangeSession;
+      const pageRangeDataset = pageRangeSession.datasets[0];
+      const pageRangeReached = isReachedCollectionDataset(pageRangeDataset)
+        && pageRangeDataset.targetCount === null
+        && pageRangeDataset.rows.length === 3
+        && pageRangeDataset.pages.map((page) => page.ordinal).join(",") === "1,2,3";
+      const pageRangeTerminalAllowed = validateCollectionBoundary(
+        pageRangeSession,
+        { step: 4, status: "completed", toolCalls: [], actions: [] },
+        state.lastContext
+      ).valid === false;
+      const pageRangeFinalized = finalizeReachedCollectionFromRuntime(pageRangeSession) === true
+        && pageRangeSession.status === "completed"
+        && pageRangeSession.collectionExports[0]?.format === "xlsx"
+        && pageRangeSession.collectionExports[0]?.rowCount === 3
+        && pageRangeSession.collectionExports[0]?.pageRange?.start === 1
+        && pageRangeSession.collectionExports[0]?.pageRange?.end === 3;
+
       return {
         firstPageCollected,
         requestedColumnsOnly,
@@ -6291,7 +6613,11 @@ async function exerciseCollectionLedgerContracts({ cdp, panelSessionId, tabId, c
         runtimeFinalizationCompleted,
         unrequestedFormatRejected,
         repeatedPageStalled,
-        zeroNewPageStalled
+        zeroNewPageStalled,
+        pageRangeRouteAccepted,
+        pageRangeReached,
+        pageRangeTerminalRequiresExport: pageRangeTerminalAllowed,
+        pageRangeFinalized
       };
     } finally {
       state.activeTab = original.activeTab;
@@ -6364,6 +6690,7 @@ async function exerciseWorkflowSetContracts({ cdp, panelSessionId, tabId }) {
         kind: "collection",
         itemDescription: "board post",
         targetCount: 40,
+        pageRange: null,
         fields: ["title"],
         includeCriteria: ["Exclude notices."],
         formats: []
@@ -6387,6 +6714,7 @@ async function exerciseWorkflowSetContracts({ cdp, panelSessionId, tabId }) {
             kind: "effect",
             itemDescription: "",
             targetCount: null,
+            pageRange: null,
             fields: [],
             includeCriteria: [],
             formats: []
@@ -6549,12 +6877,22 @@ async function exerciseWorkflowSetContracts({ cdp, panelSessionId, tabId }) {
 }
 
 async function exerciseLatencyFastPathContracts({ cdp, panelSessionId, context }) {
-  return evaluate(cdp, panelSessionId, `(() => {
+  return evaluate(cdp, panelSessionId, `(async () => {
     const originalRuntimeSettings = structuredClone(state.runtimeSettings);
+    const originalEvaluationLogs = structuredClone(state.evaluationLogs);
+    const originalMemory = await chrome.storage.local.get(FAST_ROUTE_MEMORY_STORAGE_KEY);
+    const originalMemoryCache = fastRouteMemoryCache
+      ? structuredClone(fastRouteMemoryCache)
+      : null;
     try {
       state.runtimeSettings = {
         ...state.settings,
-        includeScreenshot: true
+        includeScreenshot: true,
+        latencyMode: "fast",
+        agentMode: "approve",
+        fastModel: "fast-test-model",
+        fastRouteEnabled: true,
+        rememberSuccessfulRoutes: true
       };
       const domContext = {
         ...structuredClone(${JSON.stringify(context)}),
@@ -6593,6 +6931,110 @@ async function exerciseLatencyFastPathContracts({ cdp, panelSessionId, context }
         toolCalls: [],
         actions: [{ id: "unknown-click", type: "click", ref: "missing" }]
       };
+      const fastRoute = AgentCore.normalizeExecutionRoute({
+        version: "1.0",
+        strategy: "direct",
+        actions: [{
+          type: "click",
+          target: {
+            query: "Save",
+            roles: ["button"],
+            nearText: "",
+            reason: "Resolve the user-named control."
+          },
+          value: null,
+          checked: null,
+          key: null,
+          code: null,
+          direction: null,
+          amount: null,
+          url: null,
+          reason: "Activate the requested control once."
+        }],
+        evidenceSearch: { query: "", roles: [], nearText: "", reason: "" },
+        confidence: 0.98,
+        reason: "One semantic DOM action."
+      });
+      const fastIntent = AgentCore.normalizeTurnIntent({
+        version: "1.0",
+        mode: "standalone",
+        objective: "Click the Save button.",
+        contextSummary: "",
+        repeatPolicy: "once",
+        repeatLimit: 1,
+        deliverable: {
+          kind: "effect",
+          itemDescription: "",
+          targetCount: null,
+          pageRange: null,
+          fields: [],
+          includeCriteria: [],
+          formats: []
+        },
+        completionCriteria: ["The Save button receives one verified click."],
+        reason: "One concrete effect."
+      }, {
+        latestUserMessage: "Click the Save button."
+      });
+      const memorySession = {
+        runId: "e2e-fast-route-memory-source",
+        latestUserMessage: "Click the Save button.",
+        initialPageUrl: "https://example.test/runtime-fast-route",
+        turnIntent: fastIntent,
+        turnIntentResolved: true,
+        executionRoute: fastRoute
+      };
+      await rememberSuccessfulFastRoute(memorySession, {
+        route: fastRoute,
+        completed: [{ action: { type: "click" } }]
+      });
+      const recalledSession = {
+        runId: "e2e-fast-route-memory-recall",
+        latestUserMessage: memorySession.latestUserMessage,
+        initialPageUrl: memorySession.initialPageUrl,
+        turnIntent: createFallbackTurnIntent(memorySession.latestUserMessage),
+        turnIntentResolved: false
+      };
+      const recalledRoute = await recallSuccessfulFastRoute(recalledSession);
+      const storedMemory = await loadFastRouteMemoryStore();
+      const storedRoute = storedMemory.entries.find(
+        (entry) => entry.key === recalledSession.rememberedFastRouteKey
+      )?.route;
+      const milestoneSession = {
+        runId: "e2e-latency-milestone",
+        startedAt: new Date(Date.now() - 25).toISOString(),
+        startedAtEpochMs: Date.now() - 25,
+        latencyMilestones: {}
+      };
+      const firstMilestone = markRunLatencyMilestone(
+        milestoneSession,
+        "firstDecisionReadyMs",
+        { source: "e2e" }
+      );
+      const repeatedMilestone = markRunLatencyMilestone(
+        milestoneSession,
+        "firstDecisionReadyMs",
+        { source: "e2e-repeat" }
+      );
+      const prefetchedResolution = await resolveSemanticRouteAction(
+        memorySession,
+        fastRoute.actions[0],
+        {
+          prefetchedContext: {
+            url: memorySession.initialPageUrl,
+            documentId: "prefetched-document",
+            interactiveElements: [{
+              ref: "prefetched-save",
+              tag: "button",
+              role: "button",
+              type: "button",
+              label: "Save",
+              disabled: false,
+              ariaDisabled: false
+            }]
+          }
+        }
+      );
       const normalDomScreenshotSkipped = shouldCaptureDecisionScreenshot(domContext) === false;
       const visualSurfaceScreenshotRetained = shouldCaptureDecisionScreenshot({
         ...domContext,
@@ -6608,6 +7050,14 @@ async function exerciseLatencyFastPathContracts({ cdp, panelSessionId, context }
         visualSurfaces: [{ ref: "v1", kind: "canvas" }]
       }) === false;
       state.runtimeSettings.includeScreenshot = true;
+      const routingTimeout = deriveAiDecisionTimeoutMs({
+        purpose: "turn-routing",
+        system: "Compact routing contract",
+        user: "Resolve one current browser instruction.",
+        maxOutputTokens: 900
+      }, {
+        requestTimeoutMs: 45_000
+      });
 
       return {
         normalDomScreenshotSkipped,
@@ -6619,10 +7069,55 @@ async function exerciseLatencyFastPathContracts({ cdp, panelSessionId, context }
         readOnlyPolicyAllowed:
           buildDeterministicLowRiskPolicy(readOnlyDecision, domContext)?.verdict === "allow",
         unresolvedClickNeedsPolicy:
-          buildDeterministicLowRiskPolicy(unresolvedClickDecision, domContext) === null
+          buildDeterministicLowRiskPolicy(unresolvedClickDecision, domContext) === null,
+        fastRouterEnabled: shouldUseFastTurnRouter(
+          state.runtimeSettings,
+          memorySession
+        ),
+        fastRouteMemoryRecalled: Boolean(
+          recalledRoute?.strategy === "direct"
+          && recalledSession.turnIntentResolved
+        ),
+        fastRouteMemoryStayedSemantic: Boolean(
+          storedRoute?.actions?.length === 1
+          && storedRoute.actions[0]?.target?.query === "Save"
+          && !storedRoute.actions[0]?.ref
+          && !storedRoute.actions[0]?.selector
+        ),
+        prefetchedObservationReused:
+          prefetchedResolution.selectionSource === "prefetched-exact-semantic-match",
+        milestoneFirstWriteWins: Boolean(
+          firstMilestone >= 0
+          && repeatedMilestone === firstMilestone
+          && milestoneSession.latencyMilestones.firstDecisionReadyMs === firstMilestone
+        ),
+        routingTimeoutBounded: routingTimeout >= 7_000 && routingTimeout <= 15_000,
+        routingTimeoutBelowConfigured: routingTimeout < 45_000,
+        generalTimeoutPreserved: deriveAiDecisionTimeoutMs({
+          purpose: "planner",
+          system: "",
+          user: ""
+        }, {
+          requestTimeoutMs: 45_000
+        }) === 45_000,
+        explicitTimeoutHonored: deriveAiDecisionTimeoutMs({
+          purpose: "turn-routing",
+          timeoutMs: 6_000
+        }, {
+          requestTimeoutMs: 45_000
+        }) === 6_000
       };
     } finally {
       state.runtimeSettings = originalRuntimeSettings;
+      state.evaluationLogs = originalEvaluationLogs;
+      fastRouteMemoryCache = originalMemoryCache;
+      if (Object.hasOwn(originalMemory, FAST_ROUTE_MEMORY_STORAGE_KEY)) {
+        await chrome.storage.local.set({
+          [FAST_ROUTE_MEMORY_STORAGE_KEY]: originalMemory[FAST_ROUTE_MEMORY_STORAGE_KEY]
+        });
+      } else {
+        await chrome.storage.local.remove(FAST_ROUTE_MEMORY_STORAGE_KEY);
+      }
     }
   })()`);
 }
@@ -6652,6 +7147,7 @@ async function exerciseRoutedFastPathContracts({ cdp, panelSessionId }) {
                 kind: "effect",
                 itemDescription: "",
                 targetCount: null,
+                pageRange: null,
                 fields: [],
                 includeCriteria: [],
                 formats: []
@@ -6733,6 +7229,233 @@ async function exerciseRoutedFastPathContracts({ cdp, panelSessionId }) {
     } finally {
       requestAiDecision = originalRequestAiDecision;
       state.runtimeSettings = originalRuntimeSettings;
+    }
+  })()`);
+}
+
+async function exerciseDirectActionRouteIsolation({ cdp, panelSessionId }) {
+  return evaluate(cdp, panelSessionId, `(async () => {
+    const original = {
+      updateAgentButtons,
+      consumePrefetchedDecisionContext,
+      updateRunTimeline,
+      resolveSemanticRouteAction,
+      createDirectExecutionDecision,
+      appendEvaluationLog,
+      dispatchDirectDecision,
+      completeDirectActionRoute,
+      fallBackToGeneralAgent
+    };
+    let completedState = null;
+    let fallbackCalls = 0;
+    try {
+      updateAgentButtons = () => {};
+      consumePrefetchedDecisionContext = async () => null;
+      updateRunTimeline = () => {};
+      resolveSemanticRouteAction = async () => ({
+        ok: true,
+        action: {
+          id: "direct-save",
+          type: "click",
+          ref: "save-button",
+          reason: "Activate the requested control."
+        },
+        context: {
+          url: "https://example.test/direct-action",
+          documentId: "direct-action-document",
+          interactiveElements: []
+        },
+        target: {
+          ref: "save-button",
+          label: "Save",
+          role: "button",
+          disabled: false
+        },
+        candidateCount: 1,
+        selectionSource: "semantic-exact"
+      });
+      createDirectExecutionDecision = () => ({
+        step: 1,
+        status: "continue",
+        actions: [{
+          id: "direct-save",
+          type: "click",
+          ref: "save-button",
+          reason: "Activate the requested control."
+        }],
+        policy: {
+          decision: "allow",
+          requiresApproval: false,
+          reasons: ["The test route is locally bounded."]
+        },
+        safety: { blocked: [], approval: [] },
+        validation: { valid: true, errors: [] },
+        directTargetLabel: "Save"
+      });
+      appendEvaluationLog = () => {};
+      dispatchDirectDecision = async (_session, decision) => {
+        decision.directActionResult = {
+          ok: true,
+          result: { inputSequence: "browser-native" },
+          verification: { changed: true }
+        };
+        return "completed";
+      };
+      completeDirectActionRoute = (_session, routeState) => {
+        completedState = structuredClone(routeState);
+      };
+      fallBackToGeneralAgent = async () => {
+        fallbackCalls += 1;
+      };
+
+      const session = {
+        directRouteState: null,
+        stopRequested: false,
+        status: "routing",
+        evidence: [],
+        history: [],
+        step: 1
+      };
+      await runDirectActionRoute(session, {
+        version: "1.0",
+        strategy: "direct",
+        actions: [{
+          type: "click",
+          target: {
+            query: "Save",
+            roles: ["button"],
+            nearText: "",
+            reason: "Resolve the named control."
+          },
+          reason: "Activate the requested control."
+        }]
+      });
+
+      return {
+        completed: Boolean(completedState),
+        nextActionIndex: completedState?.nextActionIndex || 0,
+        collectionStateAbsent: !Object.hasOwn(session.directRouteState || {}, "collection"),
+        fallbackCalls
+      };
+    } finally {
+      updateAgentButtons = original.updateAgentButtons;
+      consumePrefetchedDecisionContext = original.consumePrefetchedDecisionContext;
+      updateRunTimeline = original.updateRunTimeline;
+      resolveSemanticRouteAction = original.resolveSemanticRouteAction;
+      createDirectExecutionDecision = original.createDirectExecutionDecision;
+      appendEvaluationLog = original.appendEvaluationLog;
+      dispatchDirectDecision = original.dispatchDirectDecision;
+      completeDirectActionRoute = original.completeDirectActionRoute;
+      fallBackToGeneralAgent = original.fallBackToGeneralAgent;
+    }
+  })()`);
+}
+
+async function exerciseAgentRuntimeV2Dispatch({ cdp, panelSessionId, tabId }) {
+  return evaluate(cdp, panelSessionId, `(async () => {
+    const original = {
+      saveSettingsFromForm,
+      persistCurrentSession,
+      initializeAgentRuntimeRun,
+      prefetchInitialDecisionContext,
+      runChatAgentLoop,
+      resolveAgentTurnRoute,
+      runRoutedAgentSession,
+      runtimeSettings: structuredClone(state.runtimeSettings),
+      activeTab: state.activeTab ? structuredClone(state.activeTab) : null,
+      agentSession: state.agentSession,
+      currentPlan: state.currentPlan
+    };
+    let routeCalls = 0;
+    let prefetchCalls = 0;
+    let loopCalls = 0;
+    try {
+      state.runtimeSettings = {
+        ...state.runtimeSettings,
+        agentRuntimeVersion: "v2",
+        apiEndpoint: "https://api.example.test/v1/responses"
+      };
+      state.activeTab = {
+        id: ${Number(tabId)},
+        title: "Runtime v2 fixture",
+        url: "https://example.test/runtime-v2"
+      };
+      saveSettingsFromForm = async () => {};
+      persistCurrentSession = () => Promise.resolve();
+      initializeAgentRuntimeRun = async () => ({ initialized: true });
+      prefetchInitialDecisionContext = () => {
+        prefetchCalls += 1;
+      };
+      runChatAgentLoop = async () => {
+        loopCalls += 1;
+      };
+      resolveAgentTurnRoute = async () => {
+        routeCalls += 1;
+        return { strategy: "direct" };
+      };
+      runRoutedAgentSession = async () => {};
+
+      await executeAgentInstruction("Click the Save button.", {
+        recordMessage: false
+      });
+      state.agentSession.latestMcpContext = buildAgentMcpContext({
+        enabled: true,
+        tools: Array.from({ length: 16 }, (_, index) => ({
+          name: index === 15 ? "tool.special" : \`tool.generic.\${index}\`,
+          title: index === 15 ? "Special report lookup" : \`Generic capability \${index}\`,
+          description: index === 15
+            ? "Find the requested specialist report."
+            : "Unrelated generic capability.",
+          inputSchema: {
+            type: "object",
+            properties: { query: { type: "string" } },
+            required: ["query"]
+          },
+          annotations: { readOnlyHint: true }
+        }))
+      }, { resources: [], prompts: [] });
+      const toolSearch = executeRuntimeToolSearch({
+        toolName: RUNTIME_TOOL_SEARCH_TOOL,
+        arguments: {
+          query: "specialist report",
+          preferredNames: ["tool.special"]
+        }
+      });
+      const selectedAfterSearch = formatMcpContextForPrompt(
+        state.agentSession.latestMcpContext
+      ).tools.map((tool) => tool.name);
+      return {
+        selectedVersion: selectAgentRuntimeVersion(state.runtimeSettings),
+        routeCalls,
+        prefetchCalls,
+        loopCalls,
+        turnIntentResolvedBeforeObservation: state.agentSession?.turnIntentResolved === true,
+        runtimeSnapshotCreated: state.agentSession?.runtimeV2?.version === "2.0",
+        providerChannels: {
+          decision: resolveProviderChannel("decision"),
+          groundingRepair: resolveProviderChannel("answer-grounding-repair"),
+          verifier: resolveProviderChannel("verifier-1"),
+          policy: resolveProviderChannel("policy"),
+          visual: resolveProviderChannel("visual-verifier"),
+          legacyRepair: resolveProviderChannel("turn-routing-repair")
+        },
+        toolSearchLoaded: toolSearch.loadedTools.includes("tool.special"),
+        toolSearchSchemaVisible: selectedAfterSearch.includes("tool.special")
+      };
+    } finally {
+      saveSettingsFromForm = original.saveSettingsFromForm;
+      persistCurrentSession = original.persistCurrentSession;
+      initializeAgentRuntimeRun = original.initializeAgentRuntimeRun;
+      prefetchInitialDecisionContext = original.prefetchInitialDecisionContext;
+      runChatAgentLoop = original.runChatAgentLoop;
+      resolveAgentTurnRoute = original.resolveAgentTurnRoute;
+      runRoutedAgentSession = original.runRoutedAgentSession;
+      state.runtimeSettings = original.runtimeSettings;
+      state.activeTab = original.activeTab;
+      state.agentSession = original.agentSession;
+      state.currentPlan = original.currentPlan;
+      clearRunTimeline();
+      updateAgentButtons();
     }
   })()`);
 }
@@ -7161,6 +7884,15 @@ async function exerciseAgentVerificationContracts({ cdp, panelSessionId, tabId, 
         contextSummary: "직전 답변에서 상태 정보를 정리해 전달하기로 했고 사용자가 그 작업을 계속하라고 했다.",
         repeatPolicy: "once",
         repeatLimit: 1,
+        deliverable: {
+          kind: "answer",
+          itemDescription: "",
+          targetCount: null,
+          pageRange: null,
+          fields: [],
+          includeCriteria: [],
+          formats: []
+        },
         completionCriteria: ["현재 화면 상태 정보가 최종 답변에 실제로 포함된다."],
         reason: "최신 메시지는 직전의 구체적인 미완료 전달 약속을 명시적으로 이어 간다."
       });
@@ -7286,6 +8018,15 @@ async function exerciseAgentVerificationContracts({ cdp, panelSessionId, tabId, 
         contextSummary: "직전 답변에서 확인한 정보를 다음 답변에 정리해 주겠다고 약속했고 사용자가 수락했다.",
         repeatPolicy: "once",
         repeatLimit: 1,
+        deliverable: {
+          kind: "answer",
+          itemDescription: "",
+          targetCount: null,
+          pageRange: null,
+          fields: [],
+          includeCriteria: [],
+          formats: []
+        },
         completionCriteria: ["확인한 상태 정보가 최종 답변 본문에 포함된다."],
         reason: "최신 메시지는 직전의 구체적인 미완료 결과 전달을 수락한다."
       });
@@ -8329,8 +9070,13 @@ async function captureSettingsOverviewDocs(cdp, panelSessionId) {
       uiLanguage: "ko",
       responseLanguage: "en",
       panelOpenMode: "side-panel",
-      apiProfile: "custom-json",
-      model: "local-instruct-model",
+      apiProfile: "openai-responses",
+      apiEndpoint: "http://127.0.0.1:8000/v1/responses",
+      model: "primary-model",
+      fastModel: "fast-model",
+      latencyMode: "fast",
+      serviceTier: "auto",
+      rememberSuccessfulRoutes: true,
       agentMode: "approve",
       includeScreenshot: true,
       mcpEnabled: false,
@@ -8351,6 +9097,13 @@ async function captureSettingsOverviewDocs(cdp, panelSessionId) {
   try {
     await capturePanelScreenshot(cdp, panelSessionId, "settings-overview.png");
     await capturePanelScreenshot(cdp, panelSessionId, "language-settings-en.png");
+    await evaluate(cdp, panelSessionId, `(async () => {
+      activateSettingsTab("api");
+      document.querySelector(".settings-body")?.scrollTo({ top: 150 });
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      return true;
+    })()`);
+    await capturePanelScreenshot(cdp, panelSessionId, "latency-settings.png");
   } finally {
     await evaluate(cdp, panelSessionId, `(() => {
       const snapshot = globalThis.__settingsCaptureSnapshot;

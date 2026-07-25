@@ -4,6 +4,9 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const Core = require("../agent-core.js");
+const AgentRuntimeV2 = require("../agent-v2/runtime.js");
+const AgentProviderDriverV2 = require("../agent-v2/provider-driver.js");
+const AgentRunStoreV2 = require("../agent-v2/run-store.js");
 
 function loadBackgroundFunctions(fetchImplementation = globalThis.fetch) {
   const listeners = { installed: [], clicked: [], message: [] };
@@ -32,12 +35,18 @@ function loadBackgroundFunctions(fetchImplementation = globalThis.fetch) {
     URLSearchParams,
     TextEncoder,
     Uint8Array,
+    ReadableStream,
+    Response,
     btoa,
     structuredClone,
     setTimeout,
     clearTimeout,
     Map,
-    Math
+    Math,
+    WebAgentCore: Core,
+    WebAgentRuntimeV2: AgentRuntimeV2,
+    WebAgentProviderDriverV2: AgentProviderDriverV2,
+    WebAgentRunStoreV2: AgentRunStoreV2
   };
   vm.createContext(sandbox);
   const source = fs.readFileSync(path.join(__dirname, "..", "background.js"), "utf8");
@@ -65,7 +74,42 @@ test("builds a stateless OpenAI Responses request with strict structured output"
   assert.equal(body.input[0].content[1].type, "input_image");
   assert.equal(body.text.format.type, "json_schema");
   assert.equal(body.text.format.strict, true);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(body.include)),
+    ["reasoning.encrypted_content"]
+  );
   assert.deepEqual(JSON.parse(JSON.stringify(body.text.format.schema)), Core.DECISION_SCHEMA);
+});
+
+test("replays stateless Responses output items instead of restarting every planner turn", () => {
+  const runtime = loadBackgroundFunctions();
+  const body = runtime.buildRequestBody({
+    apiProfile: "openai-responses",
+    model: "dynamic-model",
+    structuredOutput: true
+  }, {
+    system: "system",
+    user: "continue from the tool result",
+    providerState: {
+      profile: "openai-responses",
+      items: [{
+        id: "reasoning-1",
+        type: "reasoning",
+        encrypted_content: "encrypted"
+      }, {
+        id: "message-1",
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "Prior decision" }]
+      }]
+    },
+    responseSchema: Core.DECISION_SCHEMA
+  });
+
+  assert.equal(body.input[0].type, "reasoning");
+  assert.equal(body.input[1].type, "message");
+  assert.equal(body.input.at(-1).role, "user");
+  assert.equal(body.include.includes("reasoning.encrypted_content"), true);
 });
 
 test("builds the Chat Completions structured-output contract", () => {
@@ -84,6 +128,19 @@ test("builds the Chat Completions structured-output contract", () => {
   assert.equal(body.max_tokens, 800);
 });
 
+test("uses the per-request output budget when a runtime stage needs a different ceiling", () => {
+  const runtime = loadBackgroundFunctions();
+  const body = runtime.buildRequestBody({
+    apiProfile: "openai-responses",
+    maxOutputTokens: 2000
+  }, {
+    user: "bounded stage",
+    maxOutputTokens: 7200
+  });
+
+  assert.equal(body.max_output_tokens, 7200);
+});
+
 test("wires OpenAI built-in tools only into Responses requests", () => {
   const runtime = loadBackgroundFunctions();
   const body = runtime.buildRequestBody({
@@ -98,7 +155,230 @@ test("wires OpenAI built-in tools only into Responses requests", () => {
   });
   assert.deepEqual(JSON.parse(JSON.stringify(body.tools)), [{ type: "web_search", search_context_size: "medium" }]);
   assert.equal(body.tool_choice, "required");
-  assert.deepEqual(JSON.parse(JSON.stringify(body.include)), ["web_search_call.action.sources"]);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(body.include)),
+    ["reasoning.encrypted_content", "web_search_call.action.sources"]
+  );
+});
+
+test("builds a streamed native decision request with a per-stage model override", () => {
+  const runtime = loadBackgroundFunctions();
+  const body = runtime.buildRequestBody({
+    apiProfile: "openai-responses",
+    model: "primary-model",
+    structuredOutput: true
+  }, {
+    model: "stage-model",
+    system: "runtime",
+    user: "choose",
+    stream: true,
+    providerTools: [{
+      type: "function",
+      name: "browser_agent_step",
+      description: "Return one decision.",
+      parameters: Core.DECISION_SCHEMA,
+      strict: true
+    }],
+    providerToolChoice: "required"
+  });
+
+  assert.equal(body.model, "stage-model");
+  assert.equal(body.stream, true);
+  assert.equal(body.tool_choice, "required");
+  assert.equal(body.parallel_tool_calls, false);
+  assert.equal(body.tools[0].name, "browser_agent_step");
+  assert.equal(body.text, undefined);
+});
+
+test("adds low-latency Responses controls without replacing the structured format", () => {
+  const runtime = loadBackgroundFunctions();
+  const body = runtime.buildRequestBody({
+    apiProfile: "openai-responses",
+    model: "dynamic-model",
+    structuredOutput: true
+  }, {
+    system: "stable instructions",
+    user: "current request",
+    responseSchema: Core.DECISION_SCHEMA,
+    reasoningEffort: "low",
+    textVerbosity: "low",
+    serviceTier: "priority",
+    promptCache: true,
+    promptCacheScope: "planner-contract"
+  });
+
+  assert.equal(body.reasoning.effort, "low");
+  assert.equal(body.text.verbosity, "low");
+  assert.equal(body.text.format.type, "json_schema");
+  assert.equal(body.service_tier, "priority");
+  assert.match(body.prompt_cache_key, /^pc-[a-z0-9]+$/);
+});
+
+test("custom JSON templates receive the per-stage model override", () => {
+  const runtime = loadBackgroundFunctions();
+  const body = runtime.buildRequestBody({
+    apiProfile: "custom-json",
+    model: "primary-model",
+    customBodyTemplate: JSON.stringify({
+      model: "{{model}}",
+      prompt: "{{prompt}}"
+    })
+  }, {
+    model: "stage-model",
+    user: "bounded stage"
+  });
+
+  assert.equal(body.model, "stage-model");
+  assert.equal(body.prompt, "bounded stage");
+});
+
+test("streamed Responses function calls are accepted without fake output text", async () => {
+  const completedResponse = {
+    id: "response-streamed-tool",
+    status: "completed",
+    model: "dynamic-model",
+    output: [{
+      type: "function_call",
+      id: "function-item",
+      call_id: "function-call",
+      name: "browser_agent_step",
+      arguments: JSON.stringify({
+        version: "1.0",
+        status: "continue"
+      })
+    }],
+    usage: {
+      input_tokens: 100,
+      output_tokens: 25,
+      total_tokens: 125
+    }
+  };
+  const sse = [
+    `event: response.created\ndata: ${JSON.stringify({
+      type: "response.created",
+      response: { id: completedResponse.id, status: "in_progress", output: [] }
+    })}`,
+    `event: response.completed\ndata: ${JSON.stringify({
+      type: "response.completed",
+      response: completedResponse
+    })}`,
+    ""
+  ].join("\n\n");
+  const runtime = loadBackgroundFunctions(async (_url, options) => {
+    const body = JSON.parse(options.body);
+    assert.equal(body.stream, true);
+    return new Response(sse, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" }
+    });
+  });
+  const result = await runtime.callAiApi({
+    apiProfile: "openai-responses",
+    apiEndpoint: "https://api.example.test/responses",
+    model: "dynamic-model",
+    maxOutputTokens: 1000,
+    maxApiRetries: 0,
+    requestTimeoutMs: 10000,
+    structuredOutput: true
+  }, {
+    requestId: "stream-function-test",
+    system: "runtime",
+    user: "choose a step",
+    stream: true,
+    providerTools: [{
+      type: "function",
+      name: "browser_agent_step",
+      description: "Return one decision.",
+      parameters: Core.DECISION_SCHEMA,
+      strict: true
+    }],
+    providerToolChoice: "required"
+  });
+
+  assert.equal(result.text, "");
+  assert.equal(result.functionCalls.length, 1);
+  assert.equal(result.functionCalls[0].callId, "function-call");
+  assert.equal(result.functionCalls[0].arguments.status, "continue");
+  assert.equal(result.audit.streamed, true);
+  assert.ok(result.audit.firstByteMs >= 0);
+});
+
+test("compatible Responses endpoints fall back from streaming and native steps to structured JSON", async () => {
+  const bodies = [];
+  const runtime = loadBackgroundFunctions(async (_url, options) => {
+    const body = JSON.parse(options.body);
+    bodies.push(body);
+    if (body.stream === true) {
+      return new Response(JSON.stringify({ error: { message: "stream unsupported" } }), {
+        status: 400,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    if (body.tools?.some((tool) => tool.name === "browser_agent_step")) {
+      return new Response(JSON.stringify({ error: { message: "function tools unsupported" } }), {
+        status: 400,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    return new Response(JSON.stringify({
+      id: "structured-fallback",
+      status: "completed",
+      output: [{
+        type: "message",
+        role: "assistant",
+        content: [{
+          type: "output_text",
+          text: JSON.stringify({ status: "answer", message: "Fallback worked." })
+        }]
+      }]
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" }
+    });
+  });
+  const settings = {
+    apiProfile: "openai-responses",
+    apiEndpoint: "https://compatible.example.test/responses",
+    model: "dynamic-model",
+    maxOutputTokens: 1000,
+    maxApiRetries: 0,
+    requestTimeoutMs: 10000,
+    structuredOutput: true
+  };
+  const request = {
+    requestId: "native-fallback-test",
+    user: "choose",
+    stream: true,
+    fallbackResponseSchema: Core.DECISION_SCHEMA,
+    providerTools: [{
+      type: "function",
+      name: "browser_agent_step",
+      description: "Return one decision.",
+      parameters: Core.DECISION_SCHEMA,
+      strict: true
+    }],
+    providerToolChoice: "required"
+  };
+  const result = await runtime.callAiApi(settings, request);
+
+  assert.equal(bodies.length, 3);
+  assert.equal(bodies[0].stream, true);
+  assert.equal(bodies[1].stream, false);
+  assert.equal(bodies[2].tools, undefined);
+  assert.equal(bodies[2].parallel_tool_calls, undefined);
+  assert.equal(bodies[2].text.format.type, "json_schema");
+  assert.match(result.text, /Fallback worked/);
+  assert.equal(result.audit.streamingFallbackUsed, true);
+  assert.equal(result.audit.nativeToolFallbackUsed, true);
+
+  const cachedResult = await runtime.callAiApi(settings, {
+    ...request,
+    requestId: "native-fallback-cache-test"
+  });
+  assert.equal(bodies.length, 4);
+  assert.equal(bodies[3].stream, false);
+  assert.equal(bodies[3].tools, undefined);
+  assert.equal(cachedResult.audit.compatibilityCacheHit, true);
 });
 
 test("derives MCP OAuth discovery URLs without putting tokens in settings", () => {
@@ -458,8 +738,212 @@ test("falls back once when a compatible endpoint rejects structured output", asy
     outputTokens: 3,
     totalTokens: 15,
     cachedTokens: 4,
+    cacheWriteTokens: null,
     reasoningTokens: 1
   });
+});
+
+test("falls back without losing the request when a Responses-compatible endpoint rejects encrypted reasoning", async () => {
+  const requestBodies = [];
+  const runtime = loadBackgroundFunctions(async (_url, init) => {
+    const body = JSON.parse(init.body);
+    requestBodies.push(body);
+    if (requestBodies.length === 1) {
+      return {
+        ok: false,
+        status: 400,
+        headers: { get: () => null },
+        text: async () => JSON.stringify({
+          error: { message: "unsupported include value" }
+        })
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      text: async () => JSON.stringify({
+        id: "resp-compatible",
+        status: "completed",
+        output: [{
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "ok" }]
+        }]
+      })
+    };
+  });
+  const result = await runtime.fetchAiWithRetry({
+    endpoint: "https://api.example.test/v1/responses",
+    headers: { "Content-Type": "application/json" },
+    body: {
+      store: false,
+      input: [{ role: "user", content: [{ type: "input_text", text: "test" }] }],
+      include: ["reasoning.encrypted_content"],
+      max_output_tokens: 2000
+    },
+    profile: "openai-responses",
+    settings: { maxApiRetries: 0 },
+    request: { user: "test" },
+    requestId: "reasoning-fallback",
+    requestState: { controller: new AbortController() }
+  });
+
+  assert.equal(requestBodies.length, 2);
+  assert.deepEqual(requestBodies[0].include, ["reasoning.encrypted_content"]);
+  assert.equal(Object.hasOwn(requestBodies[1], "include"), false);
+  assert.equal(result.text, "ok");
+});
+
+test("negotiates unsupported low-latency hints independently and preserves structured output", async () => {
+  const requestBodies = [];
+  const rejectedFields = [
+    "reasoning.effort is unsupported",
+    "text.verbosity is unsupported",
+    "prompt_cache_key is unsupported",
+    "service_tier priority is unsupported"
+  ];
+  const runtime = loadBackgroundFunctions(async (_url, init) => {
+    const body = JSON.parse(init.body);
+    requestBodies.push(body);
+    const rejection = rejectedFields[requestBodies.length - 1];
+    if (rejection) {
+      return {
+        ok: false,
+        status: 400,
+        headers: { get: () => null },
+        text: async () => JSON.stringify({ error: { message: rejection } })
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      text: async () => JSON.stringify({
+        id: "resp-latency-fallback",
+        status: "completed",
+        output: [{
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "ok" }]
+        }]
+      })
+    };
+  });
+  const result = await runtime.fetchAiWithRetry({
+    endpoint: "https://api.example.test/v1/responses",
+    headers: { "Content-Type": "application/json" },
+    body: {
+      store: false,
+      input: [{ role: "user", content: [{ type: "input_text", text: "test" }] }],
+      reasoning: { effort: "low" },
+      text: {
+        verbosity: "low",
+        format: {
+          type: "json_schema",
+          name: "decision",
+          strict: true,
+          schema: Core.DECISION_SCHEMA
+        }
+      },
+      prompt_cache_key: "pc-test",
+      service_tier: "priority",
+      max_output_tokens: 1200
+    },
+    profile: "openai-responses",
+    settings: { maxApiRetries: 0 },
+    request: { user: "test", serviceTier: "priority" },
+    requestId: "latency-hint-fallback",
+    requestState: { controller: new AbortController() }
+  });
+
+  assert.equal(requestBodies.length, 5);
+  assert.equal(Boolean(requestBodies[0].reasoning), true);
+  assert.equal(Boolean(requestBodies[1].reasoning), false);
+  assert.equal(requestBodies[1].text.verbosity, "low");
+  assert.equal(requestBodies[2].text.verbosity, undefined);
+  assert.equal(requestBodies[2].text.format.type, "json_schema");
+  assert.equal(requestBodies[3].prompt_cache_key, undefined);
+  assert.equal(requestBodies[4].service_tier, undefined);
+  assert.equal(requestBodies[4].text.format.type, "json_schema");
+  assert.equal(result.audit.reasoningEffortFallbackUsed, true);
+  assert.equal(result.audit.textVerbosityFallbackUsed, true);
+  assert.equal(result.audit.promptCachingFallbackUsed, true);
+  assert.equal(result.audit.priorityProcessingFallbackUsed, true);
+});
+
+test("a generic compatible-endpoint error removes latency hints in one bounded retry", async () => {
+  const requestBodies = [];
+  const runtime = loadBackgroundFunctions(async (_url, init) => {
+    const body = JSON.parse(init.body);
+    requestBodies.push(body);
+    if (requestBodies.length === 1) {
+      return {
+        ok: false,
+        status: 400,
+        headers: { get: () => null },
+        text: async () => JSON.stringify({ error: { message: "unsupported request option" } })
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      text: async () => JSON.stringify({
+        id: "resp-generic-latency-fallback",
+        status: "completed",
+        output: [{
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "ok" }]
+        }]
+      })
+    };
+  });
+  const result = await runtime.fetchAiWithRetry({
+    endpoint: "https://compatible.example.test/v1/responses",
+    headers: { "Content-Type": "application/json" },
+    body: {
+      store: false,
+      input: [{ role: "user", content: [{ type: "input_text", text: "test" }] }],
+      reasoning: { effort: "low" },
+      text: {
+        verbosity: "low",
+        format: {
+          type: "json_schema",
+          name: "decision",
+          strict: true,
+          schema: Core.DECISION_SCHEMA
+        }
+      },
+      prompt_cache_key: "pc-test",
+      service_tier: "priority",
+      max_output_tokens: 1200
+    },
+    profile: "openai-responses",
+    settings: { maxApiRetries: 0 },
+    request: { user: "test", serviceTier: "priority" },
+    requestId: "generic-latency-hint-fallback",
+    requestState: { controller: new AbortController() },
+    compatibility: {
+      reasoningEffort: null,
+      textVerbosity: null,
+      promptCaching: null,
+      priorityProcessing: null,
+      updatedAt: 0
+    }
+  });
+
+  assert.equal(requestBodies.length, 2);
+  assert.equal(requestBodies[1].reasoning, undefined);
+  assert.equal(requestBodies[1].text.verbosity, undefined);
+  assert.equal(requestBodies[1].prompt_cache_key, undefined);
+  assert.equal(requestBodies[1].service_tier, undefined);
+  assert.equal(requestBodies[1].text.format.type, "json_schema");
+  assert.equal(result.audit.reasoningEffortFallbackUsed, true);
+  assert.equal(result.audit.textVerbosityFallbackUsed, true);
+  assert.equal(result.audit.promptCachingFallbackUsed, true);
+  assert.equal(result.audit.priorityProcessingFallbackUsed, true);
 });
 
 test("fails closed and records diagnostics when a successful response has no usable output", async () => {
@@ -493,6 +977,102 @@ test("fails closed and records diagnostics when a successful response has no usa
       assert.equal(error.audit.responseId, "resp-empty");
       assert.equal(error.audit.responseBytes > 0, true);
       assert.equal(error.audit.usage.totalTokens, 21);
+      return true;
+    }
+  );
+});
+
+test("retries one incomplete Responses result with a larger output budget", async () => {
+  const requestBodies = [];
+  const runtime = loadBackgroundFunctions(async (_url, init) => {
+    const body = JSON.parse(init.body);
+    requestBodies.push(body);
+    if (requestBodies.length === 1) {
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        text: async () => JSON.stringify({
+          id: "resp-incomplete",
+          status: "incomplete",
+          incomplete_details: { reason: "max_output_tokens" },
+          output: [],
+          usage: { input_tokens: 20, output_tokens: body.max_output_tokens, total_tokens: 2020 }
+        })
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      text: async () => JSON.stringify({
+        id: "resp-complete",
+        status: "completed",
+        output: [{
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "{\"status\":\"answer\"}" }]
+        }],
+        usage: { input_tokens: 20, output_tokens: 50, total_tokens: 70 }
+      })
+    };
+  });
+
+  const result = await runtime.fetchAiWithRetry({
+    endpoint: "https://api.example.test/v1/responses",
+    headers: { "Content-Type": "application/json" },
+    body: { input: [], max_output_tokens: 2000 },
+    profile: "openai-responses",
+    settings: {
+      maxApiRetries: 0,
+      maxRecoveryOutputTokens: 12000,
+      model: "dynamic-model"
+    },
+    request: { user: "test" },
+    taskType: "chat-agent-decision",
+    requestId: "incomplete-test",
+    requestState: { controller: new AbortController() }
+  });
+
+  assert.equal(requestBodies.length, 2);
+  assert.ok(requestBodies[1].max_output_tokens > requestBodies[0].max_output_tokens);
+  assert.equal(result.responseId, "resp-complete");
+  assert.equal(result.audit.attempts, 2);
+  assert.equal(result.continuation.profile, "openai-responses");
+});
+
+test("fails closed when an incomplete Responses result cannot be recovered", async () => {
+  const runtime = loadBackgroundFunctions(async () => ({
+    ok: true,
+    status: 200,
+    headers: { get: () => null },
+    text: async () => JSON.stringify({
+      id: "resp-filtered",
+      status: "incomplete",
+      incomplete_details: { reason: "content_filter" },
+      output: [{
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "partial output" }]
+      }]
+    })
+  }));
+
+  await assert.rejects(
+    runtime.fetchAiWithRetry({
+      endpoint: "https://api.example.test/v1/responses",
+      headers: { "Content-Type": "application/json" },
+      body: { input: [], max_output_tokens: 2000 },
+      profile: "openai-responses",
+      settings: { maxApiRetries: 0, model: "dynamic-model" },
+      request: { user: "test" },
+      taskType: "chat-agent-decision",
+      requestId: "filtered-test",
+      requestState: { controller: new AbortController() }
+    }),
+    (error) => {
+      assert.equal(error.name, "IncompleteAiResponseError");
+      assert.equal(error.audit.outcome, "incomplete_response");
       return true;
     }
   );

@@ -40,6 +40,7 @@
     "navigate",
     "extract"
   ]);
+  const MAX_COLLECTION_PAGES = 250;
 
   const nullableString = { type: ["string", "null"] };
   const nullableNumber = { type: ["number", "null"] };
@@ -127,6 +128,24 @@
             maximum: 5000,
             description: "Exact requested unique record count, or null when no explicit collection count exists."
           },
+          pageRange: {
+            type: ["object", "null"],
+            additionalProperties: false,
+            description: "Explicit inclusive result-page range, or null when the collection is not page-bounded.",
+            properties: {
+              start: {
+                type: "integer",
+                minimum: 1,
+                description: "First requested result-page ordinal."
+              },
+              end: {
+                type: "integer",
+                minimum: 1,
+                description: "Last requested result-page ordinal, inclusive."
+              }
+            },
+            required: ["start", "end"]
+          },
           fields: {
             type: "array",
             maxItems: 16,
@@ -149,7 +168,7 @@
             description: "Requested local file formats for a collection. Normalize an Excel workbook request to xlsx; use an empty array when no file export was requested."
           }
         },
-        required: ["kind", "itemDescription", "targetCount", "fields", "includeCriteria", "formats"]
+        required: ["kind", "itemDescription", "targetCount", "pageRange", "fields", "includeCriteria", "formats"]
       },
       completionCriteria: {
         type: "array",
@@ -231,7 +250,7 @@
         type: "array",
         maxItems: 3,
         items: ROUTE_ACTION_SCHEMA,
-        description: "Ordered semantic operations. Direct actions are resolved and executed locally without another planning call."
+        description: "Ordered semantic operations. A collection may include up to two deterministic setup operations followed by its representative extract. These actions are resolved and executed locally without another planning call."
       },
       evidenceSearch: ELEMENT_SEARCH_SCHEMA,
       confidence: {
@@ -700,6 +719,24 @@
     return { valid: errors.length === 0, errors: uniqueStrings(errors), search: normalized };
   }
 
+  function normalizeCollectionPageRange(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return null;
+    }
+    const start = Number(value.start);
+    const end = Number(value.end);
+    if (
+      !Number.isSafeInteger(start)
+      || !Number.isSafeInteger(end)
+      || start < 1
+      || end < start
+      || end - start + 1 > MAX_COLLECTION_PAGES
+    ) {
+      return null;
+    }
+    return { start, end };
+  }
+
   function normalizeTurnIntent(input, options = {}) {
     const source = input && typeof input === "object" && !Array.isArray(input) ? input : {};
     const latestUserMessage = stringValue(options.latestUserMessage).trim().slice(0, 8000);
@@ -720,9 +757,17 @@
     const deliverableKind = ["answer", "effect", "collection"].includes(deliverableSource.kind)
       ? deliverableSource.kind
       : "effect";
+    const targetCountProvided = deliverableSource.targetCount !== null
+      && deliverableSource.targetCount !== undefined
+      && deliverableSource.targetCount !== "";
     const requestedTargetCount = Number(deliverableSource.targetCount);
-    const targetCount = deliverableKind === "collection" && Number.isFinite(requestedTargetCount)
+    const targetCount = deliverableKind === "collection"
+      && targetCountProvided
+      && Number.isFinite(requestedTargetCount)
       ? Math.max(1, Math.min(5000, Math.round(requestedTargetCount)))
+      : null;
+    const pageRange = deliverableKind === "collection"
+      ? normalizeCollectionPageRange(deliverableSource.pageRange)
       : null;
     return {
       version: stringValue(source.version || "1.0"),
@@ -739,6 +784,7 @@
           ? stringValue(deliverableSource.itemDescription).trim().slice(0, 500)
           : "",
         targetCount,
+        pageRange,
         fields: deliverableKind === "collection"
           ? uniqueStrings(stringArray(deliverableSource.fields)
             .map((item) => normalizeWhitespace(item).slice(0, 120))
@@ -784,8 +830,11 @@
       if (!normalized.deliverable.itemDescription) {
         errors.push("A collection deliverable requires an item description.");
       }
-      if (!Number.isInteger(normalized.deliverable.targetCount) || normalized.deliverable.targetCount < 1) {
-        errors.push("A collection deliverable requires an exact target count.");
+      if (
+        (!Number.isInteger(normalized.deliverable.targetCount) || normalized.deliverable.targetCount < 1)
+        && !normalized.deliverable.pageRange
+      ) {
+        errors.push("A collection deliverable requires an exact target count or an explicit page range.");
       }
       if (!normalized.deliverable.fields.length) {
         errors.push("A collection deliverable requires at least one requested field.");
@@ -866,11 +915,22 @@
       if (options.deliverableKind && options.deliverableKind !== "collection") {
         errors.push("A collection route requires a collection deliverable.");
       }
+      const extractIndexes = normalized.actions
+        .map((action, index) => action.type === "extract" ? index : -1)
+        .filter((index) => index >= 0);
+      const setupActions = normalized.actions.slice(0, -1);
       if (
-        normalized.actions.length !== 1
-        || normalized.actions[0]?.type !== "extract"
+        !normalized.actions.length
+        || normalized.actions.length > 3
+        || extractIndexes.length !== 1
+        || extractIndexes[0] !== normalized.actions.length - 1
       ) {
-        errors.push("A collection route requires exactly one extract action that identifies a representative record.");
+        errors.push("A collection route requires one representative extract as its final action, optionally preceded by up to two deterministic setup operations.");
+      }
+      if (setupActions.some((action) => (
+        !["click", "fill", "select", "press", "navigate"].includes(action.type)
+      ))) {
+        errors.push("Collection setup supports only deterministic click, fill, select, press, or navigate operations.");
       }
     }
     if (normalized.strategy === "answer" && normalized.actions.length) {
@@ -1267,7 +1327,16 @@
         if (!action.collectionName) {
           errors.push("구조화 extract 액션에는 collectionName이 필요합니다.");
         }
-        if (!Number.isInteger(Number(action.targetCount)) || Number(action.targetCount) < 1 || Number(action.targetCount) > 5000) {
+        const hasValidTargetCount = Number.isInteger(Number(action.targetCount))
+          && Number(action.targetCount) >= 1
+          && Number(action.targetCount) <= 5000;
+        const pageRangeCollection = Boolean(
+          normalizeCollectionPageRange(options.collectionDeliverable?.pageRange)
+        );
+        if (
+          (!pageRangeCollection && !hasValidTargetCount)
+          || (action.targetCount !== undefined && !hasValidTargetCount)
+        ) {
           errors.push("구조화 extract 액션에는 1~5000 범위의 targetCount가 필요합니다.");
         }
       }
@@ -1632,7 +1701,7 @@ If the required visible control is absent, prefer status discover with a concise
 For an unlabeled icon or button identified relative to a nearby field, put the control kind in roles and the adjacent visible label in nearText. Leave query empty when the control itself has no visible or accessible name.
 Use visual_click only when the latest context contains visualObservation and a visual surface ref, no normal DOM ref can represent the visible target, and the target is unambiguous in the attached screenshot. Bind it to visualObservation.id, describe the exact visible target, and provide one point relative to that surface on a 0–1000 scale. Never use visual coordinates to guess hidden content or bypass a permission boundary.
 Use the runtime-resolved immutable turn intent. Do not re-expand it from raw conversation history or retry a failed prior effect unless that intent explicitly carries the prior deliverable.
-Treat deliverable.targetCount as output cardinality, never as permission to repeat the same state-changing effect. For a collection deliverable, use a bound extract action with one representative record ref, a stable collectionId reused across pages, collectionName, and the exact targetCount. The runtime expands repeated rendered records, deduplicates them across pages, and reports the remaining count. Extract the current result page before navigating again. When the current page needs extraction and one runtime-identified pagination control is available, the decision may contain exactly two ordered actions: the structured extract first and one verified pagination click second. Never use a record or detail link as pagination. Stop page traversal as soon as the ledger reaches the target or reports a repeated/no-new-record page. Requested local collection formats are generated by the runtime immediately after the exact target is reached and must have runtime evidence before completion.
+Treat deliverable.targetCount as output cardinality and deliverable.pageRange as an inclusive result-page boundary, never as permission to repeat the same state-changing effect. For a collection deliverable, use one bound extract action with one representative record ref, a stable collectionId, collectionName, and the exact targetCount when one exists; keep targetCount null for a page-range-only collection. Do not add a page click or navigation to that decision. After the first batch is bound, the runtime preserves the record structure, expands repeated rendered records, discovers and validates the next result URL, traverses one page at a time, deduplicates across pages, and stops when every supplied collection boundary is satisfied or a repeated/no-new-record page blocks progress. Never use a record or detail link as pagination. Requested local collection formats are generated by the runtime immediately after the collection boundary is reached and must have runtime evidence before completion.
 A terminal message is the exact response shown to the user. For answer or completed, include the requested result itself. Never end with a promise to inspect, summarize, compare, or report later, and never say that information was summarized without presenting that information.
 Keep each turn small. Prefer one effect class per turn. If the previous attempt made no progress, choose a materially different action, gather missing evidence, ask one focused clarification, or stop with a precise blocker.
 An executed request is not proof of progress. Use the reported observable change and do not repeat the same failed, unchanged, indeterminate, or disclosure-toggle attempt from the same evidence state.
@@ -1729,6 +1798,7 @@ Return a corrected decision object only. Preserve the user's objective, use only
     EXECUTION_ROUTE_SCHEMA,
     FAST_ANSWER_SCHEMA,
     INITIAL_DECISION_SCHEMA,
+    MAX_COLLECTION_PAGES,
     ROUTE_ACTION_TYPES,
     ROUTED_TURN_SCHEMA,
     ROUTE_STRATEGIES,
@@ -1747,6 +1817,7 @@ Return a corrected decision object only. Preserve the user's objective, use only
     fingerprintDecision,
     hashString,
     normalizeDecision,
+    normalizeCollectionPageRange,
     normalizeElementSearch,
     normalizeExecutionRoute,
     normalizePolicy,

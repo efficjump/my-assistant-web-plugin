@@ -248,6 +248,7 @@ test("screenshot-disabled mode gates both AI input and approval previews", () =>
 });
 
 test("normal DOM turns use latency fast paths without weakening state-changing policy", () => {
+  const html = fs.readFileSync(path.join(root, "panel.html"), "utf8");
   const panel = fs.readFileSync(path.join(root, "panel.js"), "utf8");
   const background = fs.readFileSync(path.join(root, "background.js"), "utf8");
   const content = fs.readFileSync(path.join(root, "content.js"), "utf8");
@@ -260,13 +261,58 @@ test("normal DOM turns use latency fast paths without weakening state-changing p
   const settleStart = panel.indexOf("async function waitAfterExecution");
   const settleEnd = panel.indexOf("function updateAgentButtons", settleStart);
   const settleFunction = panel.slice(settleStart, settleEnd);
+  const decisionStart = panel.indexOf("async function requestChatDecision");
+  const decisionEnd = panel.indexOf("async function consumePrefetchedDecisionContext", decisionStart);
+  const decisionFunction = panel.slice(decisionStart, decisionEnd);
+  const nativeBindingStart = panel.indexOf("function bindNativeProviderCall");
+  const nativeBindingEnd = panel.indexOf("function queueProviderFunctionOutput", nativeBindingStart);
+  const nativeBindingFunction = panel.slice(nativeBindingStart, nativeBindingEnd);
+  const requestStart = panel.indexOf("async function requestAiDecision");
+  const requestEnd = panel.indexOf("function deriveAiDecisionTimeoutMs", requestStart);
+  const requestFunction = panel.slice(requestStart, requestEnd);
 
+  for (const id of [
+    "latencyModeInput",
+    "serviceTierInput",
+    "rememberSuccessfulRoutesInput"
+  ]) {
+    assert.equal(hasElementId(html, id), true, `${id} should expose the latency control`);
+  }
+  assert.match(panel, /latencyMode:\s*"fast"/);
+  assert.match(panel, /serviceTier:\s*"auto"/);
+  assert.match(panel, /promptCaching:\s*true/);
+  assert.match(panel, /rememberSuccessfulRoutes:\s*true/);
+  assert.match(panel, /evaluateFastPlannerEscalation/);
+  assert.match(panel, /evaluateFastRoute/);
+  assert.match(panel, /FAST_ROUTE_MEMORY_STORAGE_KEY/);
+  assert.match(panel, /fastRouteMemoryCache/);
+  assert.match(panel, /recallSuccessfulFastRoute/);
+  assert.match(panel, /forgetSuccessfulFastRoute/);
+  assert.match(panel, /markRunLatencyMilestone/);
+  assert.match(panel, /function deriveRunCallBudget/);
+  assert.match(panel, /route === "memory"[\s\S]*return 0/);
+  assert.match(panel, /consumePrefetchedDecisionContext\(session\)/);
+  assert.match(panel, /prefetched-exact-semantic-match/);
   assert.match(screenshotFunction, /visualSurfaces\.length/);
   assert.match(screenshotFunction, /gap\?\.code === "visual_surface"/);
   assert.match(screenshotFunction, /const hasDomEvidence/);
   assert.match(screenshotFunction, /return !hasDomEvidence/);
   assert.match(policyFunction, /ExecutionContract\.actionChangesState\(action,\s*target,\s*context\) === false/);
   assert.match(policyFunction, /decision\.toolCalls\?\.length/);
+  assert.match(policyFunction, /buildDeterministicApprovalModePolicy\(decision,\s*context\)/);
+  assert.ok(
+    decisionFunction.indexOf("evaluateDeterministicTerminalVerification")
+      < decisionFunction.indexOf("requestCompletionVerification"),
+    "exact runtime evidence must be checked before a remote completion verifier"
+  );
+  assert.match(requestFunction, /AgentLatencyStrategyV2\.resolveStageProfile/);
+  assert.match(requestFunction, /buildNativeDecisionTool/);
+  assert.match(requestFunction, /providerToolOutputs/);
+  assert.match(requestFunction, /stream:\s*stageProfile\.stream/);
+  assert.match(nativeBindingFunction, /decision\.status === "discover"/);
+  assert.doesNotMatch(nativeBindingFunction, /decision\.status !== "continue"/);
+  assert.match(decisionFunction, /completion_verification_rejected/);
+  assert.match(decisionFunction, /answer_grounding_rejected/);
   assert.match(settleFunction, /type:\s*"WAIT_FOR_PAGE_SETTLE"/);
   assert.match(settleFunction, /if \(!results\.length\)/);
   assert.ok(
@@ -277,6 +323,12 @@ test("normal DOM turns use latency fast paths without weakening state-changing p
   assert.doesNotMatch(settleFunction, /delay\(mayNavigate\s*\?\s*1200\s*:\s*450\)/);
   assert.match(background, /case "WAIT_FOR_PAGE_SETTLE"/);
   assert.match(background, /function recoverNavigationInterruptedAction/);
+  assert.match(background, /parallel_tool_calls\s*=\s*false/);
+  assert.match(background, /applyKnownAiCompatibility/);
+  assert.match(background, /prompt_cache_key/);
+  assert.match(background, /service_tier/);
+  assert.match(background, /body\.reasoning\s*=\s*\{\s*effort/);
+  assert.match(background, /verbosity/);
   assert.match(background, /didActionFrameNavigate\(before,\s*after\)/);
   assert.match(background, /responseInterruptedByNavigation:\s*true/);
   assert.match(content, /case "WAIT_FOR_PAGE_SETTLE"/);
@@ -290,7 +342,7 @@ test("normal DOM turns use latency fast paths without weakening state-changing p
   assert.doesNotMatch(content, /await delay\(120\)/);
 });
 
-test("compact routing bypasses the general planner for deterministic DOM work", () => {
+test("runtime v2 prefetches observation and enables compact routing only under the fast-path contract", () => {
   const panel = fs.readFileSync(path.join(root, "panel.js"), "utf8");
   const core = fs.readFileSync(path.join(root, "agent-core.js"), "utf8");
   const instructionStart = panel.indexOf("async function executeAgentInstruction");
@@ -300,9 +352,20 @@ test("compact routing bypasses the general planner for deterministic DOM work", 
   const routedEnd = panel.indexOf("async function runChatAgentLoop", routedStart);
   const routedFunctions = panel.slice(routedStart, routedEnd);
 
+  assert.match(instructionFunction, /selectAgentRuntimeVersion\(getRuntimeSettings\(\)\) === "v1"/);
   assert.match(instructionFunction, /resolveAgentTurnRoute/);
   assert.match(instructionFunction, /runRoutedAgentSession/);
-  assert.doesNotMatch(instructionFunction, /prefetchInitialDecisionContext/);
+  assert.match(instructionFunction, /prefetchInitialDecisionContext/);
+  assert.match(instructionFunction, /await runChatAgentLoop\(\)/);
+  assert.ok(
+    instructionFunction.indexOf('=== "v1"') < instructionFunction.indexOf("resolveAgentTurnRoute"),
+    "the blind compact router must only be reachable through the explicit v1 fallback"
+  );
+  assert.ok(
+    instructionFunction.lastIndexOf("prefetchInitialDecisionContext")
+      < instructionFunction.lastIndexOf("await runChatAgentLoop()"),
+    "runtime v2 must prefetch observation before entering the general loop"
+  );
   assert.match(routedFunctions, /route\?\.strategy === "direct"/);
   assert.match(routedFunctions, /targetSearchScope:\s*"rendered-document"/);
   assert.match(routedFunctions, /chooseUniqueRouteCandidate/);
@@ -315,6 +378,38 @@ test("compact routing bypasses the general planner for deterministic DOM work", 
   assert.match(routedFunctions, /requestExecutionPolicy\(session,\s*decision,\s*resolved\.context\)/);
   assert.match(core, /ROUTED_TURN_SCHEMA/);
   assert.match(core, /FAST_ANSWER_SCHEMA/);
+});
+
+test("collection traversal stays DOM-bound after the first extraction", () => {
+  const panel = fs.readFileSync(path.join(root, "panel.js"), "utf8");
+  const content = fs.readFileSync(path.join(root, "content.js"), "utf8");
+  const directStart = panel.indexOf("async function runDirectActionRoute");
+  const directEnd = panel.indexOf("async function resolveSemanticRouteAction", directStart);
+  const directRuntime = panel.slice(directStart, directEnd);
+  const collectionStart = panel.indexOf("async function runDirectCollectionRoute");
+  const collectionEnd = panel.indexOf("function createDirectCollectionId", collectionStart);
+  const collectionRuntime = panel.slice(collectionStart, collectionEnd);
+  const paginationStart = panel.indexOf("async function resolveNextCollectionPage");
+  const paginationEnd = panel.indexOf("function isSafeCollectionPaginationDestination", paginationStart);
+  const paginationResolver = panel.slice(paginationStart, paginationEnd);
+
+  assert.match(content, /function readElementNavigationDestination/);
+  assert.match(content, /\[role='button'\],\[onclick\]/);
+  assert.doesNotMatch(
+    directRuntime,
+    /routeState\.collection|deliverable\.pageRange/,
+    "collection recovery state must never be dereferenced by the ordinary direct-action route"
+  );
+  assert.match(collectionRuntime, /routeState\.collection\.pageRange/);
+  assert.match(collectionRuntime, /routeState\.collection\.startAligned/);
+  assert.match(collectionRuntime, /type:\s*"click",\s*ref:\s*pagination\.target\.ref/);
+  assert.doesNotMatch(
+    collectionRuntime,
+    /type:\s*"navigate",\s*url:\s*pagination\.target\.href/
+  );
+  assert.match(paginationResolver, /candidate\.navigationKind === "pagination"/);
+  assert.match(paginationResolver, /isSingleStepForwardPaginationUrl/);
+  assert.doesNotMatch(paginationResolver, /requestAiDecision|requestTargetSelection/);
 });
 
 test("page input uses browser-native dispatch with target-bound verification and fallback", () => {
