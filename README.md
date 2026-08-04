@@ -1,3 +1,5 @@
+**English** | [한국어](README.ko.md)
+
 # My Assistant Web Plugin
 
 > [!IMPORTANT]
